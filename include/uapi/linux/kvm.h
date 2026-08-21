@@ -879,6 +879,81 @@ struct kvm_ppc_resize_hpt {
 #define KVM_VM_TYPE_ARM_IPA_SIZE_MASK	0xffULL
 #define KVM_VM_TYPE_ARM_IPA_SIZE(x)		\
 	((x) & KVM_VM_TYPE_ARM_IPA_SIZE_MASK)
+
+#define KVM_EXEC_FEATURE_BASE_OBJECTS	(1ULL << 0)
+#define KVM_EXEC_CPU_ANY		((__u32)-1)
+
+#define KVM_EXECUTOR_F_STRICT_CPU	(1U << 0)
+
+#define KVM_EXEC_RETURN_VCPU_EXIT	1
+#define KVM_EXEC_RETURN_SIGNAL		2
+#define KVM_EXEC_RETURN_DOMAIN_PAUSED	3
+#define KVM_EXEC_RETURN_DOMAIN_STOPPING	4
+#define KVM_EXEC_RETURN_CPU_MIGRATED	5
+
+struct kvm_exec_domain_create {
+	__u32 size;
+	__u32 flags;
+	__u32 max_capsules;
+	__u32 max_executors;
+	__u64 requested_features;
+	__u64 negotiated_features;
+	__u64 domain_generation;
+	__u64 reserved[3];
+};
+
+struct kvm_exec_attach_vcpu {
+	__u32 size;
+	__u32 flags;
+	__s32 vcpu_fd;
+	__u32 reserved0;
+	__u64 capsule_id;
+	__u64 lifecycle_generation;
+	__u64 reserved[4];
+};
+
+struct kvm_exec_detach_vcpu {
+	__u32 size;
+	__u32 flags;
+	__u64 capsule_id;
+	__u64 lifecycle_generation;
+	__u64 reserved[4];
+};
+
+struct kvm_exec_create_executor {
+	__u32 size;
+	__u32 flags;
+	__u32 requested_cpu;
+	__u32 reserved0;
+	__u64 executor_cookie;
+	__u64 executor_generation;
+	__u64 reserved[4];
+};
+
+struct kvm_exec_domain_control {
+	__u32 size;
+	__u32 flags;
+	__u64 reserved[4];
+};
+
+struct kvm_exec_run {
+	__u32 size;
+	__u32 flags;
+	__u64 request_sequence;
+	__u64 domain_generation;
+	__u64 executor_generation;
+	__u64 target_capsule_id;
+	__u64 target_lifecycle_generation;
+	__u64 user_cookie;
+	__u32 return_reason;
+	__s32 run_result;
+	__u32 vcpu_exit_reason;
+	__u32 current_cpu;
+	__u64 owned_capsule_id;
+	__u64 owned_lifecycle_generation;
+	__u64 reserved[4];
+};
+
 /*
  * ioctls for /dev/kvm fds:
  */
@@ -896,9 +971,26 @@ struct kvm_ppc_resize_hpt {
  * Get size for mmap(vcpu_fd)
  */
 #define KVM_GET_VCPU_MMAP_SIZE    _IO(KVMIO,   0x04) /* in bytes */
+#define KVM_CREATE_EXEC_DOMAIN    _IOWR(KVMIO, 0x0b, \
+				       struct kvm_exec_domain_create)
 #define KVM_GET_SUPPORTED_CPUID   _IOWR(KVMIO, 0x05, struct kvm_cpuid2)
 #define KVM_GET_EMULATED_CPUID	  _IOWR(KVMIO, 0x09, struct kvm_cpuid2)
 #define KVM_GET_MSR_FEATURE_INDEX_LIST    _IOWR(KVMIO, 0x0a, struct kvm_msr_list)
+
+/* ioctls for execution-domain fds */
+#define KVM_EXEC_ATTACH_VCPU      _IOW(KVMIO,  0xf0, \
+				      struct kvm_exec_attach_vcpu)
+#define KVM_EXEC_DETACH_VCPU      _IOW(KVMIO,  0xf1, \
+				      struct kvm_exec_detach_vcpu)
+#define KVM_EXEC_CREATE_EXECUTOR  _IOWR(KVMIO, 0xf2, \
+				       struct kvm_exec_create_executor)
+#define KVM_EXEC_PAUSE            _IOW(KVMIO,  0xf3, \
+				      struct kvm_exec_domain_control)
+#define KVM_EXEC_RESUME           _IOW(KVMIO,  0xf4, \
+				      struct kvm_exec_domain_control)
+#define KVM_EXEC_DRAIN            _IOW(KVMIO,  0xf5, \
+				      struct kvm_exec_domain_control)
+#define KVM_EXEC_RUN              _IOWR(KVMIO, 0xf6, struct kvm_exec_run)
 
 /*
  * Extension capability list.
@@ -1155,6 +1247,7 @@ struct kvm_ppc_resize_hpt {
 #define KVM_CAP_MEMORY_ATTRIBUTES 233
 #define KVM_CAP_GUEST_MEMFD 234
 #define KVM_CAP_VM_TYPES 235
+#define KVM_CAP_VCPU_EXEC_DOMAIN 236
 
 #ifdef KVM_CAP_IRQ_ROUTING
 

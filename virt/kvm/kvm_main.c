@@ -4180,6 +4180,21 @@ static struct file_operations kvm_vcpu_fops = {
 	KVM_COMPAT(kvm_vcpu_compat_ioctl),
 };
 
+struct kvm_vcpu *kvm_vcpu_from_fd(int fd, struct file **filep)
+{
+	struct file *file = fget(fd);
+
+	if (!file)
+		return ERR_PTR(-EBADF);
+	if (file->f_op != &kvm_vcpu_fops) {
+		fput(file);
+		return ERR_PTR(-EINVAL);
+	}
+
+	*filep = file;
+	return file->private_data;
+}
+
 /*
  * Allocates an inode for the vcpu.
  */
@@ -4398,6 +4413,30 @@ static int kvm_vcpu_ioctl_get_stats_fd(struct kvm_vcpu *vcpu)
 	return fd;
 }
 
+int kvm_vcpu_run(struct kvm_vcpu *vcpu)
+{
+	struct pid *oldpid = rcu_access_pointer(vcpu->pid);
+	int r;
+
+	if (unlikely(oldpid != task_pid(current))) {
+		struct pid *newpid;
+
+		r = kvm_arch_vcpu_run_pid_change(vcpu);
+		if (r)
+			return r;
+
+		newpid = get_task_pid(current, PIDTYPE_PID);
+		rcu_assign_pointer(vcpu->pid, newpid);
+		if (oldpid)
+			synchronize_rcu();
+		put_pid(oldpid);
+	}
+
+	r = kvm_arch_vcpu_ioctl_run(vcpu);
+	trace_kvm_userspace_exit(vcpu->run->exit_reason, r);
+	return r;
+}
+
 static long kvm_vcpu_ioctl(struct file *filp,
 			   unsigned int ioctl, unsigned long arg)
 {
@@ -4423,29 +4462,21 @@ static long kvm_vcpu_ioctl(struct file *filp,
 
 	if (mutex_lock_killable(&vcpu->mutex))
 		return -EINTR;
+	if (vcpu->exec_capsule && ioctl == KVM_RUN) {
+		r = -EBUSY;
+		goto out;
+	}
+	if (vcpu->exec_capsule &&
+	    !kvm_exec_domain_vcpu_ioctl_allowed(vcpu)) {
+		r = -EBUSY;
+		goto out;
+	}
 	switch (ioctl) {
 	case KVM_RUN: {
-		struct pid *oldpid;
 		r = -EINVAL;
 		if (arg)
 			goto out;
-		oldpid = rcu_access_pointer(vcpu->pid);
-		if (unlikely(oldpid != task_pid(current))) {
-			/* The thread running this VCPU changed. */
-			struct pid *newpid;
-
-			r = kvm_arch_vcpu_run_pid_change(vcpu);
-			if (r)
-				break;
-
-			newpid = get_task_pid(current, PIDTYPE_PID);
-			rcu_assign_pointer(vcpu->pid, newpid);
-			if (oldpid)
-				synchronize_rcu();
-			put_pid(oldpid);
-		}
-		r = kvm_arch_vcpu_ioctl_run(vcpu);
-		trace_kvm_userspace_exit(vcpu->run->exit_reason, r);
+		r = kvm_vcpu_run(vcpu);
 		break;
 	}
 	case KVM_GET_REGS: {
@@ -4834,6 +4865,9 @@ static int kvm_vm_ioctl_check_extension_generic(struct kvm *kvm, long arg)
 	case KVM_CAP_ENABLE_CAP_VM:
 	case KVM_CAP_HALT_POLL:
 		return 1;
+	case KVM_CAP_VCPU_EXEC_DOMAIN:
+		return IS_ENABLED(CONFIG_X86_64) ?
+			KVM_EXEC_FEATURE_BASE_OBJECTS : 0;
 #ifdef CONFIG_KVM_MMIO
 	case KVM_CAP_COALESCED_MMIO:
 		return KVM_COALESCED_MMIO_PAGE_OFFSET;
@@ -5483,6 +5517,9 @@ static long kvm_dev_ioctl(struct file *filp,
 		break;
 	case KVM_CREATE_VM:
 		r = kvm_dev_ioctl_create_vm(arg);
+		break;
+	case KVM_CREATE_EXEC_DOMAIN:
+		r = kvm_dev_ioctl_create_exec_domain((void __user *)arg);
 		break;
 	case KVM_CHECK_EXTENSION:
 		r = kvm_vm_ioctl_check_extension_generic(NULL, arg);

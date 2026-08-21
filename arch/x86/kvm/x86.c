@@ -10709,6 +10709,12 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
 	bool req_immediate_exit = false;
 
 	if (kvm_request_pending(vcpu)) {
+		if (kvm_check_request(KVM_REQ_EXEC_DOMAIN_EXIT, vcpu)) {
+			vcpu->run->exit_reason = KVM_EXIT_INTR;
+			r = -EINTR;
+			goto out;
+		}
+
 		if (kvm_check_request(KVM_REQ_VM_DEAD, vcpu)) {
 			r = -EIO;
 			goto out;
@@ -11302,6 +11308,13 @@ static void kvm_put_guest_fpu(struct kvm_vcpu *vcpu)
 	fpu_swap_kvm_fpstate(&vcpu->arch.guest_fpu, false);
 	++vcpu->stat.fpu_reload;
 	trace_kvm_fpu(0);
+}
+
+bool kvm_arch_vcpu_exec_domain_supported(struct kvm_vcpu *vcpu)
+{
+	return !is_guest_mode(vcpu) && !is_smm(vcpu) &&
+	       !guest_cpuid_has(vcpu, X86_FEATURE_VMX) &&
+	       !guest_cpuid_has(vcpu, X86_FEATURE_SVM);
 }
 
 int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)

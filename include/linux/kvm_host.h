@@ -167,6 +167,7 @@ static inline bool is_error_page(struct page *page)
 #define KVM_REQ_VM_DEAD			(1 | KVM_REQUEST_WAIT | KVM_REQUEST_NO_WAKEUP)
 #define KVM_REQ_UNBLOCK			2
 #define KVM_REQ_DIRTY_RING_SOFT_FULL	3
+#define KVM_REQ_EXEC_DOMAIN_EXIT	4
 #define KVM_REQUEST_ARCH_BASE		8
 
 /*
@@ -320,6 +321,8 @@ struct kvm_mmio_fragment {
 	unsigned len;
 };
 
+struct kvm_exec_capsule;
+
 struct kvm_vcpu {
 	struct kvm *kvm;
 #ifdef CONFIG_PREEMPT_NOTIFIERS
@@ -338,6 +341,7 @@ struct kvm_vcpu {
 
 	struct mutex mutex;
 	struct kvm_run *run;
+	struct kvm_exec_capsule *exec_capsule;
 
 #ifndef __KVM_HAVE_ARCH_WQP
 	struct rcuwait wait;
@@ -1476,6 +1480,12 @@ int kvm_arch_vcpu_ioctl_set_mpstate(struct kvm_vcpu *vcpu,
 int kvm_arch_vcpu_ioctl_set_guest_debug(struct kvm_vcpu *vcpu,
 					struct kvm_guest_debug *dbg);
 int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu);
+bool kvm_arch_vcpu_exec_domain_supported(struct kvm_vcpu *vcpu);
+
+int kvm_dev_ioctl_create_exec_domain(void __user *argp);
+bool kvm_exec_domain_vcpu_ioctl_allowed(struct kvm_vcpu *vcpu);
+struct kvm_vcpu *kvm_vcpu_from_fd(int fd, struct file **filep);
+int kvm_vcpu_run(struct kvm_vcpu *vcpu);
 
 void kvm_arch_sched_in(struct kvm_vcpu *vcpu, int cpu);
 
