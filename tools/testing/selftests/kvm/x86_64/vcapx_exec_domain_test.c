@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
+#define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -15,6 +16,16 @@
 #include "kvm_util.h"
 #include "processor.h"
 #include "test_util.h"
+
+static uint64_t fuzz_state = 0x8d26f31b9c47a5e1ULL;
+
+static uint64_t fuzz_next(void)
+{
+	fuzz_state ^= fuzz_state << 13;
+	fuzz_state ^= fuzz_state >> 7;
+	fuzz_state ^= fuzz_state << 17;
+	return fuzz_state;
+}
 
 static int create_domain(int kvm_fd, uint32_t max_capsules,
 			 uint32_t max_executors, uint64_t *generation)
@@ -77,12 +88,14 @@ static void detach_vcpu(int domain_fd, uint64_t capsule_id,
 	TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_EXEC_DETACH_VCPU, ret));
 }
 
-static int create_executor(int domain_fd, uint64_t cookie,
-			   uint64_t *generation)
+static int create_executor_on_cpu(int domain_fd, uint64_t cookie, uint32_t flags,
+				  uint32_t requested_cpu,
+				  uint64_t *generation)
 {
 	struct kvm_exec_create_executor create = {
 		.size = sizeof(create),
-		.requested_cpu = KVM_EXEC_CPU_ANY,
+		.flags = flags,
+		.requested_cpu = requested_cpu,
 		.executor_cookie = cookie,
 	};
 	int executor_fd = ioctl(domain_fd, KVM_EXEC_CREATE_EXECUTOR, &create);
@@ -93,6 +106,13 @@ static int create_executor(int domain_fd, uint64_t cookie,
 		    "KVM returned a zero executor generation");
 	*generation = create.executor_generation;
 	return executor_fd;
+}
+
+static int create_executor(int domain_fd, uint64_t cookie,
+			   uint64_t *generation)
+{
+	return create_executor_on_cpu(domain_fd, cookie, 0, KVM_EXEC_CPU_ANY,
+				      generation);
 }
 
 static void control_domain(int domain_fd, unsigned long request)
@@ -175,6 +195,117 @@ static void test_one_capsule_run_and_legacy_restore(int kvm_fd)
 	TEST_ASSERT_KVM_EXIT_REASON(vcpu, KVM_EXIT_IO);
 
 	close(executor_fd);
+	close(domain_fd);
+	kvm_vm_free(vm);
+}
+
+static void test_strict_cpu_placement(int kvm_fd)
+{
+	struct kvm_exec_run run = { .size = sizeof(run) };
+	uint64_t domain_generation, executor_generation;
+	struct kvm_vcpu *vcpu;
+	struct kvm_vm *vm;
+	cpu_set_t original_mask, pinned_mask;
+	long configured_cpus;
+	int correct_executor_fd, wrong_executor_fd;
+	int domain_fd, correct_cpu, wrong_cpu, ret;
+
+	TEST_ASSERT(!sched_getaffinity(0, sizeof(original_mask), &original_mask),
+		    "sched_getaffinity failed, errno %d", errno);
+	correct_cpu = CPU_SETSIZE;
+	for (ret = 0; ret < CPU_SETSIZE; ret++) {
+		if (CPU_ISSET(ret, &original_mask)) {
+			correct_cpu = ret;
+			break;
+		}
+	}
+	TEST_ASSERT(correct_cpu < CPU_SETSIZE, "empty CPU affinity mask");
+	CPU_ZERO(&pinned_mask);
+	CPU_SET(correct_cpu, &pinned_mask);
+	TEST_ASSERT(!sched_setaffinity(0, sizeof(pinned_mask), &pinned_mask),
+		    "sched_setaffinity failed, errno %d", errno);
+	TEST_ASSERT_EQ(sched_getcpu(), correct_cpu);
+
+	configured_cpus = sysconf(_SC_NPROCESSORS_CONF);
+	TEST_ASSERT(configured_cpus > 1 && configured_cpus <= CPU_SETSIZE,
+		    "strict placement test needs at least two configured CPUs");
+	wrong_cpu = (correct_cpu + 1) % configured_cpus;
+
+	vm = vm_create_with_one_vcpu(&vcpu, guest_two_exits);
+	disable_nested_cpuid(vcpu);
+	domain_fd = create_domain(kvm_fd, 1, 2, &domain_generation);
+	attach_vcpu(domain_fd, vcpu->fd, 1, 1);
+
+	wrong_executor_fd = create_executor_on_cpu(domain_fd, 1,
+						   KVM_EXECUTOR_F_STRICT_CPU,
+						   wrong_cpu, &executor_generation);
+	run.request_sequence = 1;
+	run.domain_generation = domain_generation;
+	run.executor_generation = executor_generation;
+	run.target_capsule_id = 1;
+	run.target_lifecycle_generation = 1;
+	assert_ioctl_errno(wrong_executor_fd, KVM_EXEC_RUN, &run, EXDEV);
+
+	correct_executor_fd = create_executor_on_cpu(domain_fd, 2,
+						     KVM_EXECUTOR_F_STRICT_CPU,
+						     correct_cpu, &executor_generation);
+	run.executor_generation = executor_generation;
+	ret = ioctl(correct_executor_fd, KVM_EXEC_RUN, &run);
+	TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_EXEC_RUN, ret));
+	TEST_ASSERT_EQ(run.return_reason, KVM_EXEC_RETURN_VCPU_EXIT);
+	TEST_ASSERT_EQ(run.vcpu_exit_reason, KVM_EXIT_IO);
+	TEST_ASSERT_EQ(run.current_cpu, correct_cpu);
+
+	close(correct_executor_fd);
+	close(wrong_executor_fd);
+	control_domain(domain_fd, KVM_EXEC_PAUSE);
+	control_domain(domain_fd, KVM_EXEC_DRAIN);
+	detach_vcpu(domain_fd, 1, 1);
+	close(domain_fd);
+	kvm_vm_free(vm);
+	TEST_ASSERT(!sched_setaffinity(0, sizeof(original_mask), &original_mask),
+		    "failed to restore CPU affinity, errno %d", errno);
+}
+
+static void test_rejects_unsupported_x86_state(int kvm_fd)
+{
+	struct kvm_exec_attach_vcpu attach = {
+		.size = sizeof(attach),
+		.capsule_id = 1,
+		.lifecycle_generation = 1,
+	};
+	struct kvm_vcpu_events events;
+	struct kvm_vcpu *vcpu;
+	struct kvm_vm *vm;
+	uint64_t domain_generation;
+	bool nested_exposed;
+	int domain_fd;
+
+	vm = vm_create_with_one_vcpu(&vcpu, guest_two_exits);
+	domain_fd = create_domain(kvm_fd, 1, 1, &domain_generation);
+	attach.vcpu_fd = vcpu->fd;
+
+	nested_exposed = kvm_cpu_has(X86_FEATURE_VMX) ||
+			 kvm_cpu_has(X86_FEATURE_SVM);
+	if (nested_exposed)
+		assert_ioctl_errno(domain_fd, KVM_EXEC_ATTACH_VCPU, &attach,
+				   EOPNOTSUPP);
+	disable_nested_cpuid(vcpu);
+
+	if (ioctl(kvm_fd, KVM_CHECK_EXTENSION, KVM_CAP_X86_SMM)) {
+		vcpu_events_get(vcpu, &events);
+		events.flags |= KVM_VCPUEVENT_VALID_SMM;
+		events.smi.smm = 1;
+		vcpu_events_set(vcpu, &events);
+		assert_ioctl_errno(domain_fd, KVM_EXEC_ATTACH_VCPU, &attach,
+				   EOPNOTSUPP);
+
+		events.smi.smm = 0;
+		vcpu_events_set(vcpu, &events);
+	}
+
+	attach_vcpu(domain_fd, vcpu->fd, 1, 1);
+	detach_vcpu(domain_fd, 1, 1);
 	close(domain_fd);
 	kvm_vm_free(vm);
 }
@@ -598,6 +729,220 @@ static void test_malformed_and_stale_requests(int kvm_fd)
 	close(vm_fd);
 }
 
+static void test_deterministic_malformed_fuzz(int kvm_fd)
+{
+	struct kvm_exec_domain_create create;
+	struct kvm_exec_attach_vcpu attach;
+	struct kvm_exec_detach_vcpu detach;
+	struct kvm_exec_create_executor create_executor_req;
+	struct kvm_exec_domain_control control;
+	struct kvm_exec_run run;
+	uint64_t domain_generation, executor_generation, value;
+	int domain_fd, executor_fd, vm_fd, vcpu_fd;
+	size_t reserved_index;
+	int i;
+
+	for (i = 0; i < 96; i++) {
+		create = (struct kvm_exec_domain_create) {
+			.size = sizeof(create),
+			.max_capsules = 1,
+			.max_executors = 1,
+			.requested_features = KVM_EXEC_FEATURE_BASE_OBJECTS,
+		};
+		value = (fuzz_next() >> 1) | 1;
+		switch (i % 6) {
+		case 0:
+			create.size = sizeof(create) + (value & 15) + 1;
+			break;
+		case 1:
+			create.flags = value;
+			break;
+		case 2:
+			create.max_capsules = 0;
+			break;
+		case 3:
+			create.max_executors = 0;
+			break;
+		case 4:
+			create.requested_features |= 1ULL << 63;
+			break;
+		case 5:
+			create.reserved[value % ARRAY_SIZE(create.reserved)] = value;
+			break;
+		}
+		assert_ioctl_errno(kvm_fd, KVM_CREATE_EXEC_DOMAIN, &create, EINVAL);
+	}
+
+	create_raw_vm_vcpu(kvm_fd, &vm_fd, &vcpu_fd);
+	domain_fd = create_domain(kvm_fd, 1, 1, &domain_generation);
+	for (i = 0; i < 96; i++) {
+		attach = (struct kvm_exec_attach_vcpu) {
+			.size = sizeof(attach),
+			.vcpu_fd = vcpu_fd,
+			.capsule_id = 1,
+			.lifecycle_generation = 1,
+		};
+		value = (fuzz_next() >> 1) | 1;
+		switch (i % 6) {
+		case 0:
+			attach.size = sizeof(attach) + (value & 15) + 1;
+			break;
+		case 1:
+			attach.flags = value;
+			break;
+		case 2:
+			attach.reserved0 = value;
+			break;
+		case 3:
+			attach.capsule_id = 0;
+			break;
+		case 4:
+			attach.lifecycle_generation = 0;
+			break;
+		case 5:
+			attach.reserved[value % ARRAY_SIZE(attach.reserved)] = value;
+			break;
+		}
+		assert_ioctl_errno(domain_fd, KVM_EXEC_ATTACH_VCPU, &attach,
+				   EINVAL);
+	}
+	attach_vcpu(domain_fd, vcpu_fd, 1, 1);
+
+	for (i = 0; i < 96; i++) {
+		create_executor_req = (struct kvm_exec_create_executor) {
+			.size = sizeof(create_executor_req),
+			.requested_cpu = KVM_EXEC_CPU_ANY,
+		};
+		value = (fuzz_next() >> 1) | 1;
+		switch (i % 6) {
+		case 0:
+			create_executor_req.size =
+				sizeof(create_executor_req) + (value & 15) + 1;
+			break;
+		case 1:
+			create_executor_req.flags = 2U << (value % 30);
+			break;
+		case 2:
+			create_executor_req.flags = KVM_EXECUTOR_F_STRICT_CPU;
+			break;
+		case 3:
+			create_executor_req.requested_cpu = UINT32_MAX - 1;
+			break;
+		case 4:
+			create_executor_req.reserved0 = value;
+			break;
+		case 5:
+			reserved_index =
+				value % ARRAY_SIZE(create_executor_req.reserved);
+			create_executor_req.reserved[reserved_index] = value;
+			break;
+		}
+		assert_ioctl_errno(domain_fd, KVM_EXEC_CREATE_EXECUTOR,
+				   &create_executor_req, EINVAL);
+	}
+	executor_fd = create_executor(domain_fd, 1, &executor_generation);
+
+	for (i = 0; i < 128; i++) {
+		run = (struct kvm_exec_run) {
+			.size = sizeof(run),
+			.request_sequence = 1,
+			.domain_generation = domain_generation,
+			.executor_generation = executor_generation,
+			.target_capsule_id = 1,
+			.target_lifecycle_generation = 1,
+		};
+		value = (fuzz_next() >> 1) | 1;
+		switch (i % 10) {
+		case 0:
+			run.size = sizeof(run) + (value & 15) + 1;
+			break;
+		case 1:
+			run.flags = value;
+			break;
+		case 2:
+			run.request_sequence = 0;
+			break;
+		case 3:
+			run.target_capsule_id = 0;
+			break;
+		case 4:
+			run.target_lifecycle_generation = 0;
+			break;
+		case 5:
+			run.reserved[value % ARRAY_SIZE(run.reserved)] = value;
+			break;
+		case 6:
+			run.domain_generation += value;
+			break;
+		case 7:
+			run.executor_generation += value;
+			break;
+		case 8:
+			run.target_lifecycle_generation += value;
+			break;
+		case 9:
+			run.target_capsule_id += value;
+			break;
+		}
+		assert_ioctl_errno(executor_fd, KVM_EXEC_RUN, &run,
+				   i % 10 < 6 ? EINVAL :
+				   i % 10 < 9 ? ESTALE : ENOENT);
+	}
+
+	for (i = 0; i < 64; i++) {
+		control = (struct kvm_exec_domain_control) {
+			.size = sizeof(control),
+		};
+		value = (fuzz_next() >> 1) | 1;
+		switch (i % 3) {
+		case 0:
+			control.size = sizeof(control) + (value & 15) + 1;
+			break;
+		case 1:
+			control.flags = value;
+			break;
+		case 2:
+			control.reserved[value % ARRAY_SIZE(control.reserved)] = value;
+			break;
+		}
+		assert_ioctl_errno(domain_fd, KVM_EXEC_PAUSE, &control, EINVAL);
+	}
+
+	for (i = 0; i < 64; i++) {
+		detach = (struct kvm_exec_detach_vcpu) {
+			.size = sizeof(detach),
+			.capsule_id = 1,
+			.lifecycle_generation = 1,
+		};
+		value = (fuzz_next() >> 1) | 1;
+		switch (i % 5) {
+		case 0:
+			detach.size = sizeof(detach) + (value & 15) + 1;
+			break;
+		case 1:
+			detach.flags = value;
+			break;
+		case 2:
+			detach.capsule_id = 0;
+			break;
+		case 3:
+			detach.lifecycle_generation = 0;
+			break;
+		case 4:
+			detach.reserved[value % ARRAY_SIZE(detach.reserved)] = value;
+			break;
+		}
+		assert_ioctl_errno(domain_fd, KVM_EXEC_DETACH_VCPU, &detach,
+				   EINVAL);
+	}
+
+	close(executor_fd);
+	detach_vcpu(domain_fd, 1, 1);
+	close(domain_fd);
+	close(vcpu_fd);
+	close(vm_fd);
+}
+
 static int wrong_mm_exec_check(const char *fd_string)
 {
 	struct kvm_exec_domain_control control = { .size = sizeof(control) };
@@ -623,12 +968,15 @@ int main(int argc, char **argv)
 
 	test_create_empty_domain(kvm_fd);
 	test_one_capsule_run_and_legacy_restore(kvm_fd);
+	test_strict_cpu_placement(kvm_fd);
+	test_rejects_unsupported_x86_state(kvm_fd);
 	test_many_capsules_across_vms(kvm_fd);
 	test_two_executor_claim_race(kvm_fd);
 	test_pause_drain_and_runner_signal(kvm_fd);
 	test_fd_close_orders(kvm_fd);
 	test_wrong_mm(kvm_fd, argv[0]);
 	test_malformed_and_stale_requests(kvm_fd);
+	test_deterministic_malformed_fuzz(kvm_fd);
 	close(kvm_fd);
 	return 0;
 }
