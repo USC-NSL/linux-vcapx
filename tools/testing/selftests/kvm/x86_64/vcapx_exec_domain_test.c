@@ -1001,7 +1001,13 @@ static void test_cross_vm_trace_stops_on_exit(int kvm_fd, void *guest_code,
 	TEST_ASSERT(b_count_at_exit > 0, "VM B made no progress before exit");
 
 	if (expected_exit == KVM_EXIT_IO) {
-		TEST_ASSERT_EQ(a->run->io.direction, KVM_EXIT_IO_OUT);
+		uint8_t pio_value = 0;
+
+		TEST_ASSERT_EQ(a->run->io.direction, KVM_EXIT_IO_IN);
+		TEST_ASSERT_EQ(a->run->io.size, sizeof(pio_value));
+		TEST_ASSERT_EQ(a->run->io.count, 1);
+		memcpy((uint8_t *)a->run + a->run->io.data_offset,
+		       &pio_value, sizeof(pio_value));
 	} else {
 		uint64_t mmio_value = 0x5a5ac055600dULL;
 
