@@ -1332,11 +1332,8 @@ static void test_trace_target_contention(int kvm_fd, bool cross_vm)
 	kvm_vm_free(vm_a);
 }
 
-static uint64_t trace_signal_ready;
-
 static void guest_trace_signal(void)
 {
-	WRITE_ONCE(trace_signal_ready, 1);
 	for (;;)
 		asm volatile("pause");
 }
@@ -1371,9 +1368,9 @@ static void test_trace_signal_releases_references(int kvm_fd, bool cross_vm)
 	struct kvm_vcpu *a, *b = NULL;
 	struct kvm_vm *vm_a, *vm_b = NULL;
 	uint64_t domain_generation, executor_generation;
-	uint64_t *ready_a, *ready_b = NULL;
+	uint64_t exits_before[2];
 	pthread_t thread;
-	int domain_fd, i;
+	int domain_fd, stats_fds[2], i;
 
 	sigemptyset(&action.sa_mask);
 	TEST_ASSERT(!sigaction(SIGUSR1, &action, NULL),
@@ -1381,16 +1378,15 @@ static void test_trace_signal_releases_references(int kvm_fd, bool cross_vm)
 	vm_a = vm_create_with_one_vcpu(&a, guest_trace_signal);
 	disable_nested_cpuid(a);
 	vcpu_guest_debug_set(a, &debug);
-	ready_a = addr_gva2hva(vm_a, (vm_vaddr_t)&trace_signal_ready);
-	WRITE_ONCE(*ready_a, 0);
+	stats_fds[0] = vcpu_get_stats_fd(a);
+	exits_before[0] = vcpu_get_stat(stats_fds[0], "exits");
 	if (cross_vm) {
 		features |= KVM_EXEC_FEATURE_CROSS_VM_CHAIN;
 		vm_b = vm_create_with_one_vcpu(&b, guest_trace_signal);
 		disable_nested_cpuid(b);
 		vcpu_guest_debug_set(b, &debug);
-		ready_b = addr_gva2hva(vm_b,
-				       (vm_vaddr_t)&trace_signal_ready);
-		WRITE_ONCE(*ready_b, 0);
+		stats_fds[1] = vcpu_get_stats_fd(b);
+		exits_before[1] = vcpu_get_stat(stats_fds[1], "exits");
 	}
 	domain_fd = create_domain_with_features(kvm_fd, cross_vm ? 2 : 1, 1,
 						features,
@@ -1407,17 +1403,20 @@ static void test_trace_signal_releases_references(int kvm_fd, bool cross_vm)
 		.executor_generation = executor_generation,
 		.entries = (uintptr_t)entries,
 		.nr_entries = cross_vm ? ARRAY_SIZE(entries) : 1,
-		.repeat_count = KVM_EXEC_TRACE_MAX_STEPS,
+		.repeat_count = KVM_EXEC_TRACE_MAX_STEPS /
+				(cross_vm ? ARRAY_SIZE(entries) : 1),
 	};
 
 	TEST_ASSERT(!pthread_create(&thread, NULL, trace_runner, &run_arg),
 		    "pthread_create failed");
 	for (i = 0; i < 1000000 &&
-	     (!READ_ONCE(*ready_a) ||
-	      (cross_vm && !READ_ONCE(*ready_b))); i++)
+	     (vcpu_get_stat(stats_fds[0], "exits") == exits_before[0] ||
+	      (cross_vm && vcpu_get_stat(stats_fds[1], "exits") ==
+	       exits_before[1])); i++)
 		sched_yield();
-	TEST_ASSERT(READ_ONCE(*ready_a) &&
-		    (!cross_vm || READ_ONCE(*ready_b)),
+	TEST_ASSERT(vcpu_get_stat(stats_fds[0], "exits") > exits_before[0] &&
+		    (!cross_vm ||
+		     vcpu_get_stat(stats_fds[1], "exits") > exits_before[1]),
 		    "signal trace did not start every target");
 	assert_ioctl_errno(domain_fd, KVM_EXEC_DETACH_VCPU, &detach[0], EBUSY);
 	if (cross_vm)
@@ -1442,8 +1441,11 @@ static void test_trace_signal_releases_references(int kvm_fd, bool cross_vm)
 	if (cross_vm)
 		detach_vcpu(domain_fd, 52, 1);
 	close(domain_fd);
-	if (vm_b)
+	close(stats_fds[0]);
+	if (vm_b) {
+		close(stats_fds[1]);
 		kvm_vm_free(vm_b);
+	}
 	kvm_vm_free(vm_a);
 }
 
