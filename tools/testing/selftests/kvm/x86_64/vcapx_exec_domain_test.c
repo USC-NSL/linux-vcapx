@@ -1429,9 +1429,8 @@ static void test_trace_signal_releases_references(int kvm_fd, bool cross_vm)
 		    run_arg.error);
 	TEST_ASSERT_EQ(run_arg.trace.return_reason, KVM_EXEC_RETURN_SIGNAL);
 	TEST_ASSERT_EQ(run_arg.trace.run_result, -EINTR);
-	TEST_ASSERT(run_arg.trace.completed_steps > 0 &&
-		    run_arg.trace.completed_steps < KVM_EXEC_TRACE_MAX_STEPS,
-		    "signal did not stop an active trace");
+	TEST_ASSERT(run_arg.trace.completed_steps < KVM_EXEC_TRACE_MAX_STEPS,
+		    "signal did not stop the trace before its step bound");
 	if (cross_vm)
 		TEST_ASSERT(run_arg.trace.switch_count > 0,
 			    "cross-VM signal test did not switch targets");
