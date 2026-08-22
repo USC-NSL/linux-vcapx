@@ -841,7 +841,7 @@ static long kvm_exec_run_trace(struct kvm_exec_executor *executor,
 			continue;
 		}
 
-		handoff_start = ktime_get_mono_fast_ns();
+		handoff_start = ktime_get_ns();
 		if (next->owner || next->running) {
 			trace.return_reason = KVM_EXEC_RETURN_TRACE_TARGET_BUSY;
 			trace.run_result = -EBUSY;
@@ -851,7 +851,7 @@ static long kvm_exec_run_trace(struct kvm_exec_executor *executor,
 		next->owner = executor;
 		executor->current_capsule = next;
 		next->running = true;
-		handoff_end = ktime_get_mono_fast_ns();
+		handoff_end = ktime_get_ns();
 		trace.switch_count++;
 		if (!trace.first_switch_ns)
 			trace.first_switch_ns = handoff_end;
