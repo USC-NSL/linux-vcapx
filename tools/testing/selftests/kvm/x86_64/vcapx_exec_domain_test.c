@@ -174,15 +174,14 @@ static void disable_nested_cpuid(struct kvm_vcpu *vcpu)
 		vcpu_clear_cpuid_feature(vcpu, X86_FEATURE_SVM);
 }
 
-static uint64_t vcpu_get_stat(struct kvm_vcpu *vcpu, const char *stat_name)
+static uint64_t vcpu_get_stat(int stats_fd, const char *stat_name)
 {
 	struct kvm_stats_header header;
 	struct kvm_stats_desc *descriptors, *descriptor;
 	uint64_t data = 0;
 	size_t descriptor_size;
-	int stats_fd, i;
+	int i;
 
-	stats_fd = vcpu_get_stats_fd(vcpu);
 	read_stats_header(stats_fd, &header);
 	descriptors = read_stats_descriptors(stats_fd, &header);
 	descriptor_size = get_stats_descriptor_size(&header);
@@ -193,12 +192,10 @@ static uint64_t vcpu_get_stat(struct kvm_vcpu *vcpu, const char *stat_name)
 			continue;
 		read_stat_data(stats_fd, &header, descriptor, &data, 1);
 		free(descriptors);
-		close(stats_fd);
 		return data;
 	}
 
 	free(descriptors);
-	close(stats_fd);
 	TEST_FAIL("vCPU statistic '%s' is unavailable", stat_name);
 	return 0;
 }
@@ -594,7 +591,7 @@ static void test_cross_vm_state_and_seeded_traces(int kvm_fd)
 	uint64_t *tsc_errors[2], *nmi_counts[2], *nmi_errors[2];
 	uint64_t domain_generation, executor_generation;
 	uint64_t expected_switches;
-	int domain_fd, executor_fd, ret, i, vm_index;
+	int domain_fd, executor_fd, stats_fds[4], ret, i, vm_index;
 
 	vm_a = vm_create_with_one_vcpu(&vcpus[0], guest_single_step_trace);
 	vcpus[2] = vm_vcpu_add(vm_a, 1, guest_single_step_trace);
@@ -661,7 +658,8 @@ static void test_cross_vm_state_and_seeded_traces(int kvm_fd)
 		vcpu_fpu_set(vcpus[i], &fpu[i]);
 		ret = ioctl(vcpus[i]->fd, KVM_NMI, 0);
 		TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_NMI, ret));
-		exits_before[i] = vcpu_get_stat(vcpus[i], "exits");
+		stats_fds[i] = vcpu_get_stats_fd(vcpus[i]);
+		exits_before[i] = vcpu_get_stat(stats_fds[i], "exits");
 	}
 
 	domain_fd = create_domain_with_features(kvm_fd, 4, 1, features,
@@ -729,7 +727,7 @@ static void test_cross_vm_state_and_seeded_traces(int kvm_fd)
 	control_domain(domain_fd, KVM_EXEC_DRAIN);
 	for (i = 0; i < 4; i++) {
 		vm_index = i & 1;
-		TEST_ASSERT(vcpu_get_stat(vcpus[i], "exits") > exits_before[i],
+		TEST_ASSERT(vcpu_get_stat(stats_fds[i], "exits") > exits_before[i],
 			    "cross-VM vCPU %d exit accounting did not advance", i);
 		vcpu_regs_get(vcpus[i], &observed_regs);
 		TEST_ASSERT_EQ(observed_regs.rsp,
@@ -743,6 +741,7 @@ static void test_cross_vm_state_and_seeded_traces(int kvm_fd)
 				    sizeof(xmm_signatures[i])),
 			    "cross-VM vCPU %d XMM15 signature changed", i);
 		detach_vcpu(domain_fd, capsule_ids[i], generations[i]);
+		close(stats_fds[i]);
 	}
 	close(executor_fd);
 	close(domain_fd);
@@ -964,7 +963,7 @@ static void test_cross_vm_trace_stops_on_exit(int kvm_fd, void *guest_code,
 	uint64_t domain_generation, executor_generation;
 	uint64_t *b_counts, b_count_at_exit;
 	uint64_t b_exits_before, b_exits_at_exit;
-	int domain_fd, executor_fd, ret;
+	int domain_fd, executor_fd, b_stats_fd, ret;
 
 	vm_a = vm_create_with_one_vcpu(&a, guest_code);
 	vm_b = vm_create_with_one_vcpu(&b, guest_single_step_trace);
@@ -977,7 +976,8 @@ static void test_cross_vm_trace_stops_on_exit(int kvm_fd, void *guest_code,
 		virt_map(vm_a, TRACE_MMIO_GPA, TRACE_MMIO_GPA, 1);
 	b_counts = addr_gva2hva(vm_b, (vm_vaddr_t)trace_counts);
 	memset(b_counts, 0, sizeof(trace_counts));
-	b_exits_before = vcpu_get_stat(b, "exits");
+	b_stats_fd = vcpu_get_stats_fd(b);
+	b_exits_before = vcpu_get_stat(b_stats_fd, "exits");
 
 	domain_fd = create_domain_with_features(kvm_fd, 2, 1, features,
 						&domain_generation);
@@ -1000,7 +1000,7 @@ static void test_cross_vm_trace_stops_on_exit(int kvm_fd, void *guest_code,
 	TEST_ASSERT(trace.switch_count > 0,
 		    "cross-VM trace reached a device exit without switching");
 	b_count_at_exit = READ_ONCE(b_counts[1]);
-	b_exits_at_exit = vcpu_get_stat(b, "exits");
+	b_exits_at_exit = vcpu_get_stat(b_stats_fd, "exits");
 	TEST_ASSERT(b_exits_at_exit > b_exits_before,
 		    "VM B did not enter before VM A's device exit");
 
@@ -1029,7 +1029,7 @@ static void test_cross_vm_trace_stops_on_exit(int kvm_fd, void *guest_code,
 	TEST_ASSERT_EQ(run.vcpu_exit_reason, KVM_EXIT_DEBUG);
 	TEST_ASSERT_EQ(run.owned_capsule_id, 61);
 	TEST_ASSERT_EQ(READ_ONCE(b_counts[1]), b_count_at_exit);
-	TEST_ASSERT_EQ(vcpu_get_stat(b, "exits"), b_exits_at_exit);
+	TEST_ASSERT_EQ(vcpu_get_stat(b_stats_fd, "exits"), b_exits_at_exit);
 
 	control_domain(domain_fd, KVM_EXEC_PAUSE);
 	control_domain(domain_fd, KVM_EXEC_DRAIN);
@@ -1037,6 +1037,7 @@ static void test_cross_vm_trace_stops_on_exit(int kvm_fd, void *guest_code,
 	detach_vcpu(domain_fd, 62, 1);
 	close(executor_fd);
 	close(domain_fd);
+	close(b_stats_fd);
 	kvm_vm_free(vm_b);
 	kvm_vm_free(vm_a);
 }
