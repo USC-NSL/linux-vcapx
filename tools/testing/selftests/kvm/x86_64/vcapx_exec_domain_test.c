@@ -10,7 +10,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
-#include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -1116,7 +1115,7 @@ static void test_cross_vm_memslot_update(int kvm_fd)
 	uint64_t domain_generation, executor_generation;
 	uint64_t (*a_observations)[2], (*b_observations)[2];
 	uint64_t *a_errors, *b_errors, b_before_update;
-	void *a_old_hva, *a_new_hva, *b_hva;
+	void *a_hva, *b_hva;
 	pthread_t thread;
 	int domain_fd, i;
 
@@ -1135,14 +1134,10 @@ static void test_cross_vm_memslot_update(int kvm_fd)
 				    TRACE_SLOT_GPA, TRACE_SLOT_ID, 1, 0);
 	virt_map(vm_a, TRACE_SLOT_GPA, TRACE_SLOT_GPA, 1);
 	virt_map(vm_b, TRACE_SLOT_GPA, TRACE_SLOT_GPA, 1);
-	a_old_hva = addr_gpa2hva(vm_a, TRACE_SLOT_GPA);
+	a_hva = addr_gpa2hva(vm_a, TRACE_SLOT_GPA);
 	b_hva = addr_gpa2hva(vm_b, TRACE_SLOT_GPA);
-	WRITE_ONCE(*(uint64_t *)a_old_hva, TRACE_SLOT_A_OLD);
+	WRITE_ONCE(*(uint64_t *)a_hva, TRACE_SLOT_A_OLD);
 	WRITE_ONCE(*(uint64_t *)b_hva, TRACE_SLOT_B);
-	a_new_hva = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
-			 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	TEST_ASSERT(a_new_hva != MAP_FAILED, "mmap failed, errno %d", errno);
-	WRITE_ONCE(*(uint64_t *)a_new_hva, TRACE_SLOT_A_NEW);
 
 	a_observations = addr_gva2hva(vm_a,
 				      (vm_vaddr_t)trace_slot_observations);
@@ -1182,7 +1177,9 @@ static void test_cross_vm_memslot_update(int kvm_fd)
 		    "cross-VM trace did not observe initial slot mappings");
 	b_before_update = READ_ONCE(b_observations[1][0]);
 
-	slot.userspace_addr = (uintptr_t)a_new_hva;
+	WRITE_ONCE(*(uint64_t *)a_hva, TRACE_SLOT_A_NEW);
+	slot.flags = KVM_MEM_LOG_DIRTY_PAGES;
+	slot.userspace_addr = (uintptr_t)a_hva;
 	vm_ioctl(vm_a, KVM_SET_USER_MEMORY_REGION, &slot);
 	for (i = 0; i < 1000000 &&
 	     !READ_ONCE(a_observations[0][1]); i++)
@@ -1208,9 +1205,8 @@ static void test_cross_vm_memslot_update(int kvm_fd)
 	TEST_ASSERT_EQ(READ_ONCE(b_observations[0][0]), 0);
 	TEST_ASSERT_EQ(READ_ONCE(b_observations[0][1]), 0);
 
-	slot.userspace_addr = (uintptr_t)a_old_hva;
+	slot.flags = 0;
 	vm_ioctl(vm_a, KVM_SET_USER_MEMORY_REGION, &slot);
-	TEST_ASSERT(!munmap(a_new_hva, 4096), "munmap failed, errno %d", errno);
 	detach_vcpu(domain_fd, 71, 1);
 	detach_vcpu(domain_fd, 72, 1);
 	close(run_arg.executor_fd);
