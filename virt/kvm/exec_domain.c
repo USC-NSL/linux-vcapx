@@ -118,6 +118,8 @@ static void kvm_exec_kick_running_locked(struct kvm_exec_domain *domain)
 		if (!capsule->vcpu || !capsule->running)
 			continue;
 		kvm_make_request(KVM_REQ_EXEC_DOMAIN_EXIT, capsule->vcpu);
+		/* Break KVM's halt wait so x86 can consume the exit request. */
+		kvm_make_request(KVM_REQ_UNBLOCK, capsule->vcpu);
 		kvm_vcpu_kick(capsule->vcpu);
 	}
 }
