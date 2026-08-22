@@ -6,8 +6,13 @@
 #include <linux/kvm_host.h>
 #include <linux/module.h>
 #include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/timekeeping.h>
 #include <linux/uaccess.h>
 #include <linux/xarray.h>
+
+#define KVM_EXEC_SUPPORTED_FEATURES \
+	(KVM_EXEC_FEATURE_BASE_OBJECTS | KVM_EXEC_FEATURE_INTRA_VM_CHAIN)
 
 struct kvm_exec_domain;
 struct kvm_exec_executor;
@@ -19,6 +24,7 @@ struct kvm_exec_capsule {
 	struct kvm_exec_executor *owner;
 	u64 capsule_id;
 	u64 lifecycle_generation;
+	u32 trace_refs;
 	bool running;
 };
 
@@ -47,6 +53,7 @@ struct kvm_exec_domain {
 	wait_queue_head_t drain_wait;
 	atomic_t active_runs;
 	u64 generation;
+	u64 negotiated_features;
 	u32 max_capsules;
 	u32 max_executors;
 	u32 nr_capsule_slots;
@@ -318,7 +325,7 @@ static int kvm_exec_detach_vcpu(struct kvm_exec_domain *domain,
 		ret = -ESTALE;
 		goto out;
 	}
-	if (capsule->owner || capsule->running) {
+	if (capsule->owner || capsule->running || capsule->trace_refs) {
 		ret = -EBUSY;
 		goto out;
 	}
@@ -593,6 +600,297 @@ out_executor:
 	return ret;
 }
 
+static void
+kvm_exec_trace_put_refs_locked(struct kvm_exec_capsule **capsules, u32 nr_capsules)
+{
+	u32 i;
+
+	for (i = 0; i < nr_capsules; i++) {
+		if (WARN_ON_ONCE(!capsules[i]->trace_refs))
+			continue;
+		capsules[i]->trace_refs--;
+	}
+}
+
+static long kvm_exec_run_trace(struct kvm_exec_executor *executor,
+			       void __user *argp)
+{
+	struct kvm_exec_domain *domain = executor->domain;
+	struct kvm_exec_trace_entry *entries;
+	struct kvm_exec_capsule **capsules;
+	struct kvm_exec_capsule *capsule, *next;
+	struct kvm_exec_run_trace trace;
+	struct kvm *trace_kvm = NULL;
+	u64 total_steps, step;
+	u64 handoff_start, handoff_end;
+	u32 initial_cpu, final_cpu, i;
+	bool active = false;
+	int run_ret, ret;
+
+	if (copy_from_user(&trace, argp, sizeof(trace)))
+		return -EFAULT;
+	if (trace.size != sizeof(trace) || trace.flags ||
+	    !trace.request_sequence || !trace.nr_entries ||
+	    trace.nr_entries > KVM_EXEC_TRACE_MAX_ENTRIES ||
+	    !trace.repeat_count ||
+	    memchr_inv(trace.reserved, 0, sizeof(trace.reserved)))
+		return trace.nr_entries > KVM_EXEC_TRACE_MAX_ENTRIES ?
+			-E2BIG : -EINVAL;
+	total_steps = (u64)trace.nr_entries * trace.repeat_count;
+	if (total_steps > KVM_EXEC_TRACE_MAX_STEPS)
+		return -E2BIG;
+
+	ret = kvm_exec_domain_access(domain);
+	if (ret)
+		return ret;
+	if (!(domain->negotiated_features &
+	      KVM_EXEC_FEATURE_INTRA_VM_CHAIN))
+		return -EOPNOTSUPP;
+
+	entries = memdup_array_user(u64_to_user_ptr(trace.entries),
+				    trace.nr_entries, sizeof(*entries));
+	if (IS_ERR(entries))
+		return PTR_ERR(entries);
+	capsules = kcalloc(trace.nr_entries, sizeof(*capsules),
+			   GFP_KERNEL_ACCOUNT);
+	if (!capsules) {
+		ret = -ENOMEM;
+		goto out_entries;
+	}
+
+	for (i = 0; i < trace.nr_entries; i++) {
+		if (!entries[i].capsule_id ||
+		    !entries[i].lifecycle_generation || entries[i].reserved ||
+		    entries[i].capsule_id > ULONG_MAX) {
+			ret = -EINVAL;
+			goto out_capsules;
+		}
+	}
+
+	if (mutex_lock_killable(&executor->run_lock)) {
+		ret = -EINTR;
+		goto out_capsules;
+	}
+	if (trace.domain_generation != domain->generation ||
+	    trace.executor_generation != executor->generation ||
+	    trace.request_sequence <= executor->last_request_sequence) {
+		ret = -ESTALE;
+		goto out_executor;
+	}
+
+	initial_cpu = get_cpu();
+	put_cpu();
+	final_cpu = initial_cpu;
+	if ((executor->flags & KVM_EXECUTOR_F_STRICT_CPU) &&
+	    initial_cpu != executor->requested_cpu) {
+		ret = -EXDEV;
+		goto out_executor;
+	}
+
+	mutex_lock(&domain->lock);
+	if (domain->stopping) {
+		ret = -ESHUTDOWN;
+		goto out_domain;
+	}
+	if (domain->paused) {
+		ret = -EBUSY;
+		goto out_domain;
+	}
+
+	for (i = 0; i < trace.nr_entries; i++) {
+		capsule = xa_load(&domain->capsules, entries[i].capsule_id);
+		if (!capsule || !capsule->vcpu) {
+			ret = -ENOENT;
+			goto out_domain;
+		}
+		if (capsule->lifecycle_generation !=
+		    entries[i].lifecycle_generation) {
+			ret = -ESTALE;
+			goto out_domain;
+		}
+		if (!trace_kvm) {
+			trace_kvm = capsule->vcpu->kvm;
+		} else if (trace_kvm != capsule->vcpu->kvm) {
+			ret = -EXDEV;
+			goto out_domain;
+		}
+		if ((capsule->vcpu->guest_debug &
+		     (KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_SINGLESTEP)) !=
+		    (KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_SINGLESTEP)) {
+			ret = -EINVAL;
+			goto out_domain;
+		}
+		if ((capsule->owner &&
+		     (capsule->owner != executor ||
+		      executor->current_capsule != capsule)) ||
+		    capsule->running) {
+			ret = -EBUSY;
+			goto out_domain;
+		}
+		capsules[i] = capsule;
+	}
+
+	capsule = capsules[0];
+	if ((executor->current_capsule &&
+	     executor->current_capsule != capsule) ||
+	    (capsule->owner && capsule->owner != executor)) {
+		ret = -EBUSY;
+		goto out_domain;
+	}
+	for (i = 0; i < trace.nr_entries; i++)
+		capsules[i]->trace_refs++;
+	if (!capsule->owner) {
+		capsule->owner = executor;
+		executor->current_capsule = capsule;
+	}
+	capsule->running = true;
+	atomic_inc(&domain->active_runs);
+	active = true;
+	executor->last_request_sequence = trace.request_sequence;
+	mutex_unlock(&domain->lock);
+
+	trace.return_reason = 0;
+	trace.run_result = 0;
+	trace.vcpu_exit_reason = 0;
+	trace.current_cpu = initial_cpu;
+	trace.owned_capsule_id = capsule->capsule_id;
+	trace.owned_lifecycle_generation = capsule->lifecycle_generation;
+	trace.completed_steps = 0;
+	trace.switch_count = 0;
+	trace.first_switch_ns = 0;
+	trace.last_switch_ns = 0;
+	trace.ownership_handoff_ns = 0;
+
+	for (step = 0; step < total_steps; step++) {
+		final_cpu = get_cpu();
+		put_cpu();
+		trace.current_cpu = final_cpu;
+		if ((executor->flags & KVM_EXECUTOR_F_STRICT_CPU) &&
+		    final_cpu != executor->requested_cpu) {
+			trace.return_reason = KVM_EXEC_RETURN_CPU_MIGRATED;
+			trace.run_result = -EXDEV;
+			goto finish_run;
+		}
+
+		capsule = executor->current_capsule;
+		if (mutex_lock_killable(&capsule->vcpu->mutex)) {
+			trace.return_reason = KVM_EXEC_RETURN_SIGNAL;
+			trace.run_result = -EINTR;
+			goto finish_run;
+		}
+		if (READ_ONCE(domain->stopping) || READ_ONCE(domain->paused)) {
+			trace.return_reason = READ_ONCE(domain->stopping) ?
+				KVM_EXEC_RETURN_DOMAIN_STOPPING :
+				KVM_EXEC_RETURN_DOMAIN_PAUSED;
+			trace.run_result = -EINTR;
+			mutex_unlock(&capsule->vcpu->mutex);
+			goto finish_run;
+		}
+		if (capsule->vcpu->exec_capsule != capsule ||
+		    !kvm_arch_vcpu_exec_domain_supported(capsule->vcpu)) {
+			trace.return_reason = KVM_EXEC_RETURN_VCPU_EXIT;
+			trace.run_result = -EOPNOTSUPP;
+			mutex_unlock(&capsule->vcpu->mutex);
+			goto finish_run;
+		}
+
+		run_ret = kvm_vcpu_run(capsule->vcpu);
+		final_cpu = get_cpu();
+		put_cpu();
+		trace.run_result = run_ret;
+		trace.vcpu_exit_reason = capsule->vcpu->run->exit_reason;
+		trace.current_cpu = final_cpu;
+		mutex_unlock(&capsule->vcpu->mutex);
+
+		mutex_lock(&domain->lock);
+		capsule->running = false;
+		if (domain->stopping) {
+			trace.return_reason = KVM_EXEC_RETURN_DOMAIN_STOPPING;
+			goto finish_locked;
+		}
+		if (domain->paused) {
+			trace.return_reason = KVM_EXEC_RETURN_DOMAIN_PAUSED;
+			goto finish_locked;
+		}
+		if ((executor->flags & KVM_EXECUTOR_F_STRICT_CPU) &&
+		    final_cpu != executor->requested_cpu) {
+			trace.return_reason = KVM_EXEC_RETURN_CPU_MIGRATED;
+			goto finish_locked;
+		}
+		if (run_ret == -EINTR) {
+			trace.return_reason = KVM_EXEC_RETURN_SIGNAL;
+			goto finish_locked;
+		}
+		if (run_ret || trace.vcpu_exit_reason != KVM_EXIT_DEBUG) {
+			trace.return_reason = KVM_EXEC_RETURN_VCPU_EXIT;
+			goto finish_locked;
+		}
+
+		trace.completed_steps++;
+		if (step + 1 == total_steps) {
+			trace.return_reason = KVM_EXEC_RETURN_TRACE_COMPLETE;
+			goto finish_locked;
+		}
+
+		next = capsules[(step + 1) % trace.nr_entries];
+		if (next == capsule) {
+			capsule->running = true;
+			mutex_unlock(&domain->lock);
+			continue;
+		}
+
+		handoff_start = ktime_get_mono_fast_ns();
+		if (next->owner || next->running) {
+			trace.return_reason = KVM_EXEC_RETURN_TRACE_TARGET_BUSY;
+			trace.run_result = -EBUSY;
+			goto finish_locked;
+		}
+		capsule->owner = NULL;
+		next->owner = executor;
+		executor->current_capsule = next;
+		next->running = true;
+		handoff_end = ktime_get_mono_fast_ns();
+		trace.switch_count++;
+		if (!trace.first_switch_ns)
+			trace.first_switch_ns = handoff_end;
+		trace.last_switch_ns = handoff_end;
+		trace.ownership_handoff_ns += handoff_end - handoff_start;
+		mutex_unlock(&domain->lock);
+	}
+
+finish_run:
+	mutex_lock(&domain->lock);
+	capsule = executor->current_capsule;
+	if (capsule && capsule->running)
+		capsule->running = false;
+finish_locked:
+	capsule = executor->current_capsule;
+	if (capsule) {
+		trace.owned_capsule_id = capsule->capsule_id;
+		trace.owned_lifecycle_generation =
+			capsule->lifecycle_generation;
+	}
+	if (active) {
+		kvm_exec_trace_put_refs_locked(capsules, trace.nr_entries);
+		atomic_dec(&domain->active_runs);
+	}
+	mutex_unlock(&domain->lock);
+	wake_up_all(&domain->drain_wait);
+	memset(trace.reserved, 0, sizeof(trace.reserved));
+	ret = copy_to_user(argp, &trace, sizeof(trace)) ? -EFAULT : 0;
+	goto out_executor;
+
+out_domain:
+	mutex_unlock(&domain->lock);
+out_executor:
+	mutex_unlock(&executor->run_lock);
+out_capsules:
+	kfree(capsules);
+out_entries:
+	kfree(entries);
+	return ret;
+}
+
 static long kvm_exec_executor_ioctl(struct file *file, unsigned int ioctl,
 				    unsigned long arg)
 {
@@ -600,9 +898,11 @@ static long kvm_exec_executor_ioctl(struct file *file, unsigned int ioctl,
 
 	if (_IOC_TYPE(ioctl) != KVMIO)
 		return -EINVAL;
-	if (ioctl != KVM_EXEC_RUN)
-		return -ENOTTY;
-	return kvm_exec_run(executor, (void __user *)arg);
+	if (ioctl == KVM_EXEC_RUN)
+		return kvm_exec_run(executor, (void __user *)arg);
+	if (ioctl == KVM_EXEC_RUN_TRACE)
+		return kvm_exec_run_trace(executor, (void __user *)arg);
+	return -ENOTTY;
 }
 
 static const struct file_operations kvm_exec_executor_fops = {
@@ -717,7 +1017,8 @@ int kvm_dev_ioctl_create_exec_domain(void __user *argp)
 	if (create.size != sizeof(create) || create.flags ||
 	    !create.max_capsules || !create.max_executors ||
 	    create.max_capsules > U16_MAX || create.max_executors > U16_MAX ||
-	    create.requested_features != KVM_EXEC_FEATURE_BASE_OBJECTS ||
+	    !(create.requested_features & KVM_EXEC_FEATURE_BASE_OBJECTS) ||
+	    create.requested_features & ~KVM_EXEC_SUPPORTED_FEATURES ||
 	    memchr_inv(create.reserved, 0, sizeof(create.reserved)))
 		return -EINVAL;
 
@@ -741,6 +1042,7 @@ int kvm_dev_ioctl_create_exec_domain(void __user *argp)
 	atomic_set(&domain->active_runs, 0);
 	domain->generation =
 		kvm_exec_next_generation(&kvm_exec_domain_generation);
+	domain->negotiated_features = create.requested_features;
 	domain->max_capsules = create.max_capsules;
 	domain->max_executors = create.max_executors;
 
@@ -754,7 +1056,7 @@ int kvm_dev_ioctl_create_exec_domain(void __user *argp)
 		return ret;
 	}
 
-	create.negotiated_features = KVM_EXEC_FEATURE_BASE_OBJECTS;
+	create.negotiated_features = domain->negotiated_features;
 	create.domain_generation = domain->generation;
 	if (copy_to_user(argp, &create, sizeof(create))) {
 		fput(file);

@@ -4867,7 +4867,8 @@ static int kvm_vm_ioctl_check_extension_generic(struct kvm *kvm, long arg)
 		return 1;
 	case KVM_CAP_VCPU_EXEC_DOMAIN:
 		return IS_ENABLED(CONFIG_X86_64) ?
-			KVM_EXEC_FEATURE_BASE_OBJECTS : 0;
+			KVM_EXEC_FEATURE_BASE_OBJECTS |
+			KVM_EXEC_FEATURE_INTRA_VM_CHAIN : 0;
 #ifdef CONFIG_KVM_MMIO
 	case KVM_CAP_COALESCED_MMIO:
 		return KVM_COALESCED_MMIO_PAGE_OFFSET;

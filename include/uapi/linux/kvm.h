@@ -881,7 +881,11 @@ struct kvm_ppc_resize_hpt {
 	((x) & KVM_VM_TYPE_ARM_IPA_SIZE_MASK)
 
 #define KVM_EXEC_FEATURE_BASE_OBJECTS	(1ULL << 0)
+#define KVM_EXEC_FEATURE_INTRA_VM_CHAIN	(1ULL << 1)
 #define KVM_EXEC_CPU_ANY		((__u32)-1)
+
+#define KVM_EXEC_TRACE_MAX_ENTRIES	256U
+#define KVM_EXEC_TRACE_MAX_STEPS	1000000U
 
 #define KVM_EXECUTOR_F_STRICT_CPU	(1U << 0)
 
@@ -890,6 +894,8 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_RETURN_DOMAIN_PAUSED	3
 #define KVM_EXEC_RETURN_DOMAIN_STOPPING	4
 #define KVM_EXEC_RETURN_CPU_MIGRATED	5
+#define KVM_EXEC_RETURN_TRACE_COMPLETE	6
+#define KVM_EXEC_RETURN_TRACE_TARGET_BUSY 7
 
 struct kvm_exec_domain_create {
 	__u32 size;
@@ -954,6 +960,37 @@ struct kvm_exec_run {
 	__u64 reserved[4];
 };
 
+struct kvm_exec_trace_entry {
+	__u64 capsule_id;
+	__u64 lifecycle_generation;
+	__u64 user_cookie;
+	__u64 reserved;
+};
+
+struct kvm_exec_run_trace {
+	__u32 size;
+	__u32 flags;
+	__u64 request_sequence;
+	__u64 domain_generation;
+	__u64 executor_generation;
+	__aligned_u64 entries;
+	__u32 nr_entries;
+	__u32 repeat_count;
+	__u64 user_cookie;
+	__u32 return_reason;
+	__s32 run_result;
+	__u32 vcpu_exit_reason;
+	__u32 current_cpu;
+	__u64 owned_capsule_id;
+	__u64 owned_lifecycle_generation;
+	__u64 completed_steps;
+	__u64 switch_count;
+	__u64 first_switch_ns;
+	__u64 last_switch_ns;
+	__u64 ownership_handoff_ns;
+	__u64 reserved[3];
+};
+
 /*
  * ioctls for /dev/kvm fds:
  */
@@ -991,6 +1028,8 @@ struct kvm_exec_run {
 #define KVM_EXEC_DRAIN            _IOW(KVMIO,  0xf5, \
 				      struct kvm_exec_domain_control)
 #define KVM_EXEC_RUN              _IOWR(KVMIO, 0xf6, struct kvm_exec_run)
+#define KVM_EXEC_RUN_TRACE        _IOWR(KVMIO, 0xf7, \
+				       struct kvm_exec_run_trace)
 
 /*
  * Extension capability list.
