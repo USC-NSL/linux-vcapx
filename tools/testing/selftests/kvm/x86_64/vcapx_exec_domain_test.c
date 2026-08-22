@@ -19,6 +19,8 @@
 
 static uint64_t fuzz_state = 0x8d26f31b9c47a5e1ULL;
 
+static void signal_handler(int signal);
+
 static uint64_t fuzz_next(void)
 {
 	fuzz_state ^= fuzz_state << 13;
@@ -150,6 +152,20 @@ static void guest_two_exits(void)
 
 static uint64_t trace_counts[2];
 static uint64_t trace_state_errors[2];
+static uint64_t trace_stacks[2];
+static uint64_t trace_stack_errors[2];
+static uint64_t trace_last_tsc[2];
+static uint64_t trace_tsc_errors[2];
+static uint64_t trace_nmi_counts[2];
+static uint64_t trace_nmi_errors;
+
+static void guest_trace_nmi_handler(struct ex_regs *regs)
+{
+	if (regs->rdi < ARRAY_SIZE(trace_nmi_counts))
+		trace_nmi_counts[regs->rdi]++;
+	else
+		trace_nmi_errors++;
+}
 
 static void guest_single_step_trace(uint64_t id)
 {
@@ -157,10 +173,22 @@ static void guest_single_step_trace(uint64_t id)
 	const uint64_t expected = signature;
 
 	for (;;) {
+		uint64_t now = rdtsc();
+		uint64_t stack;
+
+		asm volatile("mov %%rsp, %0" : "=r"(stack));
+
 		WRITE_ONCE(trace_counts[id], READ_ONCE(trace_counts[id]) + 1);
 		asm volatile("pause" : "+r"(signature) : : "memory");
 		if (signature != expected)
 			WRITE_ONCE(trace_state_errors[id], signature);
+		if (!READ_ONCE(trace_stacks[id]))
+			WRITE_ONCE(trace_stacks[id], stack);
+		else if (READ_ONCE(trace_stacks[id]) != stack)
+			WRITE_ONCE(trace_stack_errors[id], stack);
+		if (READ_ONCE(trace_last_tsc[id]) > now)
+			WRITE_ONCE(trace_tsc_errors[id], 1);
+		WRITE_ONCE(trace_last_tsc[id], now);
 	}
 }
 
@@ -192,24 +220,72 @@ static void test_same_vm_single_step_trace(int kvm_fd)
 		.repeat_count = repeats,
 		.user_cookie = 0x55aa,
 	};
-	uint64_t *counts, *errors;
+	static const uint64_t gpr_signatures[2] = {
+		0x5a5a000000000000ULL, 0x5a5a000000000001ULL,
+	};
+	static const uint64_t debug_signatures[2] = {
+		0x1111222233334444ULL, 0xaaaabbbbccccddddULL,
+	};
+	static const uint64_t xmm_signatures[2][2] = {
+		{ 0x0123456789abcdefULL, 0xfedcba9876543210ULL },
+		{ 0x8877665544332211ULL, 0x1122334455667788ULL },
+	};
+	struct kvm_debugregs debugregs[2], observed_debugregs;
+	struct kvm_fpu fpu[2], observed_fpu;
+	struct kvm_regs regs[2], observed_regs;
+	uint64_t *counts, *errors, *stacks, *stack_errors, *tsc_errors;
+	uint64_t *nmi_counts, *nmi_errors;
 	struct kvm_vcpu *a, *b;
+	struct kvm_vcpu *vcpus[2];
 	struct kvm_vm *vm;
 	uint64_t domain_generation, executor_generation;
-	int domain_fd, executor_fd, ret;
+	int domain_fd, executor_fd, ret, i;
 
 	vm = vm_create_with_one_vcpu(&a, guest_single_step_trace);
 	b = vm_vcpu_add(vm, 1, guest_single_step_trace);
 	vcpu_args_set(a, 1, 0);
 	vcpu_args_set(b, 1, 1);
+	vcpus[0] = a;
+	vcpus[1] = b;
 	disable_nested_cpuid(a);
 	disable_nested_cpuid(b);
+	vm_init_descriptor_tables(vm);
+	vcpu_init_descriptor_tables(a);
+	vcpu_init_descriptor_tables(b);
+	vm_install_exception_handler(vm, NMI_VECTOR,
+				     guest_trace_nmi_handler);
 	vcpu_guest_debug_set(a, &debug);
 	vcpu_guest_debug_set(b, &debug);
 	counts = addr_gva2hva(vm, (vm_vaddr_t)trace_counts);
 	errors = addr_gva2hva(vm, (vm_vaddr_t)trace_state_errors);
+	stacks = addr_gva2hva(vm, (vm_vaddr_t)trace_stacks);
+	stack_errors = addr_gva2hva(vm, (vm_vaddr_t)trace_stack_errors);
+	tsc_errors = addr_gva2hva(vm, (vm_vaddr_t)trace_tsc_errors);
+	nmi_counts = addr_gva2hva(vm, (vm_vaddr_t)trace_nmi_counts);
+	nmi_errors = addr_gva2hva(vm, (vm_vaddr_t)&trace_nmi_errors);
 	memset(counts, 0, sizeof(trace_counts));
 	memset(errors, 0, sizeof(trace_state_errors));
+	memset(stacks, 0, sizeof(trace_stacks));
+	memset(stack_errors, 0, sizeof(trace_stack_errors));
+	memset(addr_gva2hva(vm, (vm_vaddr_t)trace_last_tsc), 0,
+	       sizeof(trace_last_tsc));
+	memset(tsc_errors, 0, sizeof(trace_tsc_errors));
+	memset(nmi_counts, 0, sizeof(trace_nmi_counts));
+	WRITE_ONCE(*nmi_errors, 0);
+	for (i = 0; i < 2; i++) {
+		vcpu_regs_get(vcpus[i], &regs[i]);
+		regs[i].r12 = gpr_signatures[i];
+		vcpu_regs_set(vcpus[i], &regs[i]);
+		vcpu_debugregs_get(vcpus[i], &debugregs[i]);
+		debugregs[i].db[0] = debug_signatures[i];
+		vcpu_debugregs_set(vcpus[i], &debugregs[i]);
+		vcpu_fpu_get(vcpus[i], &fpu[i]);
+		memcpy(fpu[i].xmm[15], xmm_signatures[i],
+		       sizeof(xmm_signatures[i]));
+		vcpu_fpu_set(vcpus[i], &fpu[i]);
+		ret = ioctl(vcpus[i]->fd, KVM_NMI, 0);
+		TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_NMI, ret));
+	}
 
 	domain_fd = create_domain_with_features(kvm_fd, 2, 1, features,
 						&domain_generation);
@@ -238,9 +314,27 @@ static void test_same_vm_single_step_trace(int kvm_fd)
 		    "second trace vCPU made no guest progress");
 	TEST_ASSERT_EQ(READ_ONCE(errors[0]), 0);
 	TEST_ASSERT_EQ(READ_ONCE(errors[1]), 0);
+	TEST_ASSERT_EQ(READ_ONCE(stack_errors[0]), 0);
+	TEST_ASSERT_EQ(READ_ONCE(stack_errors[1]), 0);
+	TEST_ASSERT_EQ(READ_ONCE(tsc_errors[0]), 0);
+	TEST_ASSERT_EQ(READ_ONCE(tsc_errors[1]), 0);
+	TEST_ASSERT_EQ(READ_ONCE(nmi_counts[0]), 1);
+	TEST_ASSERT_EQ(READ_ONCE(nmi_counts[1]), 1);
+	TEST_ASSERT_EQ(READ_ONCE(*nmi_errors), 0);
 
 	control_domain(domain_fd, KVM_EXEC_PAUSE);
 	control_domain(domain_fd, KVM_EXEC_DRAIN);
+	for (i = 0; i < 2; i++) {
+		vcpu_regs_get(vcpus[i], &observed_regs);
+		TEST_ASSERT_EQ(observed_regs.rsp, READ_ONCE(stacks[i]));
+		TEST_ASSERT_EQ(observed_regs.r12, gpr_signatures[i]);
+		vcpu_debugregs_get(vcpus[i], &observed_debugregs);
+		TEST_ASSERT_EQ(observed_debugregs.db[0], debug_signatures[i]);
+		vcpu_fpu_get(vcpus[i], &observed_fpu);
+		TEST_ASSERT(!memcmp(observed_fpu.xmm[15], xmm_signatures[i],
+				    sizeof(xmm_signatures[i])),
+			    "vCPU %d XMM15 signature changed", i);
+	}
 	detach_vcpu(domain_fd, 11, 3);
 	detach_vcpu(domain_fd, 12, 4);
 	close(executor_fd);
@@ -344,6 +438,73 @@ static void test_base_only_domain_rejects_trace(int kvm_fd)
 
 	close(executor_fd);
 	close(domain_fd);
+}
+
+static void test_trace_stale_and_current_owner_rejection(int kvm_fd)
+{
+	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
+				  KVM_EXEC_FEATURE_INTRA_VM_CHAIN;
+	struct kvm_guest_debug debug = {
+		.control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_SINGLESTEP,
+	};
+	struct kvm_exec_trace_entry entry = {
+		.capsule_id = 31,
+		.lifecycle_generation = 7,
+	};
+	struct kvm_exec_run_trace trace = {
+		.size = sizeof(trace),
+		.request_sequence = 1,
+		.entries = (uintptr_t)&entry,
+		.nr_entries = 1,
+		.repeat_count = 1,
+	};
+	struct kvm_vcpu *a, *b;
+	struct kvm_vm *vm;
+	uint64_t domain_generation, executor_generation;
+	int domain_fd, executor_fd, ret;
+
+	vm = vm_create_with_one_vcpu(&a, guest_single_step_trace);
+	b = vm_vcpu_add(vm, 1, guest_single_step_trace);
+	vcpu_args_set(a, 1, 0);
+	vcpu_args_set(b, 1, 1);
+	disable_nested_cpuid(a);
+	disable_nested_cpuid(b);
+	vcpu_guest_debug_set(a, &debug);
+	vcpu_guest_debug_set(b, &debug);
+	domain_fd = create_domain_with_features(kvm_fd, 2, 1, features,
+						&domain_generation);
+	attach_vcpu(domain_fd, a->fd, 31, 7);
+	attach_vcpu(domain_fd, b->fd, 32, 9);
+	executor_fd = create_executor(domain_fd, 1, &executor_generation);
+	trace.domain_generation = domain_generation + 1;
+	trace.executor_generation = executor_generation;
+	assert_ioctl_errno(executor_fd, KVM_EXEC_RUN_TRACE, &trace, ESTALE);
+	trace.domain_generation = domain_generation;
+	trace.executor_generation = executor_generation + 1;
+	assert_ioctl_errno(executor_fd, KVM_EXEC_RUN_TRACE, &trace, ESTALE);
+	trace.executor_generation = executor_generation;
+	entry.lifecycle_generation++;
+	assert_ioctl_errno(executor_fd, KVM_EXEC_RUN_TRACE, &trace, ESTALE);
+	entry.lifecycle_generation--;
+
+	ret = ioctl(executor_fd, KVM_EXEC_RUN_TRACE, &trace);
+	TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_EXEC_RUN_TRACE, ret));
+	TEST_ASSERT_EQ(trace.return_reason, KVM_EXEC_RETURN_TRACE_COMPLETE);
+	TEST_ASSERT_EQ(trace.owned_capsule_id, 31);
+	assert_ioctl_errno(executor_fd, KVM_EXEC_RUN_TRACE, &trace, ESTALE);
+
+	trace.request_sequence = 2;
+	entry.capsule_id = 32;
+	entry.lifecycle_generation = 9;
+	assert_ioctl_errno(executor_fd, KVM_EXEC_RUN_TRACE, &trace, EBUSY);
+
+	control_domain(domain_fd, KVM_EXEC_PAUSE);
+	control_domain(domain_fd, KVM_EXEC_DRAIN);
+	detach_vcpu(domain_fd, 31, 7);
+	detach_vcpu(domain_fd, 32, 9);
+	close(executor_fd);
+	close(domain_fd);
+	kvm_vm_free(vm);
 }
 
 static void guest_trace_io(void)
@@ -451,6 +612,189 @@ static void *trace_runner(void *opaque)
 	arg->ret = ioctl(arg->executor_fd, KVM_EXEC_RUN_TRACE, &arg->trace);
 	arg->error = errno;
 	return NULL;
+}
+
+static uint64_t trace_contention_ready;
+
+static void guest_trace_contention(uint64_t id)
+{
+	if (!id)
+		WRITE_ONCE(trace_contention_ready, 1);
+	for (;;)
+		asm volatile("pause");
+}
+
+static void test_trace_target_contention(int kvm_fd)
+{
+	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
+				  KVM_EXEC_FEATURE_INTRA_VM_CHAIN;
+	struct kvm_guest_debug debug = {
+		.control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_SINGLESTEP,
+	};
+	struct kvm_exec_trace_entry entries[KVM_EXEC_TRACE_MAX_ENTRIES];
+	struct kvm_exec_run claim = {
+		.size = sizeof(claim),
+		.request_sequence = 1,
+		.target_capsule_id = 42,
+		.target_lifecycle_generation = 1,
+	};
+	struct trace_run_arg run_arg = { };
+	struct kvm_vcpu *a, *b;
+	struct kvm_vm *vm;
+	uint64_t domain_generation, executor_generations[2];
+	uint64_t *ready;
+	pthread_t thread;
+	int domain_fd, claim_executor_fd, ret, i;
+
+	vm = vm_create_with_one_vcpu(&a, guest_trace_contention);
+	b = vm_vcpu_add(vm, 1, guest_trace_contention);
+	vcpu_args_set(a, 1, 0);
+	vcpu_args_set(b, 1, 1);
+	disable_nested_cpuid(a);
+	disable_nested_cpuid(b);
+	vcpu_guest_debug_set(a, &debug);
+	vcpu_guest_debug_set(b, &debug);
+	ready = addr_gva2hva(vm, (vm_vaddr_t)&trace_contention_ready);
+	WRITE_ONCE(*ready, 0);
+	for (i = 0; i < KVM_EXEC_TRACE_MAX_ENTRIES; i++) {
+		entries[i].capsule_id = i + 1 == KVM_EXEC_TRACE_MAX_ENTRIES ?
+					42 : 41;
+		entries[i].lifecycle_generation = 1;
+		entries[i].user_cookie = i;
+		entries[i].reserved = 0;
+	}
+
+	domain_fd = create_domain_with_features(kvm_fd, 2, 2, features,
+						&domain_generation);
+	attach_vcpu(domain_fd, a->fd, 41, 1);
+	attach_vcpu(domain_fd, b->fd, 42, 1);
+	run_arg.executor_fd = create_executor(domain_fd, 1,
+					      &executor_generations[0]);
+	claim_executor_fd = create_executor(domain_fd, 2,
+					    &executor_generations[1]);
+	run_arg.trace = (struct kvm_exec_run_trace) {
+		.size = sizeof(run_arg.trace),
+		.request_sequence = 1,
+		.domain_generation = domain_generation,
+		.executor_generation = executor_generations[0],
+		.entries = (uintptr_t)entries,
+		.nr_entries = ARRAY_SIZE(entries),
+		.repeat_count = 1,
+	};
+	claim.domain_generation = domain_generation;
+	claim.executor_generation = executor_generations[1];
+
+	TEST_ASSERT(!pthread_create(&thread, NULL, trace_runner, &run_arg),
+		    "pthread_create failed");
+	for (i = 0; i < 1000000 && !READ_ONCE(*ready); i++)
+		sched_yield();
+	TEST_ASSERT(READ_ONCE(*ready), "contention trace did not start");
+	ret = ioctl(claim_executor_fd, KVM_EXEC_RUN, &claim);
+	TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_EXEC_RUN, ret));
+	TEST_ASSERT_EQ(claim.return_reason, KVM_EXEC_RETURN_VCPU_EXIT);
+	TEST_ASSERT_EQ(claim.owned_capsule_id, 42);
+	pthread_join(thread, NULL);
+	TEST_ASSERT(!run_arg.ret,
+		    "contention trace returned %d errno %d", run_arg.ret,
+		    run_arg.error);
+	TEST_ASSERT_EQ(run_arg.trace.return_reason,
+		       KVM_EXEC_RETURN_TRACE_TARGET_BUSY);
+	TEST_ASSERT_EQ(run_arg.trace.run_result, -EBUSY);
+	TEST_ASSERT_EQ(run_arg.trace.completed_steps,
+		       KVM_EXEC_TRACE_MAX_ENTRIES - 1);
+	TEST_ASSERT_EQ(run_arg.trace.switch_count, 0);
+	TEST_ASSERT_EQ(run_arg.trace.owned_capsule_id, 41);
+
+	control_domain(domain_fd, KVM_EXEC_PAUSE);
+	control_domain(domain_fd, KVM_EXEC_DRAIN);
+	detach_vcpu(domain_fd, 41, 1);
+	detach_vcpu(domain_fd, 42, 1);
+	close(claim_executor_fd);
+	close(run_arg.executor_fd);
+	close(domain_fd);
+	kvm_vm_free(vm);
+}
+
+static uint64_t trace_signal_ready;
+
+static void guest_trace_signal(void)
+{
+	WRITE_ONCE(trace_signal_ready, 1);
+	for (;;)
+		asm volatile("pause");
+}
+
+static void test_trace_signal_releases_references(int kvm_fd)
+{
+	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
+				  KVM_EXEC_FEATURE_INTRA_VM_CHAIN;
+	struct sigaction action = {
+		.sa_handler = signal_handler,
+	};
+	struct kvm_guest_debug debug = {
+		.control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_SINGLESTEP,
+	};
+	struct kvm_exec_trace_entry entry = {
+		.capsule_id = 51,
+		.lifecycle_generation = 1,
+	};
+	struct kvm_exec_detach_vcpu detach = {
+		.size = sizeof(detach),
+		.capsule_id = 51,
+		.lifecycle_generation = 1,
+	};
+	struct trace_run_arg run_arg = { };
+	struct kvm_vcpu *vcpu;
+	struct kvm_vm *vm;
+	uint64_t domain_generation, executor_generation;
+	uint64_t *ready;
+	pthread_t thread;
+	int domain_fd, i;
+
+	sigemptyset(&action.sa_mask);
+	TEST_ASSERT(!sigaction(SIGUSR1, &action, NULL),
+		    "sigaction failed, errno %d", errno);
+	vm = vm_create_with_one_vcpu(&vcpu, guest_trace_signal);
+	disable_nested_cpuid(vcpu);
+	vcpu_guest_debug_set(vcpu, &debug);
+	ready = addr_gva2hva(vm, (vm_vaddr_t)&trace_signal_ready);
+	WRITE_ONCE(*ready, 0);
+	domain_fd = create_domain_with_features(kvm_fd, 1, 1, features,
+						&domain_generation);
+	attach_vcpu(domain_fd, vcpu->fd, 51, 1);
+	run_arg.executor_fd = create_executor(domain_fd, 1,
+					      &executor_generation);
+	run_arg.trace = (struct kvm_exec_run_trace) {
+		.size = sizeof(run_arg.trace),
+		.request_sequence = 1,
+		.domain_generation = domain_generation,
+		.executor_generation = executor_generation,
+		.entries = (uintptr_t)&entry,
+		.nr_entries = 1,
+		.repeat_count = KVM_EXEC_TRACE_MAX_STEPS,
+	};
+
+	TEST_ASSERT(!pthread_create(&thread, NULL, trace_runner, &run_arg),
+		    "pthread_create failed");
+	for (i = 0; i < 1000000 && !READ_ONCE(*ready); i++)
+		sched_yield();
+	TEST_ASSERT(READ_ONCE(*ready), "signal trace did not start");
+	assert_ioctl_errno(domain_fd, KVM_EXEC_DETACH_VCPU, &detach, EBUSY);
+	TEST_ASSERT(!pthread_kill(thread, SIGUSR1), "pthread_kill failed");
+	pthread_join(thread, NULL);
+	TEST_ASSERT(!run_arg.ret,
+		    "signaled trace returned %d errno %d", run_arg.ret,
+		    run_arg.error);
+	TEST_ASSERT_EQ(run_arg.trace.return_reason, KVM_EXEC_RETURN_SIGNAL);
+	TEST_ASSERT_EQ(run_arg.trace.run_result, -EINTR);
+	TEST_ASSERT(run_arg.trace.completed_steps > 0 &&
+		    run_arg.trace.completed_steps < KVM_EXEC_TRACE_MAX_STEPS,
+		    "signal did not stop an active trace");
+
+	close(run_arg.executor_fd);
+	detach_vcpu(domain_fd, 51, 1);
+	close(domain_fd);
+	kvm_vm_free(vm);
 }
 
 static void test_halted_trace_pause_and_drain(int kvm_fd)
@@ -1392,7 +1736,10 @@ int main(int argc, char **argv)
 	test_same_vm_single_step_trace(kvm_fd);
 	test_trace_validation_and_cross_vm_rejection(kvm_fd);
 	test_base_only_domain_rejects_trace(kvm_fd);
+	test_trace_stale_and_current_owner_rejection(kvm_fd);
 	test_trace_conservative_exits(kvm_fd);
+	test_trace_target_contention(kvm_fd);
+	test_trace_signal_releases_references(kvm_fd);
 	test_halted_trace_pause_and_drain(kvm_fd);
 	close(kvm_fd);
 	return 0;
