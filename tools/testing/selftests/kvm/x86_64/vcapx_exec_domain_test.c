@@ -155,6 +155,7 @@ static void test_one_capsule_run_and_legacy_restore(int kvm_fd)
 		.lifecycle_generation = 1,
 	};
 	struct kvm_exec_run run;
+	struct kvm_interrupt irq = { .irq = 32 };
 	struct kvm_vcpu *vcpu;
 	struct kvm_vm *vm;
 	uint64_t domain_generation, executor_generation;
@@ -183,6 +184,14 @@ static void test_one_capsule_run_and_legacy_restore(int kvm_fd)
 	TEST_ASSERT_EQ(run.vcpu_exit_reason, KVM_EXIT_IO);
 	TEST_ASSERT_EQ(run.owned_capsule_id, 1);
 	TEST_ASSERT_EQ(run.owned_lifecycle_generation, 1);
+
+	/*
+	 * The selftest library creates an in-kernel PIC, for which x86 KVM
+	 * rejects KVM_INTERRUPT with ENXIO.  Reaching that error instead of the
+	 * execution-domain EBUSY proves that injection is allowed at this
+	 * returned executor boundary.
+	 */
+	assert_ioctl_errno(vcpu->fd, KVM_INTERRUPT, &irq, ENXIO);
 
 	assert_ioctl_errno(executor_fd, KVM_EXEC_RUN, &run, ESTALE);
 	assert_ioctl_errno(domain_fd, KVM_EXEC_DETACH_VCPU, &detach, EBUSY);
@@ -580,6 +589,27 @@ static void create_raw_vm_vcpu(int kvm_fd, int *vm_fd, int *vcpu_fd)
 		    KVM_IOCTL_ERROR(KVM_CREATE_VCPU, *vcpu_fd));
 }
 
+static void test_attached_capsule_accepts_interrupt_before_entry(int kvm_fd)
+{
+	struct kvm_interrupt irq = { .irq = 32 };
+	struct kvm_regs regs;
+	uint64_t generation;
+	int domain_fd, vm_fd, vcpu_fd, ret;
+
+	create_raw_vm_vcpu(kvm_fd, &vm_fd, &vcpu_fd);
+	domain_fd = create_domain(kvm_fd, 1, 1, &generation);
+	attach_vcpu(domain_fd, vcpu_fd, 1, 1);
+
+	ret = ioctl(vcpu_fd, KVM_INTERRUPT, &irq);
+	TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_INTERRUPT, ret));
+	assert_ioctl_errno(vcpu_fd, KVM_GET_REGS, &regs, EBUSY);
+
+	detach_vcpu(domain_fd, 1, 1);
+	close(domain_fd);
+	close(vcpu_fd);
+	close(vm_fd);
+}
+
 static void test_fd_close_orders(int kvm_fd)
 {
 	static const int orders[24][4] = {
@@ -973,6 +1003,7 @@ int main(int argc, char **argv)
 	test_many_capsules_across_vms(kvm_fd);
 	test_two_executor_claim_race(kvm_fd);
 	test_pause_drain_and_runner_signal(kvm_fd);
+	test_attached_capsule_accepts_interrupt_before_entry(kvm_fd);
 	test_fd_close_orders(kvm_fd);
 	test_wrong_mm(kvm_fd, argv[0]);
 	test_malformed_and_stale_requests(kvm_fd);

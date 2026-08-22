@@ -4467,7 +4467,7 @@ static long kvm_vcpu_ioctl(struct file *filp,
 		goto out;
 	}
 	if (vcpu->exec_capsule &&
-	    !kvm_exec_domain_vcpu_ioctl_allowed(vcpu)) {
+	    !kvm_exec_domain_vcpu_ioctl_allowed(vcpu, ioctl)) {
 		r = -EBUSY;
 		goto out;
 	}

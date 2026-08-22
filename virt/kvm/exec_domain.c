@@ -85,12 +85,15 @@ static int kvm_exec_domain_access(struct kvm_exec_domain *domain)
 	return 0;
 }
 
-bool kvm_exec_domain_vcpu_ioctl_allowed(struct kvm_vcpu *vcpu)
+bool kvm_exec_domain_vcpu_ioctl_allowed(struct kvm_vcpu *vcpu,
+					unsigned int ioctl)
 {
 	struct kvm_exec_capsule *capsule = vcpu->exec_capsule;
 
-	return capsule && READ_ONCE(capsule->domain->paused) &&
-	       !READ_ONCE(capsule->running);
+	if (!capsule || READ_ONCE(capsule->running))
+		return false;
+
+	return ioctl == KVM_INTERRUPT || READ_ONCE(capsule->domain->paused);
 }
 
 static bool kvm_exec_control_valid(struct kvm_exec_domain_control *control)

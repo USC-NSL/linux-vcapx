@@ -1483,7 +1483,8 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu);
 bool kvm_arch_vcpu_exec_domain_supported(struct kvm_vcpu *vcpu);
 
 int kvm_dev_ioctl_create_exec_domain(void __user *argp);
-bool kvm_exec_domain_vcpu_ioctl_allowed(struct kvm_vcpu *vcpu);
+bool kvm_exec_domain_vcpu_ioctl_allowed(struct kvm_vcpu *vcpu,
+					unsigned int ioctl);
 struct kvm_vcpu *kvm_vcpu_from_fd(int fd, struct file **filep);
 int kvm_vcpu_run(struct kvm_vcpu *vcpu);
 
