@@ -346,12 +346,6 @@ static void test_base_only_domain_rejects_trace(int kvm_fd)
 	close(domain_fd);
 }
 
-static void guest_trace_hlt(void)
-{
-	asm volatile("hlt");
-	GUEST_DONE();
-}
-
 static void guest_trace_io(void)
 {
 	GUEST_SYNC(1);
@@ -429,10 +423,98 @@ static void test_trace_stops_on_non_debug_exit(int kvm_fd, void *guest_code,
 
 static void test_trace_conservative_exits(int kvm_fd)
 {
-	test_trace_stops_on_non_debug_exit(kvm_fd, guest_trace_hlt,
-					   KVM_EXIT_HLT);
 	test_trace_stops_on_non_debug_exit(kvm_fd, guest_trace_io,
 					   KVM_EXIT_IO);
+}
+
+static uint64_t trace_hlt_ready;
+
+static void guest_trace_hlt(void)
+{
+	WRITE_ONCE(trace_hlt_ready, 1);
+	asm volatile("hlt");
+	GUEST_DONE();
+}
+
+struct trace_run_arg {
+	struct kvm_exec_run_trace trace;
+	int executor_fd;
+	int ret;
+	int error;
+};
+
+static void *trace_runner(void *opaque)
+{
+	struct trace_run_arg *arg = opaque;
+
+	errno = 0;
+	arg->ret = ioctl(arg->executor_fd, KVM_EXEC_RUN_TRACE, &arg->trace);
+	arg->error = errno;
+	return NULL;
+}
+
+static void test_halted_trace_pause_and_drain(int kvm_fd)
+{
+	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
+				  KVM_EXEC_FEATURE_INTRA_VM_CHAIN;
+	struct kvm_guest_debug debug = {
+		.control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_SINGLESTEP,
+	};
+	struct kvm_exec_trace_entry entry = {
+		.capsule_id = 22,
+		.lifecycle_generation = 1,
+	};
+	struct trace_run_arg run_arg = { };
+	struct kvm_vcpu *vcpu;
+	struct kvm_vm *vm;
+	uint64_t domain_generation, executor_generation;
+	uint64_t *ready;
+	pthread_t thread;
+	int domain_fd, i;
+
+	vm = vm_create_with_one_vcpu(&vcpu, guest_trace_hlt);
+	disable_nested_cpuid(vcpu);
+	vcpu_guest_debug_set(vcpu, &debug);
+	ready = addr_gva2hva(vm, (vm_vaddr_t)&trace_hlt_ready);
+	WRITE_ONCE(*ready, 0);
+	domain_fd = create_domain_with_features(kvm_fd, 1, 1, features,
+						&domain_generation);
+	attach_vcpu(domain_fd, vcpu->fd, 22, 1);
+	run_arg.executor_fd = create_executor(domain_fd, 1,
+					      &executor_generation);
+	run_arg.trace = (struct kvm_exec_run_trace) {
+		.size = sizeof(run_arg.trace),
+		.request_sequence = 1,
+		.domain_generation = domain_generation,
+		.executor_generation = executor_generation,
+		.entries = (uintptr_t)&entry,
+		.nr_entries = 1,
+		.repeat_count = KVM_EXEC_TRACE_MAX_STEPS,
+	};
+	TEST_ASSERT(!pthread_create(&thread, NULL, trace_runner, &run_arg),
+		    "pthread_create failed");
+	for (i = 0; i < 1000000 && !READ_ONCE(*ready); i++)
+		sched_yield();
+	TEST_ASSERT(READ_ONCE(*ready), "trace guest did not reach HLT setup");
+	usleep(1000);
+
+	control_domain(domain_fd, KVM_EXEC_PAUSE);
+	control_domain(domain_fd, KVM_EXEC_DRAIN);
+	pthread_join(thread, NULL);
+	TEST_ASSERT(!run_arg.ret,
+		    "halted trace returned %d errno %d", run_arg.ret,
+		    run_arg.error);
+	TEST_ASSERT_EQ(run_arg.trace.return_reason,
+		       KVM_EXEC_RETURN_DOMAIN_PAUSED);
+	TEST_ASSERT(run_arg.trace.completed_steps > 0 &&
+		    run_arg.trace.completed_steps < KVM_EXEC_TRACE_MAX_STEPS,
+		    "halted trace did not stop at a bounded step");
+	TEST_ASSERT_EQ(run_arg.trace.owned_capsule_id, 22);
+
+	detach_vcpu(domain_fd, 22, 1);
+	close(run_arg.executor_fd);
+	close(domain_fd);
+	kvm_vm_free(vm);
 }
 
 static void test_create_empty_domain(int kvm_fd)
@@ -1311,6 +1393,7 @@ int main(int argc, char **argv)
 	test_trace_validation_and_cross_vm_rejection(kvm_fd);
 	test_base_only_domain_rejects_trace(kvm_fd);
 	test_trace_conservative_exits(kvm_fd);
+	test_halted_trace_pause_and_drain(kvm_fd);
 	close(kvm_fd);
 	return 0;
 }
