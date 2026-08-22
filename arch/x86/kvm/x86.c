@@ -10692,6 +10692,15 @@ void __kvm_request_immediate_exit(struct kvm_vcpu *vcpu)
 }
 EXPORT_SYMBOL_GPL(__kvm_request_immediate_exit);
 
+static bool kvm_vcpu_check_exec_domain_exit(struct kvm_vcpu *vcpu)
+{
+	if (!kvm_check_request(KVM_REQ_EXEC_DOMAIN_EXIT, vcpu))
+		return false;
+
+	vcpu->run->exit_reason = KVM_EXIT_INTR;
+	return true;
+}
+
 /*
  * Called within kvm->srcu read side.
  * Returns 1 to let vcpu_run() continue the guest execution loop without
@@ -10709,8 +10718,7 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
 	bool req_immediate_exit = false;
 
 	if (kvm_request_pending(vcpu)) {
-		if (kvm_check_request(KVM_REQ_EXEC_DOMAIN_EXIT, vcpu)) {
-			vcpu->run->exit_reason = KVM_EXIT_INTR;
+		if (kvm_vcpu_check_exec_domain_exit(vcpu)) {
 			r = -EINTR;
 			goto out;
 		}
@@ -11097,6 +11105,9 @@ out:
 static inline int vcpu_block(struct kvm_vcpu *vcpu)
 {
 	bool hv_timer;
+
+	if (kvm_vcpu_check_exec_domain_exit(vcpu))
+		return -EINTR;
 
 	if (!kvm_arch_vcpu_runnable(vcpu)) {
 		/*
