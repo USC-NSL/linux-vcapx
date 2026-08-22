@@ -12,7 +12,8 @@
 #include <linux/xarray.h>
 
 #define KVM_EXEC_SUPPORTED_FEATURES \
-	(KVM_EXEC_FEATURE_BASE_OBJECTS | KVM_EXEC_FEATURE_INTRA_VM_CHAIN)
+	(KVM_EXEC_FEATURE_BASE_OBJECTS | KVM_EXEC_FEATURE_INTRA_VM_CHAIN | \
+	 KVM_EXEC_FEATURE_CROSS_VM_CHAIN)
 
 struct kvm_exec_domain;
 struct kvm_exec_executor;
@@ -712,7 +713,9 @@ static long kvm_exec_run_trace(struct kvm_exec_executor *executor,
 		}
 		if (!trace_kvm) {
 			trace_kvm = capsule->vcpu->kvm;
-		} else if (trace_kvm != capsule->vcpu->kvm) {
+		} else if (trace_kvm != capsule->vcpu->kvm &&
+			   !(domain->negotiated_features &
+			     KVM_EXEC_FEATURE_CROSS_VM_CHAIN)) {
 			ret = -EXDEV;
 			goto out_domain;
 		}
@@ -1021,6 +1024,8 @@ int kvm_dev_ioctl_create_exec_domain(void __user *argp)
 	    create.max_capsules > U16_MAX || create.max_executors > U16_MAX ||
 	    !(create.requested_features & KVM_EXEC_FEATURE_BASE_OBJECTS) ||
 	    create.requested_features & ~KVM_EXEC_SUPPORTED_FEATURES ||
+	    ((create.requested_features & KVM_EXEC_FEATURE_CROSS_VM_CHAIN) &&
+	     !(create.requested_features & KVM_EXEC_FEATURE_INTRA_VM_CHAIN)) ||
 	    memchr_inv(create.reserved, 0, sizeof(create.reserved)))
 		return -EINVAL;
 

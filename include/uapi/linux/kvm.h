@@ -882,6 +882,7 @@ struct kvm_ppc_resize_hpt {
 
 #define KVM_EXEC_FEATURE_BASE_OBJECTS	(1ULL << 0)
 #define KVM_EXEC_FEATURE_INTRA_VM_CHAIN	(1ULL << 1)
+#define KVM_EXEC_FEATURE_CROSS_VM_CHAIN	(1ULL << 2)
 #define KVM_EXEC_CPU_ANY		((__u32)-1)
 
 #define KVM_EXEC_TRACE_MAX_ENTRIES	256U
