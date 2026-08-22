@@ -963,6 +963,7 @@ static void test_cross_vm_trace_stops_on_exit(int kvm_fd, void *guest_code,
 	struct kvm_vm *vm_a, *vm_b;
 	uint64_t domain_generation, executor_generation;
 	uint64_t *b_counts, b_count_at_exit;
+	uint64_t b_exits_before, b_exits_at_exit;
 	int domain_fd, executor_fd, ret;
 
 	vm_a = vm_create_with_one_vcpu(&a, guest_code);
@@ -976,6 +977,7 @@ static void test_cross_vm_trace_stops_on_exit(int kvm_fd, void *guest_code,
 		virt_map(vm_a, TRACE_MMIO_GPA, TRACE_MMIO_GPA, 1);
 	b_counts = addr_gva2hva(vm_b, (vm_vaddr_t)trace_counts);
 	memset(b_counts, 0, sizeof(trace_counts));
+	b_exits_before = vcpu_get_stat(b, "exits");
 
 	domain_fd = create_domain_with_features(kvm_fd, 2, 1, features,
 						&domain_generation);
@@ -998,7 +1000,9 @@ static void test_cross_vm_trace_stops_on_exit(int kvm_fd, void *guest_code,
 	TEST_ASSERT(trace.switch_count > 0,
 		    "cross-VM trace reached a device exit without switching");
 	b_count_at_exit = READ_ONCE(b_counts[1]);
-	TEST_ASSERT(b_count_at_exit > 0, "VM B made no progress before exit");
+	b_exits_at_exit = vcpu_get_stat(b, "exits");
+	TEST_ASSERT(b_exits_at_exit > b_exits_before,
+		    "VM B did not enter before VM A's device exit");
 
 	if (expected_exit == KVM_EXIT_IO) {
 		uint8_t pio_value = 0;
@@ -1025,6 +1029,7 @@ static void test_cross_vm_trace_stops_on_exit(int kvm_fd, void *guest_code,
 	TEST_ASSERT_EQ(run.vcpu_exit_reason, KVM_EXIT_DEBUG);
 	TEST_ASSERT_EQ(run.owned_capsule_id, 61);
 	TEST_ASSERT_EQ(READ_ONCE(b_counts[1]), b_count_at_exit);
+	TEST_ASSERT_EQ(vcpu_get_stat(b, "exits"), b_exits_at_exit);
 
 	control_domain(domain_fd, KVM_EXEC_PAUSE);
 	control_domain(domain_fd, KVM_EXEC_DRAIN);
