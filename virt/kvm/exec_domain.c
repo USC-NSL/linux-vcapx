@@ -1377,6 +1377,51 @@ static bool kvm_exec_async_blocks_entry(struct kvm_exec_capsule *capsule)
 		!capsule->exit.async_entry_authorized);
 }
 
+static int
+kvm_exec_async_apply_completion(struct kvm_exec_executor *executor)
+{
+	struct kvm_exec_domain *domain = executor->domain;
+	struct kvm_exec_capsule *capsule;
+	u8 immediate_exit;
+	bool pending;
+	int run_ret;
+
+	mutex_lock(&domain->lock);
+	capsule = executor->current_capsule;
+	if (!capsule || !capsule->vcpu || capsule->running ||
+	    !capsule->exit.completion_pending ||
+	    !capsule->exit.async_completion_ready) {
+		mutex_unlock(&domain->lock);
+		return -EINVAL;
+	}
+	capsule->running = true;
+	capsule->exit.async_entry_authorized = true;
+	mutex_unlock(&domain->lock);
+
+	mutex_lock(&capsule->vcpu->mutex);
+	immediate_exit = READ_ONCE(capsule->vcpu->run->immediate_exit);
+	WRITE_ONCE(capsule->vcpu->run->immediate_exit, 1);
+	run_ret = kvm_vcpu_run(capsule->vcpu);
+	WRITE_ONCE(capsule->vcpu->run->immediate_exit, immediate_exit);
+	pending = kvm_arch_vcpu_exec_completion_pending(capsule->vcpu);
+	mutex_unlock(&capsule->vcpu->mutex);
+
+	mutex_lock(&domain->lock);
+	capsule->running = false;
+	if (!pending) {
+		WRITE_ONCE(capsule->exit.completion_pending, false);
+		capsule->exit.async_request_pending = false;
+		capsule->exit.async_completion_ready = false;
+		capsule->exit.async_entry_authorized = false;
+	}
+	mutex_unlock(&domain->lock);
+	wake_up_all(&domain->drain_wait);
+
+	if (pending)
+		return -EIO;
+	return run_ret == -EINTR ? 0 : -EPROTO;
+}
+
 static bool kvm_exec_exit_blocks_handoff(struct kvm_exec_capsule *capsule)
 {
 	return capsule->exit.completion_pending &&
@@ -1784,6 +1829,15 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 			run.return_reason = KVM_EXEC_RETURN_INVALID_COMPLETION;
 			run.run_result = async_ret;
 			break;
+		}
+		if (async_ret > 0) {
+			async_ret = kvm_exec_async_apply_completion(executor);
+			if (async_ret) {
+				run.return_reason =
+					KVM_EXEC_RETURN_INVALID_COMPLETION;
+				run.run_result = async_ret;
+				break;
+			}
 		}
 
 		command_ret = 0;
