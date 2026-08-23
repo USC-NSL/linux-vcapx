@@ -2168,7 +2168,7 @@ static void guest_sync_pio(void)
 		     :
 		     : "a" (value), "d" (SYNC_EXIT_PIO_PORT));
 	WRITE_ONCE(sync_exit_pio_progress, 2);
-	asm volatile("int3");
+	asm volatile("hlt");
 }
 
 static void guest_sync_mmio(void)
@@ -2179,7 +2179,21 @@ static void guest_sync_mmio(void)
 	WRITE_ONCE(sync_exit_mmio_progress, 1);
 	WRITE_ONCE(*(uint64_t *)(TRACE_MMIO_GPA + 8), ~value);
 	WRITE_ONCE(sync_exit_mmio_progress, 2);
-	asm volatile("int3");
+	asm volatile("hlt");
+}
+
+struct pause_after_progress_arg {
+	uint64_t *progress;
+	int domain_fd;
+};
+
+static void *pause_after_progress(void *opaque)
+{
+	struct pause_after_progress_arg *arg = opaque;
+
+	wait_for_trace_progress(arg->progress, 1);
+	control_domain(arg->domain_fd, KVM_EXEC_PAUSE);
+	return NULL;
 }
 
 static struct kvm_exec_run_dispatch
@@ -2212,9 +2226,7 @@ static void test_dynamic_synchronous_exits(int kvm_fd)
 		.target_lifecycle_generation = 16,
 	};
 	struct kvm_exec_domain_control control = { .size = sizeof(control) };
-	struct kvm_guest_debug debug = {
-		.control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_SW_BP,
-	};
+	struct pause_after_progress_arg pause_arg;
 	struct kvm_exec_trace_entry legacy_entry = {
 		.capsule_id = 61,
 		.lifecycle_generation = 16,
@@ -2244,6 +2256,7 @@ static void test_dynamic_synchronous_exits(int kvm_fd)
 	uint64_t domain_generation, executor_generation;
 	uint32_t pio_response = 0xa55ac33c;
 	uint64_t mmio_response = 0xfedcba9876543210ULL;
+	pthread_t pause_thread;
 	uint16_t saved_port;
 	uint32_t saved_mmio_len;
 	int domain_fd, executor_fd, received_signal;
@@ -2252,8 +2265,6 @@ static void test_dynamic_synchronous_exits(int kvm_fd)
 	mmio_vm = vm_create_with_one_vcpu(&mmio_vcpu, guest_sync_mmio);
 	disable_nested_cpuid(pio_vcpu);
 	disable_nested_cpuid(mmio_vcpu);
-	vcpu_guest_debug_set(pio_vcpu, &debug);
-	vcpu_guest_debug_set(mmio_vcpu, &debug);
 	vcpu_regs_get(pio_vcpu, &saved_regs);
 	sigemptyset(&blocked_mask);
 	sigaddset(&blocked_mask, SIGUSR1);
@@ -2368,23 +2379,32 @@ static void test_dynamic_synchronous_exits(int kvm_fd)
 	};
 	TEST_ASSERT(publish_dispatch_command(&mapping, command),
 		    "pending-exit release did not publish");
+	pause_arg = (struct pause_after_progress_arg) {
+		.progress = pio_progress,
+		.domain_fd = domain_fd,
+	};
+	TEST_ASSERT(!pthread_create(&pause_thread, NULL, pause_after_progress,
+				    &pause_arg),
+		    "pthread_create failed");
 	run = run_dispatch_once(executor_fd, domain_generation,
 				executor_generation);
+	pthread_join(pause_thread, NULL);
 	completion = consume_dispatch_completion(&mapping);
 	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_EXIT_PENDING);
 	TEST_ASSERT_EQ(completion.owned_capsule_id, 61);
-	TEST_ASSERT_EQ(run.vcpu_exit_reason, KVM_EXIT_DEBUG);
-	TEST_ASSERT_EQ(run.exit_sequence, 3);
+	TEST_ASSERT_EQ(run.return_reason, KVM_EXEC_RETURN_DOMAIN_PAUSED);
+	TEST_ASSERT_EQ(run.run_result, -EINTR);
+	TEST_ASSERT_EQ(run.exit_sequence, 2);
 	TEST_ASSERT_EQ(run.exit_flags, 0);
 	TEST_ASSERT_EQ(READ_ONCE(*pio_progress), 2);
+	control_domain(domain_fd, KVM_EXEC_DRAIN);
+	control_domain(domain_fd, KVM_EXEC_RESUME);
 
 	command = (struct kvm_exec_command) {
 		.opcode = KVM_EXEC_CMD_SWITCH,
 		.request_sequence = 3,
 		.domain_generation = domain_generation,
 		.executor_generation = executor_generation,
-		.expected_current_id = 61,
-		.expected_current_generation = 16,
 		.target_capsule_id = 62,
 		.target_lifecycle_generation = 26,
 	};
@@ -2420,14 +2440,22 @@ static void test_dynamic_synchronous_exits(int kvm_fd)
 		       KVM_EXEC_EXIT_F_COMPLETION_PENDING);
 	TEST_ASSERT_EQ(READ_ONCE(*mmio_value), mmio_response);
 	TEST_ASSERT_EQ(READ_ONCE(*mmio_progress), 1);
+	pause_arg = (struct pause_after_progress_arg) {
+		.progress = mmio_progress,
+		.domain_fd = domain_fd,
+	};
+	TEST_ASSERT(!pthread_create(&pause_thread, NULL, pause_after_progress,
+				    &pause_arg),
+		    "pthread_create failed");
 	run = run_dispatch_once(executor_fd, domain_generation,
 				executor_generation);
-	TEST_ASSERT_EQ(run.vcpu_exit_reason, KVM_EXIT_DEBUG);
-	TEST_ASSERT_EQ(run.exit_sequence, 3);
+	pthread_join(pause_thread, NULL);
+	TEST_ASSERT_EQ(run.return_reason, KVM_EXEC_RETURN_DOMAIN_PAUSED);
+	TEST_ASSERT_EQ(run.run_result, -EINTR);
+	TEST_ASSERT_EQ(run.exit_sequence, 2);
 	TEST_ASSERT_EQ(run.exit_flags, 0);
 	TEST_ASSERT_EQ(READ_ONCE(*mmio_progress), 2);
 
-	control_domain(domain_fd, KVM_EXEC_PAUSE);
 	control_domain(domain_fd, KVM_EXEC_DRAIN);
 	detach_vcpu(domain_fd, 61, 16);
 	detach_vcpu(domain_fd, 62, 26);
@@ -2457,9 +2485,11 @@ static void test_sync_domain_close_pending(int kvm_fd, bool close_on_write)
 		.lifecycle_generation = 36,
 	};
 	struct kvm_exec_domain_control control = { .size = sizeof(control) };
-	struct kvm_guest_debug debug = {
-		.control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_SW_BP,
+	struct sigaction action = {
+		.sa_handler = signal_handler,
 	};
+	struct sigaction old_action;
+	struct vcpu_run_arg run_arg = { };
 	struct kvm_exec_run_dispatch run;
 	struct kvm_exec_completion completion;
 	struct dispatch_mapping mapping;
@@ -2468,11 +2498,14 @@ static void test_sync_domain_close_pending(int kvm_fd, bool close_on_write)
 	uint64_t *pio_value, *pio_progress;
 	uint64_t domain_generation, executor_generation;
 	uint32_t response = 0x13579bdf;
+	pthread_t thread;
 	int domain_fd, executor_fd;
 
 	vm = vm_create_with_one_vcpu(&vcpu, guest_sync_pio);
 	disable_nested_cpuid(vcpu);
-	vcpu_guest_debug_set(vcpu, &debug);
+	sigemptyset(&action.sa_mask);
+	TEST_ASSERT(!sigaction(SIGUSR1, &action, &old_action),
+		    "sigaction failed, errno %d", errno);
 	pio_value = addr_gva2hva(vm, (vm_vaddr_t)&sync_exit_pio_value);
 	pio_progress = addr_gva2hva(vm,
 				    (vm_vaddr_t)&sync_exit_pio_progress);
@@ -2522,11 +2555,20 @@ static void test_sync_domain_close_pending(int kvm_fd, bool close_on_write)
 		TEST_ASSERT_KVM_EXIT_REASON(vcpu, KVM_EXIT_IO);
 		TEST_ASSERT_EQ(READ_ONCE(*pio_progress), 1);
 	}
-	vcpu_run(vcpu);
-	TEST_ASSERT_KVM_EXIT_REASON(vcpu, KVM_EXIT_DEBUG);
+	run_arg.vcpu = vcpu;
+	TEST_ASSERT(!pthread_create(&thread, NULL, ordinary_vcpu_runner,
+				    &run_arg),
+		    "pthread_create failed");
+	wait_for_trace_progress(pio_progress, 1);
+	TEST_ASSERT(!pthread_kill(thread, SIGUSR1), "pthread_kill failed");
+	pthread_join(thread, NULL);
+	TEST_ASSERT(run_arg.ret == -1 && run_arg.error == EINTR,
+		    "ordinary KVM_RUN did not return EINTR after signal");
 	TEST_ASSERT_EQ(READ_ONCE(*pio_value), response);
 	TEST_ASSERT_EQ(READ_ONCE(*pio_progress), 2);
 	kvm_vm_free(vm);
+	TEST_ASSERT(!sigaction(SIGUSR1, &old_action, NULL),
+		    "restoring signal action failed, errno %d", errno);
 }
 
 static void test_dynamic_kick_and_cancel(int kvm_fd)
