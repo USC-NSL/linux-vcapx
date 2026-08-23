@@ -885,6 +885,7 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_FEATURE_CROSS_VM_CHAIN	(1ULL << 2)
 #define KVM_EXEC_FEATURE_DYNAMIC_DISPATCH (1ULL << 3)
 #define KVM_EXEC_FEATURE_SYNC_EXITS	(1ULL << 4)
+#define KVM_EXEC_FEATURE_ASYNC_PIO_WRITE (1ULL << 5)
 #define KVM_EXEC_CPU_ANY		((__u32)-1)
 
 #define KVM_EXEC_TRACE_MAX_ENTRIES	256U
@@ -904,11 +905,13 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_RETURN_DISPATCH_CORRUPT	10
 #define KVM_EXEC_RETURN_INVALID_COMPLETION 11
 
-#define KVM_EXEC_DISPATCH_ABI_VERSION	1U
+#define KVM_EXEC_DISPATCH_ABI_VERSION	2U
 #define KVM_EXEC_DISPATCH_RING_ENTRIES	32U
 #define KVM_EXEC_DISPATCH_COMMAND_OFFSET	256U
 #define KVM_EXEC_DISPATCH_COMPLETION_OFFSET 4096U
-#define KVM_EXEC_DISPATCH_MMAP_SIZE	8192U
+#define KVM_EXEC_EXIT_REQUEST_OFFSET	8192U
+#define KVM_EXEC_EXIT_COMPLETION_OFFSET	12288U
+#define KVM_EXEC_DISPATCH_MMAP_SIZE	16384U
 
 #define KVM_EXEC_DISPATCH_F_RETURN_IF_EMPTY (1U << 0)
 
@@ -927,6 +930,9 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_COMPLETE_EXIT_PENDING	10U
 
 #define KVM_EXEC_EXIT_F_COMPLETION_PENDING (1U << 0)
+
+#define KVM_EXEC_EXIT_REQUEST_PIO_WRITE	1U
+#define KVM_EXEC_EXIT_COMPLETE_OK	1U
 
 #define KVM_EXEC_CANCEL_ACCEPTED		1U
 #define KVM_EXEC_CANCEL_APPLIED		2U
@@ -1029,9 +1035,11 @@ struct kvm_exec_run_trace {
 
 /*
  * Userspace is the sole command producer and completion consumer.  KVM is the
- * sole command consumer and completion producer.  Producers fill an entry and
- * release-store the corresponding tail; consumers acquire-load the tail before
- * reading the entry and release-store the head after consuming it.
+ * sole command consumer and completion producer.  KVM is also the sole exit
+ * request producer, while userspace is the sole exit completion producer.
+ * Producers fill an entry and release-store the corresponding tail; consumers
+ * acquire-load the tail before reading the entry and release-store the head
+ * after consuming it.
  */
 struct kvm_exec_dispatch_header {
 	__u32 abi_version;
@@ -1042,10 +1050,21 @@ struct kvm_exec_dispatch_header {
 	__u32 completion_entries;
 	__u32 command_entry_size;
 	__u32 completion_entry_size;
+	__u32 exit_request_offset;
+	__u32 exit_completion_offset;
+	__u32 exit_request_entries;
+	__u32 exit_completion_entries;
+	__u32 exit_request_entry_size;
+	__u32 exit_completion_entry_size;
+	__u32 reserved0[2];
 	__u64 command_head;
 	__u64 command_tail;
 	__u64 completion_head;
 	__u64 completion_tail;
+	__u64 exit_request_head;
+	__u64 exit_request_tail;
+	__u64 exit_completion_head;
+	__u64 exit_completion_tail;
 	__u64 kernel_corruption_count;
 	__u64 kernel_kick_count;
 	__u64 last_kick_sequence;
@@ -1054,7 +1073,12 @@ struct kvm_exec_dispatch_header {
 	__u64 last_applied_sequence;
 	__u64 last_entry_sequence;
 	__u64 last_entry_ns;
-	__u64 reserved[16];
+	__u64 executor_return_count;
+	__u64 async_exit_request_count;
+	__u64 async_exit_completion_count;
+	__u64 async_exit_fallback_count;
+	__u64 last_async_exit_sequence;
+	__u64 reserved[3];
 };
 
 struct kvm_exec_command {
@@ -1088,7 +1112,40 @@ struct kvm_exec_completion {
 	__u64 consumed_ns;
 	__u64 applied_ns;
 	__u64 entry_attempt_ns;
-	__u64 reserved[2];
+	__u64 executor_return_count;
+	__u64 reserved;
+};
+
+struct kvm_exec_exit_request {
+	__u32 size;
+	__u16 type;
+	__u16 flags;
+	__u64 domain_generation;
+	__u64 executor_generation;
+	__u64 capsule_id;
+	__u64 lifecycle_generation;
+	__u64 exit_sequence;
+	__u64 executor_return_count;
+	__u64 published_ns;
+	__u16 port;
+	__u8 width;
+	__u8 count;
+	__u32 reserved0;
+	__u8 data[8];
+	__u64 reserved[6];
+};
+
+struct kvm_exec_exit_completion {
+	__u32 size;
+	__u16 status;
+	__u16 flags;
+	__u64 domain_generation;
+	__u64 executor_generation;
+	__u64 capsule_id;
+	__u64 lifecycle_generation;
+	__u64 exit_sequence;
+	__u64 completed_ns;
+	__u64 reserved[9];
 };
 
 struct kvm_exec_run_dispatch {
