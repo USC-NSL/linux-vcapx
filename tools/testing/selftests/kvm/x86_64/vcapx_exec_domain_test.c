@@ -2497,6 +2497,105 @@ static void test_dynamic_synchronous_exits(int kvm_fd)
 		    "restoring synchronous-exit signal mask failed");
 }
 
+static void test_sync_exit_kick_preserves_completion(int kvm_fd)
+{
+	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
+				  KVM_EXEC_FEATURE_DYNAMIC_DISPATCH |
+				  KVM_EXEC_FEATURE_SYNC_EXITS;
+	struct kvm_exec_command command = {
+		.opcode = KVM_EXEC_CMD_SWITCH,
+		.request_sequence = 1,
+		.target_capsule_id = 65,
+		.target_lifecycle_generation = 38,
+	};
+	struct kvm_exec_run_dispatch run;
+	struct kvm_exec_completion completion;
+	struct dispatch_mapping mapping;
+	struct dispatch_run_arg run_arg;
+	struct kvm_vcpu *vcpu;
+	struct kvm_vm *vm;
+	uint64_t *pio_value, *pio_progress;
+	uint64_t domain_generation, executor_generation;
+	uint32_t response;
+	pthread_t thread;
+	int domain_fd, executor_fd;
+	int kick;
+
+	vm = vm_create_with_one_vcpu(&vcpu, guest_sync_pio);
+	disable_nested_cpuid(vcpu);
+	pio_value = addr_gva2hva(vm, (vm_vaddr_t)&sync_exit_pio_value);
+	pio_progress = addr_gva2hva(vm,
+				    (vm_vaddr_t)&sync_exit_pio_progress);
+	WRITE_ONCE(*pio_progress, 0);
+	domain_fd = create_domain_with_features(kvm_fd, 1, 1, features,
+						&domain_generation);
+	attach_vcpu(domain_fd, vcpu->fd, 65, 38);
+	executor_fd = create_executor(domain_fd, 0x80a, &executor_generation);
+	mapping = map_dispatch(executor_fd);
+	command.domain_generation = domain_generation;
+	command.executor_generation = executor_generation;
+	TEST_ASSERT(publish_dispatch_command(&mapping, command),
+		    "kick-completion command did not publish");
+	run = run_dispatch_once(executor_fd, domain_generation,
+				executor_generation);
+	completion = consume_dispatch_completion(&mapping);
+	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_APPLIED);
+	TEST_ASSERT_EQ(run.return_reason, KVM_EXEC_RETURN_VCPU_EXIT);
+	TEST_ASSERT_EQ(run.vcpu_exit_reason, KVM_EXIT_IO);
+	TEST_ASSERT_EQ(run.exit_flags, KVM_EXEC_EXIT_F_COMPLETION_PENDING);
+
+	response = 0xc35a91e7;
+	memcpy((uint8_t *)vcpu->run + vcpu->run->io.data_offset,
+	       &response, sizeof(response));
+	run_arg = (struct dispatch_run_arg) {
+		.executor_fd = executor_fd,
+		.run = {
+			.size = sizeof(run_arg.run),
+			.flags = KVM_EXEC_DISPATCH_F_RETURN_IF_EMPTY,
+			.domain_generation = domain_generation,
+			.executor_generation = executor_generation,
+		},
+	};
+	TEST_ASSERT(!pthread_create(&thread, NULL, dispatch_runner, &run_arg),
+		    "pthread_create failed");
+	for (kick = 0; kick < 4096; kick++) {
+		kick_dispatch(executor_fd, domain_generation,
+			      executor_generation, kick + 2);
+		sched_yield();
+	}
+	pthread_join(thread, NULL);
+	TEST_ASSERT(!run_arg.ret,
+		    "kicked completion run failed, ret %d errno %d",
+		    run_arg.ret, run_arg.error);
+	TEST_ASSERT_EQ(run_arg.run.return_reason, KVM_EXEC_RETURN_VCPU_EXIT);
+	TEST_ASSERT_EQ(run_arg.run.vcpu_exit_reason, KVM_EXIT_IO);
+	TEST_ASSERT_EQ(run_arg.run.exit_sequence, 2);
+	TEST_ASSERT_EQ(run_arg.run.exit_flags,
+		       KVM_EXEC_EXIT_F_COMPLETION_PENDING);
+	TEST_ASSERT_EQ(READ_ONCE(*pio_progress), 1);
+	TEST_ASSERT_EQ(READ_ONCE(*pio_value), response);
+
+	/* A prior kick request may surface once before the write retires. */
+	for (kick = 0; kick < 8; kick++) {
+		run = run_dispatch_once(executor_fd, domain_generation,
+					executor_generation);
+		if (run.vcpu_exit_reason == KVM_EXIT_HLT)
+			break;
+		TEST_ASSERT_EQ(run.return_reason, KVM_EXEC_RETURN_SIGNAL);
+		TEST_ASSERT_EQ(run.run_result, -EINTR);
+	}
+	TEST_ASSERT_EQ(run.vcpu_exit_reason, KVM_EXIT_HLT);
+	TEST_ASSERT_EQ(READ_ONCE(*pio_progress), 2);
+
+	control_domain(domain_fd, KVM_EXEC_PAUSE);
+	control_domain(domain_fd, KVM_EXEC_DRAIN);
+	munmap(mapping.header, KVM_EXEC_DISPATCH_MMAP_SIZE);
+	close(executor_fd);
+	detach_vcpu(domain_fd, 65, 38);
+	close(domain_fd);
+	kvm_vm_free(vm);
+}
+
 static void test_sync_domain_close_pending(int kvm_fd, bool close_on_write)
 {
 	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
@@ -3654,6 +3753,7 @@ int main(int argc, char **argv)
 	}
 	if (argc == 2 && !strcmp(argv[1], "--sync-exits-only")) {
 		test_dynamic_synchronous_exits(kvm_fd);
+		test_sync_exit_kick_preserves_completion(kvm_fd);
 		test_sync_domain_close_pending(kvm_fd, false);
 		test_sync_domain_close_pending(kvm_fd, true);
 		close(kvm_fd);
@@ -3692,6 +3792,7 @@ int main(int argc, char **argv)
 	test_dynamic_kick_and_cancel(kvm_fd);
 	test_dynamic_ring_backpressure_and_corruption(kvm_fd);
 	test_dynamic_synchronous_exits(kvm_fd);
+	test_sync_exit_kick_preserves_completion(kvm_fd);
 	test_sync_domain_close_pending(kvm_fd, false);
 	test_sync_domain_close_pending(kvm_fd, true);
 	test_dynamic_cross_vm_seeded_trace(kvm_fd);

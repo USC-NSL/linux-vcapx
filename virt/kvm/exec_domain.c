@@ -1508,6 +1508,7 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 		bool invalid_completion = false;
 		bool pending_after_run = false;
 		bool kick_pending;
+		u32 reported_exit_reason;
 
 		mutex_lock(&domain->lock);
 		if (domain->stopping || domain->paused) {
@@ -1644,15 +1645,24 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 			kvm_exec_dispatch_publish(executor, &completion);
 			completion_pending = false;
 		}
+		reported_exit_reason = capsule->vcpu->run->exit_reason;
 		if (invalid_completion) {
 			run_ret = -EINVAL;
 			capsule->vcpu->run->exit_reason = capsule->exit.reason;
+			reported_exit_reason = capsule->exit.reason;
 		} else if (!entry_allowed) {
 			run_ret = -EINTR;
-			capsule->vcpu->run->exit_reason = KVM_EXIT_INTR;
+			/*
+			 * A kick may arrive after userspace supplied a synchronous
+			 * response but before KVM has applied it.  The kvm_run page is
+			 * still the capsule's authoritative completion state, so an
+			 * interrupted entry attempt must not replace its exit metadata.
+			 */
+			reported_exit_reason = KVM_EXIT_INTR;
 		} else {
 			attempted_kvm_run = true;
 			run_ret = kvm_vcpu_run(capsule->vcpu);
+			reported_exit_reason = capsule->vcpu->run->exit_reason;
 			pending_after_run =
 				kvm_arch_vcpu_exec_completion_pending(capsule->vcpu);
 			if (!run_ret)
@@ -1662,7 +1672,7 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 		final_cpu = get_cpu();
 		put_cpu();
 		run.run_result = run_ret;
-		run.vcpu_exit_reason = capsule->vcpu->run->exit_reason;
+		run.vcpu_exit_reason = reported_exit_reason;
 		run.current_cpu = final_cpu;
 		mutex_unlock(&capsule->vcpu->mutex);
 
