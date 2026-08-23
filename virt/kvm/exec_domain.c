@@ -1164,8 +1164,9 @@ static void kvm_exec_snapshot_exit(struct kvm_vcpu *vcpu,
 		exit->len = run->io.size;
 		exit->direction = run->io.direction;
 		if (bytes <= sizeof(exit->data) &&
-		    run->io.data_offset <= PAGE_SIZE &&
-		    bytes <= PAGE_SIZE - run->io.data_offset)
+		    run->io.data_offset >= PAGE_SIZE &&
+		    run->io.data_offset < 2 * PAGE_SIZE &&
+		    bytes <= 2 * PAGE_SIZE - run->io.data_offset)
 			memcpy(exit->data, (void *)run + run->io.data_offset,
 			       bytes);
 	} else if (run->exit_reason == KVM_EXIT_MMIO) {
@@ -1195,9 +1196,9 @@ static bool kvm_exec_async_pio_write(struct kvm_exec_domain *domain,
 	       exit->reason == KVM_EXIT_IO &&
 	       exit->direction == KVM_EXIT_IO_OUT && exit->count == 1 &&
 	       (exit->len == 1 || exit->len == 2 || exit->len == 4) &&
-	       exit->completion_pending &&
-	       exit->data_offset <= PAGE_SIZE &&
-	       exit->len <= PAGE_SIZE - exit->data_offset;
+	       exit->completion_pending && exit->data_offset >= PAGE_SIZE &&
+	       exit->data_offset < 2 * PAGE_SIZE &&
+	       exit->len <= 2 * PAGE_SIZE - exit->data_offset;
 }
 
 static bool kvm_exec_pending_exit_valid(struct kvm_exec_capsule *capsule)

@@ -2180,7 +2180,15 @@ consume_exit_request(struct dispatch_mapping *mapping)
 		TEST_ASSERT(!clock_gettime(CLOCK_MONOTONIC, &now),
 			    "clock_gettime failed, errno: %d", errno);
 		TEST_ASSERT(timespec_to_ns(timespec_sub(deadline, now)) > 0,
-			    "timed out waiting for mapped exit request");
+			    "timed out waiting for mapped exit request: request=%llu head=%llu tail=%llu completion=%llu/%llu fallback=%llu returns=%llu corruption=%llu",
+			    (unsigned long long)mapping->header->async_exit_request_count,
+			    (unsigned long long)head,
+			    (unsigned long long)mapping->header->exit_request_tail,
+			    (unsigned long long)mapping->header->exit_completion_head,
+			    (unsigned long long)mapping->header->exit_completion_tail,
+			    (unsigned long long)mapping->header->async_exit_fallback_count,
+			    (unsigned long long)mapping->header->executor_return_count,
+			    (unsigned long long)mapping->header->kernel_corruption_count);
 		sched_yield();
 	}
 	request = mapping->exit_requests
