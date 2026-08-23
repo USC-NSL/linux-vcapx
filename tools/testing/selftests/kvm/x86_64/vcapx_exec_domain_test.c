@@ -1188,12 +1188,16 @@ struct trace_run_arg {
 	int executor_fd;
 	int ret;
 	int error;
+	bool pin_cpu;
+	uint32_t cpu;
 };
 
 static void *trace_runner(void *opaque)
 {
 	struct trace_run_arg *arg = opaque;
 
+	if (arg->pin_cpu)
+		kvm_pin_this_task_to_pcpu(arg->cpu);
 	errno = 0;
 	arg->ret = ioctl(arg->executor_fd, KVM_EXEC_RUN_TRACE, &arg->trace);
 	arg->error = errno;
@@ -1376,10 +1380,31 @@ static void test_trace_target_contention(int kvm_fd, bool cross_vm)
 	struct trace_run_arg run_arg = { };
 	struct kvm_vcpu *a, *b;
 	struct kvm_vm *vm_a, *vm_b = NULL;
+	cpu_set_t original_mask, pinned_mask;
 	uint64_t domain_generation, executor_generations[2];
 	uint64_t *ready;
 	pthread_t thread;
-	int domain_fd, claim_executor_fd, ret, i;
+	int domain_fd, claim_executor_fd, main_cpu = -1, runner_cpu = -1;
+	int ret, i;
+
+	TEST_ASSERT(!sched_getaffinity(0, sizeof(original_mask), &original_mask),
+		    "sched_getaffinity failed, errno %d", errno);
+	for (i = 0; i < CPU_SETSIZE; i++) {
+		if (!CPU_ISSET(i, &original_mask))
+			continue;
+		if (main_cpu < 0)
+			main_cpu = i;
+		else {
+			runner_cpu = i;
+			break;
+		}
+	}
+	TEST_ASSERT(runner_cpu >= 0,
+		    "trace contention test needs two allowed host CPUs");
+	CPU_ZERO(&pinned_mask);
+	CPU_SET(main_cpu, &pinned_mask);
+	TEST_ASSERT(!sched_setaffinity(0, sizeof(pinned_mask), &pinned_mask),
+		    "failed to pin contention claimant, errno %d", errno);
 
 	vm_a = vm_create_with_one_vcpu(&a, guest_trace_contention);
 	if (cross_vm) {
@@ -1421,6 +1446,8 @@ static void test_trace_target_contention(int kvm_fd, bool cross_vm)
 		.nr_entries = ARRAY_SIZE(entries),
 		.repeat_count = 1,
 	};
+	run_arg.pin_cpu = true;
+	run_arg.cpu = runner_cpu;
 	claim.domain_generation = domain_generation;
 	claim.executor_generation = executor_generations[1];
 
@@ -1455,6 +1482,8 @@ static void test_trace_target_contention(int kvm_fd, bool cross_vm)
 	if (vm_b)
 		kvm_vm_free(vm_b);
 	kvm_vm_free(vm_a);
+	TEST_ASSERT(!sched_setaffinity(0, sizeof(original_mask), &original_mask),
+		    "failed to restore CPU affinity, errno %d", errno);
 }
 
 static void guest_trace_signal(void)
