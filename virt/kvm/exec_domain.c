@@ -141,6 +141,11 @@ static u64 kvm_exec_next_generation(atomic64_t *counter)
 	return generation;
 }
 
+u64 kvm_exec_supported_features(void)
+{
+	return KVM_EXEC_SUPPORTED_FEATURES;
+}
+
 static int kvm_exec_domain_access(struct kvm_exec_domain *domain)
 {
 	if (domain->mm != current->mm)
