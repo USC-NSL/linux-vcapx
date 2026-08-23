@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -21,6 +22,8 @@
 static uint64_t fuzz_state = 0x8d26f31b9c47a5e1ULL;
 
 static void signal_handler(int signal);
+static int create_executor(int domain_fd, uint64_t cookie,
+			   uint64_t *generation);
 
 static uint64_t fuzz_next(void)
 {
@@ -99,6 +102,85 @@ static void test_cross_vm_feature_dependencies(int kvm_fd)
 	TEST_ASSERT(domain_fd >= 0,
 		    KVM_IOCTL_ERROR(KVM_CREATE_EXEC_DOMAIN, domain_fd));
 	TEST_ASSERT_EQ(create.negotiated_features, complete_features);
+	close(domain_fd);
+}
+
+static void test_dynamic_dispatch_uapi_layout(void)
+{
+	TEST_ASSERT_EQ(sizeof(struct kvm_exec_dispatch_header), 256);
+	TEST_ASSERT_EQ(sizeof(struct kvm_exec_command), 96);
+	TEST_ASSERT_EQ(sizeof(struct kvm_exec_completion), 112);
+	TEST_ASSERT_EQ(sizeof(struct kvm_exec_run_dispatch), 104);
+	TEST_ASSERT_EQ(sizeof(struct kvm_exec_kick), 48);
+	TEST_ASSERT_EQ(sizeof(struct kvm_exec_cancel), 56);
+	TEST_ASSERT_EQ(KVM_EXEC_DISPATCH_COMMAND_OFFSET, 256);
+	TEST_ASSERT_EQ(KVM_EXEC_DISPATCH_COMPLETION_OFFSET, 4096);
+	TEST_ASSERT_EQ(KVM_EXEC_DISPATCH_MMAP_SIZE, 8192);
+}
+
+static void test_dynamic_dispatch_mapping(int kvm_fd)
+{
+	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
+				  KVM_EXEC_FEATURE_INTRA_VM_CHAIN |
+				  KVM_EXEC_FEATURE_CROSS_VM_CHAIN |
+				  KVM_EXEC_FEATURE_DYNAMIC_DISPATCH;
+	struct kvm_exec_dispatch_header *header;
+	uint64_t domain_generation, executor_generation;
+	pid_t child;
+	int domain_fd, executor_fd, status;
+
+	domain_fd = create_domain_with_features(kvm_fd, 2, 1, features,
+						&domain_generation);
+	executor_fd = create_executor(domain_fd, 0x701, &executor_generation);
+	child = fork();
+	TEST_ASSERT(child >= 0, "fork failed, errno %d", errno);
+	if (!child) {
+		void *wrong_mm_mapping;
+
+		errno = 0;
+		wrong_mm_mapping = mmap(NULL, KVM_EXEC_DISPATCH_MMAP_SIZE,
+					PROT_READ | PROT_WRITE, MAP_SHARED,
+					executor_fd, 0);
+		_exit(wrong_mm_mapping == MAP_FAILED && errno == EIO ? 0 : 1);
+	}
+	waitpid(child, &status, 0);
+	TEST_ASSERT(WIFEXITED(status) && !WEXITSTATUS(status),
+		    "wrong-mm executor mmap was not rejected");
+
+	header = mmap(NULL, KVM_EXEC_DISPATCH_MMAP_SIZE, PROT_READ | PROT_WRITE,
+		      MAP_SHARED, executor_fd, 0);
+	TEST_ASSERT(header != MAP_FAILED, "executor mmap failed, errno: %d", errno);
+	TEST_ASSERT_EQ(header->abi_version, KVM_EXEC_DISPATCH_ABI_VERSION);
+	TEST_ASSERT_EQ(header->region_size, KVM_EXEC_DISPATCH_MMAP_SIZE);
+	TEST_ASSERT_EQ(header->command_offset, KVM_EXEC_DISPATCH_COMMAND_OFFSET);
+	TEST_ASSERT_EQ(header->completion_offset,
+		       KVM_EXEC_DISPATCH_COMPLETION_OFFSET);
+	TEST_ASSERT_EQ(header->command_entries, KVM_EXEC_DISPATCH_RING_ENTRIES);
+	TEST_ASSERT_EQ(header->completion_entries, KVM_EXEC_DISPATCH_RING_ENTRIES);
+	TEST_ASSERT_EQ(header->command_entry_size,
+		       sizeof(struct kvm_exec_command));
+	TEST_ASSERT_EQ(header->completion_entry_size,
+		       sizeof(struct kvm_exec_completion));
+	TEST_ASSERT_EQ(header->command_head, 0);
+	TEST_ASSERT_EQ(header->command_tail, 0);
+	TEST_ASSERT_EQ(header->completion_head, 0);
+	TEST_ASSERT_EQ(header->completion_tail, 0);
+	child = fork();
+	TEST_ASSERT(child >= 0, "fork failed, errno %d", errno);
+	if (!child) {
+		unsigned char residency;
+
+		errno = 0;
+		_exit(mincore(header, 4096, &residency) == -1 &&
+		      errno == ENOMEM ? 0 : 1);
+	}
+	waitpid(child, &status, 0);
+	TEST_ASSERT(WIFEXITED(status) && !WEXITSTATUS(status),
+		    "dispatch mapping survived into a different mm");
+
+	close(executor_fd);
+	TEST_ASSERT_EQ(header->abi_version, KVM_EXEC_DISPATCH_ABI_VERSION);
+	munmap(header, KVM_EXEC_DISPATCH_MMAP_SIZE);
 	close(domain_fd);
 }
 
@@ -1835,6 +1917,12 @@ static void guest_spin(void)
 		asm volatile("pause");
 }
 
+static void guest_spin_irqs_disabled(void)
+{
+	asm volatile("cli" ::: "memory");
+	guest_spin();
+}
+
 static uint64_t *guest_started_hva(struct kvm_vm *vm)
 {
 	uint64_t *started =
@@ -1851,6 +1939,16 @@ static void wait_for_guest(uint64_t *started)
 	for (i = 0; i < 1000000 && !READ_ONCE(*started); i++)
 		sched_yield();
 	TEST_ASSERT(READ_ONCE(*started), "guest did not enter its spin loop");
+}
+
+static void wait_for_trace_progress(uint64_t *count, uint64_t previous)
+{
+	int i;
+
+	for (i = 0; i < 1000000 && READ_ONCE(*count) == previous; i++)
+		sched_yield();
+	TEST_ASSERT(READ_ONCE(*count) > previous,
+		    "dispatched capsule did not make guest progress");
 }
 
 static void signal_handler(int signal)
@@ -1925,6 +2023,669 @@ static void *executor_runner(void *opaque)
 	arg->ret = ioctl(arg->executor_fd, KVM_EXEC_RUN, &arg->run);
 	arg->error = errno;
 	return NULL;
+}
+
+struct dispatch_mapping {
+	struct kvm_exec_dispatch_header *header;
+	struct kvm_exec_command *commands;
+	struct kvm_exec_completion *completions;
+};
+
+struct dispatch_run_arg {
+	struct kvm_exec_run_dispatch run;
+	int executor_fd;
+	int ret;
+	int error;
+};
+
+static struct dispatch_mapping map_dispatch(int executor_fd)
+{
+	struct dispatch_mapping mapping;
+	void *region;
+
+	region = mmap(NULL, KVM_EXEC_DISPATCH_MMAP_SIZE,
+		      PROT_READ | PROT_WRITE, MAP_SHARED, executor_fd, 0);
+	TEST_ASSERT(region != MAP_FAILED, "executor mmap failed, errno: %d", errno);
+	mapping.header = region;
+	mapping.commands = region + KVM_EXEC_DISPATCH_COMMAND_OFFSET;
+	mapping.completions = region + KVM_EXEC_DISPATCH_COMPLETION_OFFSET;
+	return mapping;
+}
+
+static bool publish_dispatch_command(struct dispatch_mapping *mapping,
+				     struct kvm_exec_command command)
+{
+	uint64_t head = __atomic_load_n(&mapping->header->command_head,
+					__ATOMIC_ACQUIRE);
+	uint64_t tail = mapping->header->command_tail;
+
+	if (tail - head == KVM_EXEC_DISPATCH_RING_ENTRIES)
+		return false;
+	command.size = sizeof(command);
+	mapping->commands[tail % KVM_EXEC_DISPATCH_RING_ENTRIES] = command;
+	__atomic_store_n(&mapping->header->command_tail, tail + 1,
+			 __ATOMIC_RELEASE);
+	return true;
+}
+
+static struct kvm_exec_completion
+consume_dispatch_completion(struct dispatch_mapping *mapping)
+{
+	struct kvm_exec_completion completion;
+	uint64_t head;
+	int i;
+
+	for (i = 0; i < 1000000; i++) {
+		head = mapping->header->completion_head;
+		if (__atomic_load_n(&mapping->header->completion_tail,
+				    __ATOMIC_ACQUIRE) != head)
+			break;
+		sched_yield();
+	}
+	TEST_ASSERT(i < 1000000, "timed out waiting for dispatch completion");
+	completion = mapping->completions[head % KVM_EXEC_DISPATCH_RING_ENTRIES];
+	__atomic_store_n(&mapping->header->completion_head, head + 1,
+			 __ATOMIC_RELEASE);
+	return completion;
+}
+
+static void kick_dispatch(int executor_fd, uint64_t domain_generation,
+			  uint64_t executor_generation, uint64_t sequence)
+{
+	struct kvm_exec_kick kick = {
+		.size = sizeof(kick),
+		.domain_generation = domain_generation,
+		.executor_generation = executor_generation,
+		.request_sequence = sequence,
+	};
+	int ret = ioctl(executor_fd, KVM_EXEC_KICK, &kick);
+
+	TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_EXEC_KICK, ret));
+}
+
+static uint32_t cancel_dispatch(int executor_fd, uint64_t domain_generation,
+				uint64_t executor_generation, uint64_t sequence)
+{
+	struct kvm_exec_cancel cancel = {
+		.size = sizeof(cancel),
+		.domain_generation = domain_generation,
+		.executor_generation = executor_generation,
+		.request_sequence = sequence,
+	};
+	int ret = ioctl(executor_fd, KVM_EXEC_CANCEL, &cancel);
+
+	TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_EXEC_CANCEL, ret));
+	return cancel.status;
+}
+
+static void *dispatch_runner(void *opaque)
+{
+	struct dispatch_run_arg *arg = opaque;
+
+	errno = 0;
+	arg->ret = ioctl(arg->executor_fd, KVM_EXEC_RUN_DISPATCH, &arg->run);
+	arg->error = errno;
+	return NULL;
+}
+
+static void test_dynamic_kick_and_cancel(int kvm_fd)
+{
+	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
+				  KVM_EXEC_FEATURE_INTRA_VM_CHAIN |
+				  KVM_EXEC_FEATURE_CROSS_VM_CHAIN |
+				  KVM_EXEC_FEATURE_DYNAMIC_DISPATCH;
+	struct kvm_exec_command command = {
+		.opcode = KVM_EXEC_CMD_SWITCH,
+		.request_sequence = 1,
+		.target_capsule_id = 41,
+		.target_lifecycle_generation = 7,
+		.user_cookie = 0x701,
+	};
+	struct dispatch_run_arg run_arg = { };
+	struct kvm_exec_cancel stale_cancel = {
+		.size = sizeof(stale_cancel),
+		.request_sequence = 6,
+	};
+	struct kvm_exec_completion completion;
+	struct dispatch_mapping mapping;
+	uint64_t *started;
+	struct kvm_vcpu *vcpu;
+	struct kvm_vm *vm;
+	uint64_t domain_generation, executor_generation;
+	pthread_t thread;
+	int domain_fd;
+
+	vm = vm_create_with_one_vcpu(&vcpu, guest_spin_irqs_disabled);
+	disable_nested_cpuid(vcpu);
+	started = guest_started_hva(vm);
+	domain_fd = create_domain_with_features(kvm_fd, 1, 1, features,
+						&domain_generation);
+	attach_vcpu(domain_fd, vcpu->fd, 41, 7);
+	run_arg.executor_fd = create_executor(domain_fd, 0x701,
+					      &executor_generation);
+	mapping = map_dispatch(run_arg.executor_fd);
+	command.domain_generation = domain_generation;
+	command.executor_generation = executor_generation;
+	TEST_ASSERT(publish_dispatch_command(&mapping, command),
+		    "initial dispatch command was unexpectedly full");
+	run_arg.run.size = sizeof(run_arg.run);
+	run_arg.run.domain_generation = domain_generation;
+	run_arg.run.executor_generation = executor_generation;
+	TEST_ASSERT(!pthread_create(&thread, NULL, dispatch_runner, &run_arg),
+		    "pthread_create failed");
+	completion = consume_dispatch_completion(&mapping);
+	TEST_ASSERT_EQ(completion.request_sequence, 1);
+	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_APPLIED);
+	TEST_ASSERT_EQ(completion.previous_capsule_id, 0);
+	TEST_ASSERT_EQ(completion.owned_capsule_id, 41);
+	TEST_ASSERT(completion.applied_ns && completion.entry_attempt_ns >=
+					 completion.applied_ns,
+		    "dispatch timestamps are not ordered");
+	wait_for_guest(started);
+
+	command = (struct kvm_exec_command) {
+		.opcode = KVM_EXEC_CMD_SWITCH,
+		.request_sequence = 2,
+		.domain_generation = domain_generation,
+		.executor_generation = executor_generation,
+		.expected_current_id = 41,
+		.expected_current_generation = 7,
+		.target_capsule_id = 41,
+		.target_lifecycle_generation = 8,
+	};
+	TEST_ASSERT(publish_dispatch_command(&mapping, command),
+		    "stale-target command was unexpectedly full");
+	kick_dispatch(run_arg.executor_fd, domain_generation,
+		      executor_generation, 2);
+	completion = consume_dispatch_completion(&mapping);
+	TEST_ASSERT_EQ(completion.request_sequence, 2);
+	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_TARGET_STALE);
+	TEST_ASSERT_EQ(completion.previous_capsule_id, 41);
+	TEST_ASSERT_EQ(completion.owned_capsule_id, 41);
+
+	command = (struct kvm_exec_command) {
+		.opcode = KVM_EXEC_CMD_RELEASE,
+		.request_sequence = 3,
+		.domain_generation = domain_generation,
+		.executor_generation = executor_generation,
+		.expected_current_id = 41,
+		.expected_current_generation = 7,
+	};
+	TEST_ASSERT(publish_dispatch_command(&mapping, command),
+		    "release command was unexpectedly full");
+	usleep(20000);
+	TEST_ASSERT_EQ(__atomic_load_n(&mapping.header->completion_tail,
+				       __ATOMIC_ACQUIRE), 2);
+	kick_dispatch(run_arg.executor_fd, domain_generation,
+		      executor_generation, 3);
+	completion = consume_dispatch_completion(&mapping);
+	TEST_ASSERT_EQ(completion.request_sequence, 3);
+	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_RETURNED);
+	TEST_ASSERT_EQ(completion.previous_capsule_id, 41);
+	TEST_ASSERT_EQ(completion.owned_capsule_id, 0);
+
+	/* A kick before publication cannot make a later command visible. */
+	kick_dispatch(run_arg.executor_fd, domain_generation,
+		      executor_generation, 4);
+	usleep(20000);
+	command = (struct kvm_exec_command) {
+		.opcode = KVM_EXEC_CMD_SWITCH,
+		.request_sequence = 4,
+		.domain_generation = domain_generation,
+		.executor_generation = executor_generation,
+		.target_capsule_id = 41,
+		.target_lifecycle_generation = 7,
+	};
+	TEST_ASSERT(publish_dispatch_command(&mapping, command),
+		    "cancelled command was unexpectedly full");
+	usleep(20000);
+	TEST_ASSERT_EQ(__atomic_load_n(&mapping.header->completion_tail,
+				       __ATOMIC_ACQUIRE), 3);
+	TEST_ASSERT_EQ(cancel_dispatch(run_arg.executor_fd, domain_generation,
+				       executor_generation, 4),
+		       KVM_EXEC_CANCEL_ACCEPTED);
+	kick_dispatch(run_arg.executor_fd, domain_generation,
+		      executor_generation, 4);
+	completion = consume_dispatch_completion(&mapping);
+	TEST_ASSERT_EQ(completion.status,
+		       KVM_EXEC_COMPLETE_CANCELLED_BEFORE_APPLY);
+	TEST_ASSERT_EQ(completion.owned_capsule_id, 0);
+	TEST_ASSERT_EQ(cancel_dispatch(run_arg.executor_fd, domain_generation,
+				       executor_generation, 4),
+		       KVM_EXEC_CANCEL_ALREADY_CANCELLED);
+
+	command.request_sequence = 5;
+	TEST_ASSERT(publish_dispatch_command(&mapping, command),
+		    "second switch command was unexpectedly full");
+	kick_dispatch(run_arg.executor_fd, domain_generation,
+		      executor_generation, 5);
+	completion = consume_dispatch_completion(&mapping);
+	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_APPLIED);
+	TEST_ASSERT_EQ(cancel_dispatch(run_arg.executor_fd, domain_generation,
+				       executor_generation, 5),
+		       KVM_EXEC_CANCEL_APPLIED);
+
+	stale_cancel.domain_generation = domain_generation + 1;
+	stale_cancel.executor_generation = executor_generation;
+	assert_ioctl_errno(run_arg.executor_fd, KVM_EXEC_CANCEL, &stale_cancel,
+			   ESTALE);
+	stale_cancel.domain_generation = domain_generation;
+	stale_cancel.executor_generation = executor_generation + 1;
+	assert_ioctl_errno(run_arg.executor_fd, KVM_EXEC_CANCEL, &stale_cancel,
+			   ESTALE);
+
+	/* Apply and cancellation race at one serialized ownership point. */
+	for (command.request_sequence = 6; command.request_sequence < 134;
+	     command.request_sequence++) {
+		uint32_t cancel_status;
+
+		command.expected_current_id = 41;
+		command.expected_current_generation = 7;
+		TEST_ASSERT(publish_dispatch_command(&mapping, command),
+			    "race command was unexpectedly full");
+		kick_dispatch(run_arg.executor_fd, domain_generation,
+			      executor_generation, command.request_sequence);
+		cancel_status = cancel_dispatch(run_arg.executor_fd,
+						domain_generation,
+						executor_generation,
+						command.request_sequence);
+		completion = consume_dispatch_completion(&mapping);
+		TEST_ASSERT_EQ(completion.request_sequence,
+			       command.request_sequence);
+		if (cancel_status == KVM_EXEC_CANCEL_ACCEPTED) {
+			TEST_ASSERT_EQ(completion.status,
+				       KVM_EXEC_COMPLETE_CANCELLED_BEFORE_APPLY);
+		} else {
+			TEST_ASSERT_EQ(cancel_status, KVM_EXEC_CANCEL_APPLIED);
+			TEST_ASSERT_EQ(completion.status,
+				       KVM_EXEC_COMPLETE_APPLIED);
+		}
+		TEST_ASSERT_EQ(completion.owned_capsule_id, 41);
+		TEST_ASSERT_EQ(mapping.header->completion_head,
+			       mapping.header->completion_tail);
+	}
+
+	control_domain(domain_fd, KVM_EXEC_PAUSE);
+	control_domain(domain_fd, KVM_EXEC_DRAIN);
+	pthread_join(thread, NULL);
+	TEST_ASSERT(!run_arg.ret,
+		    "KVM_EXEC_RUN_DISPATCH returned %d errno %d",
+		    run_arg.ret, run_arg.error);
+	TEST_ASSERT_EQ(run_arg.run.return_reason,
+		       KVM_EXEC_RETURN_DOMAIN_PAUSED);
+	TEST_ASSERT_EQ(run_arg.run.run_result, -EINTR);
+	TEST_ASSERT_EQ(run_arg.run.owned_capsule_id, 41);
+	TEST_ASSERT_EQ(mapping.header->kernel_kick_count, 133);
+
+	munmap(mapping.header, KVM_EXEC_DISPATCH_MMAP_SIZE);
+	close(run_arg.executor_fd);
+	detach_vcpu(domain_fd, 41, 7);
+	close(domain_fd);
+	kvm_vm_free(vm);
+}
+
+static void test_dynamic_ring_backpressure_and_corruption(int kvm_fd)
+{
+	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
+				  KVM_EXEC_FEATURE_DYNAMIC_DISPATCH;
+	struct kvm_exec_command command = {
+		.opcode = KVM_EXEC_CMD_SWITCH,
+		.target_capsule_id = 999,
+		.target_lifecycle_generation = 1,
+	};
+	struct kvm_exec_run_dispatch run = {
+		.size = sizeof(run),
+		.flags = KVM_EXEC_DISPATCH_F_RETURN_IF_EMPTY,
+	};
+	struct kvm_exec_completion completion;
+	struct dispatch_mapping mapping;
+	uint64_t domain_generation, executor_generation;
+	int domain_fd, executor_fd, ret, i;
+
+	domain_fd = create_domain_with_features(kvm_fd, 1, 1, features,
+						&domain_generation);
+	executor_fd = create_executor(domain_fd, 0x702, &executor_generation);
+	mapping = map_dispatch(executor_fd);
+	command.domain_generation = domain_generation;
+	command.executor_generation = executor_generation;
+	run.domain_generation = domain_generation;
+	run.executor_generation = executor_generation;
+
+	for (i = 0; i < KVM_EXEC_DISPATCH_RING_ENTRIES; i++) {
+		command.request_sequence = i + 1;
+		command.reserved[0] = i == 0;
+		TEST_ASSERT(publish_dispatch_command(&mapping, command),
+			    "command ring filled before its advertised capacity");
+	}
+	command.request_sequence++;
+	command.reserved[0] = 0;
+	TEST_ASSERT(!publish_dispatch_command(&mapping, command),
+		    "command producer overwrote a full ring");
+
+	ret = ioctl(executor_fd, KVM_EXEC_RUN_DISPATCH, &run);
+	TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_EXEC_RUN_DISPATCH, ret));
+	TEST_ASSERT_EQ(run.return_reason, KVM_EXEC_RETURN_DISPATCH_EMPTY);
+	TEST_ASSERT_EQ(run.command_head, KVM_EXEC_DISPATCH_RING_ENTRIES);
+	TEST_ASSERT_EQ(run.completion_tail, KVM_EXEC_DISPATCH_RING_ENTRIES);
+
+	TEST_ASSERT(publish_dispatch_command(&mapping, command),
+		    "command ring did not reopen after kernel consumption");
+	ret = ioctl(executor_fd, KVM_EXEC_RUN_DISPATCH, &run);
+	TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_EXEC_RUN_DISPATCH, ret));
+	TEST_ASSERT_EQ(run.return_reason, KVM_EXEC_RETURN_COMPLETION_FULL);
+	TEST_ASSERT_EQ(run.run_result, -ENOSPC);
+	TEST_ASSERT_EQ(run.command_head, KVM_EXEC_DISPATCH_RING_ENTRIES);
+
+	for (i = 0; i < KVM_EXEC_DISPATCH_RING_ENTRIES; i++) {
+		completion = consume_dispatch_completion(&mapping);
+		TEST_ASSERT_EQ(completion.request_sequence, i + 1);
+		TEST_ASSERT_EQ(completion.status,
+			       i ? KVM_EXEC_COMPLETE_TARGET_UNKNOWN :
+				   KVM_EXEC_COMPLETE_REJECTED);
+	}
+	ret = ioctl(executor_fd, KVM_EXEC_RUN_DISPATCH, &run);
+	TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_EXEC_RUN_DISPATCH, ret));
+	TEST_ASSERT_EQ(run.return_reason, KVM_EXEC_RETURN_DISPATCH_EMPTY);
+	completion = consume_dispatch_completion(&mapping);
+	TEST_ASSERT_EQ(completion.request_sequence,
+		       KVM_EXEC_DISPATCH_RING_ENTRIES + 1);
+	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_TARGET_UNKNOWN);
+
+	/* Duplicate sequences terminate once and do not poison the next entry. */
+	command.request_sequence = KVM_EXEC_DISPATCH_RING_ENTRIES + 2;
+	TEST_ASSERT(publish_dispatch_command(&mapping, command),
+		    "first duplicate-sequence command did not publish");
+	TEST_ASSERT(publish_dispatch_command(&mapping, command),
+		    "second duplicate-sequence command did not publish");
+	command.request_sequence++;
+	TEST_ASSERT(publish_dispatch_command(&mapping, command),
+		    "post-duplicate command did not publish");
+	ret = ioctl(executor_fd, KVM_EXEC_RUN_DISPATCH, &run);
+	TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_EXEC_RUN_DISPATCH, ret));
+	completion = consume_dispatch_completion(&mapping);
+	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_TARGET_UNKNOWN);
+	completion = consume_dispatch_completion(&mapping);
+	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_REJECTED);
+	completion = consume_dispatch_completion(&mapping);
+	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_TARGET_UNKNOWN);
+
+	/* A producer distance beyond capacity is a controlled fatal ring error. */
+	__atomic_store_n(&mapping.header->command_tail,
+			 mapping.header->command_head +
+			 KVM_EXEC_DISPATCH_RING_ENTRIES + 1,
+			 __ATOMIC_RELEASE);
+	ret = ioctl(executor_fd, KVM_EXEC_RUN_DISPATCH, &run);
+	TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_EXEC_RUN_DISPATCH, ret));
+	TEST_ASSERT_EQ(run.return_reason, KVM_EXEC_RETURN_DISPATCH_CORRUPT);
+	TEST_ASSERT_EQ(run.run_result, -EPROTO);
+	TEST_ASSERT_EQ(run.corruption_count, 1);
+	TEST_ASSERT_EQ(mapping.header->kernel_corruption_count, 1);
+
+	munmap(mapping.header, KVM_EXEC_DISPATCH_MMAP_SIZE);
+	close(executor_fd);
+	close(domain_fd);
+}
+
+static void test_dynamic_cross_vm_seeded_trace(int kvm_fd)
+{
+	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
+				  KVM_EXEC_FEATURE_INTRA_VM_CHAIN |
+				  KVM_EXEC_FEATURE_CROSS_VM_CHAIN |
+				  KVM_EXEC_FEATURE_DYNAMIC_DISPATCH;
+	const uint64_t capsule_ids[2] = { 501, 902 };
+	const uint64_t generations[2] = { 51, 92 };
+	struct kvm_guest_debug debug = {
+		.control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_SINGLESTEP,
+	};
+	struct kvm_exec_command command = {
+		.opcode = KVM_EXEC_CMD_SWITCH,
+	};
+	struct dispatch_run_arg run_arg = { };
+	struct dispatch_mapping mapping;
+	struct kvm_exec_completion completion;
+	struct kvm_vcpu *vcpus[2];
+	struct kvm_vm *vms[2];
+	uint64_t *counts[2], *errors[2];
+	uint64_t domain_generation, executor_generation;
+	uint64_t previous_id = 0, previous_generation = 0;
+	uint64_t random = 0x7018c055600dULL;
+	pthread_t thread;
+	int domain_fd, i;
+
+	vms[0] = vm_create_with_one_vcpu(&vcpus[0], guest_single_step_trace);
+	vms[1] = vm_create_with_one_vcpu(&vcpus[1], guest_single_step_trace);
+	for (i = 0; i < 2; i++) {
+		vcpu_args_set(vcpus[i], 1, i);
+		disable_nested_cpuid(vcpus[i]);
+		vcpu_guest_debug_set(vcpus[i], &debug);
+		counts[i] = addr_gva2hva(vms[i], (vm_vaddr_t)trace_counts);
+		errors[i] = addr_gva2hva(vms[i],
+					 (vm_vaddr_t)trace_state_errors);
+		memset(counts[i], 0, sizeof(trace_counts));
+		memset(errors[i], 0, sizeof(trace_state_errors));
+	}
+
+	domain_fd = create_domain_with_features(kvm_fd, 2, 1, features,
+						&domain_generation);
+	for (i = 0; i < 2; i++)
+		attach_vcpu(domain_fd, vcpus[i]->fd, capsule_ids[i],
+			    generations[i]);
+	run_arg.executor_fd = create_executor(domain_fd, 0x703,
+					      &executor_generation);
+	mapping = map_dispatch(run_arg.executor_fd);
+	run_arg.run.size = sizeof(run_arg.run);
+	run_arg.run.domain_generation = domain_generation;
+	run_arg.run.executor_generation = executor_generation;
+	command.domain_generation = domain_generation;
+	command.executor_generation = executor_generation;
+
+	for (i = 0; i < 4096; i++) {
+		uint64_t progress_before;
+		int target;
+
+		random ^= random << 13;
+		random ^= random >> 7;
+		random ^= random << 17;
+		target = random & 1;
+		progress_before = READ_ONCE(counts[target][target]);
+		command.request_sequence = i + 1;
+		command.expected_current_id = previous_id;
+		command.expected_current_generation = previous_generation;
+		command.target_capsule_id = capsule_ids[target];
+		command.target_lifecycle_generation = generations[target];
+		command.user_cookie = random;
+		TEST_ASSERT(publish_dispatch_command(&mapping, command),
+			    "seeded command ring unexpectedly full at step %d", i);
+		if (!i) {
+			TEST_ASSERT(!pthread_create(&thread, NULL, dispatch_runner,
+						    &run_arg),
+				    "pthread_create failed");
+		} else {
+			kick_dispatch(run_arg.executor_fd, domain_generation,
+				      executor_generation, i + 1);
+		}
+		completion = consume_dispatch_completion(&mapping);
+		TEST_ASSERT_EQ(completion.request_sequence, i + 1);
+		TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_APPLIED);
+		TEST_ASSERT_EQ(completion.previous_capsule_id, previous_id);
+		TEST_ASSERT_EQ(completion.owned_capsule_id,
+			       capsule_ids[target]);
+		TEST_ASSERT_EQ(completion.owned_lifecycle_generation,
+			       generations[target]);
+		TEST_ASSERT_EQ(completion.user_cookie, random);
+		wait_for_trace_progress(&counts[target][target], progress_before);
+		previous_id = capsule_ids[target];
+		previous_generation = generations[target];
+	}
+
+	control_domain(domain_fd, KVM_EXEC_PAUSE);
+	control_domain(domain_fd, KVM_EXEC_DRAIN);
+	pthread_join(thread, NULL);
+	TEST_ASSERT(!run_arg.ret,
+		    "dynamic seeded runner returned %d errno %d",
+		    run_arg.ret, run_arg.error);
+	TEST_ASSERT_EQ(run_arg.run.return_reason,
+		       KVM_EXEC_RETURN_DOMAIN_PAUSED);
+	TEST_ASSERT_EQ(run_arg.run.owned_capsule_id, previous_id);
+	TEST_ASSERT(READ_ONCE(counts[0][0]) > 0,
+		    "first dynamic capsule made no guest progress");
+	TEST_ASSERT(READ_ONCE(counts[1][1]) > 0,
+		    "second dynamic capsule made no guest progress");
+	TEST_ASSERT_EQ(READ_ONCE(errors[0][0]), 0);
+	TEST_ASSERT_EQ(READ_ONCE(errors[1][1]), 0);
+
+	munmap(mapping.header, KVM_EXEC_DISPATCH_MMAP_SIZE);
+	close(run_arg.executor_fd);
+	for (i = 0; i < 2; i++)
+		detach_vcpu(domain_fd, capsule_ids[i], generations[i]);
+	close(domain_fd);
+	kvm_vm_free(vms[1]);
+	kvm_vm_free(vms[0]);
+}
+
+static void test_dynamic_two_executor_migration(int kvm_fd)
+{
+	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
+				  KVM_EXEC_FEATURE_INTRA_VM_CHAIN |
+				  KVM_EXEC_FEATURE_CROSS_VM_CHAIN |
+				  KVM_EXEC_FEATURE_DYNAMIC_DISPATCH;
+	const uint64_t capsule_ids[2] = { 711, 822 };
+	const uint64_t generations[2] = { 17, 28 };
+	struct kvm_guest_debug debug = {
+		.control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_SINGLESTEP,
+	};
+	struct kvm_exec_command command = {
+		.opcode = KVM_EXEC_CMD_SWITCH,
+	};
+	struct dispatch_run_arg runners[2] = { };
+	struct dispatch_mapping mappings[2];
+	struct kvm_exec_completion completion;
+	struct kvm_vcpu *vcpus[2];
+	struct kvm_vm *vms[2];
+	uint64_t domain_generation, executor_generations[2];
+	pthread_t threads[2];
+	int domain_fd, i;
+
+	for (i = 0; i < 2; i++) {
+		vms[i] = vm_create_with_one_vcpu(&vcpus[i],
+						 guest_single_step_trace);
+		vcpu_args_set(vcpus[i], 1, i);
+		disable_nested_cpuid(vcpus[i]);
+		vcpu_guest_debug_set(vcpus[i], &debug);
+	}
+	domain_fd = create_domain_with_features(kvm_fd, 2, 2, features,
+						&domain_generation);
+	for (i = 0; i < 2; i++) {
+		attach_vcpu(domain_fd, vcpus[i]->fd, capsule_ids[i],
+			    generations[i]);
+		runners[i].executor_fd =
+			create_executor(domain_fd, 0x710 + i,
+					&executor_generations[i]);
+		mappings[i] = map_dispatch(runners[i].executor_fd);
+		runners[i].run.size = sizeof(runners[i].run);
+		runners[i].run.domain_generation = domain_generation;
+		runners[i].run.executor_generation = executor_generations[i];
+		command.request_sequence = 1;
+		command.domain_generation = domain_generation;
+		command.executor_generation = executor_generations[i];
+		command.expected_current_id = 0;
+		command.expected_current_generation = 0;
+		command.target_capsule_id = capsule_ids[i];
+		command.target_lifecycle_generation = generations[i];
+		TEST_ASSERT(publish_dispatch_command(&mappings[i], command),
+			    "initial migration command did not publish");
+		TEST_ASSERT(!pthread_create(&threads[i], NULL, dispatch_runner,
+					    &runners[i]),
+			    "pthread_create failed");
+		completion = consume_dispatch_completion(&mappings[i]);
+		TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_APPLIED);
+		TEST_ASSERT_EQ(completion.owned_capsule_id, capsule_ids[i]);
+	}
+
+	command = (struct kvm_exec_command) {
+		.opcode = KVM_EXEC_CMD_SWITCH,
+		.request_sequence = 2,
+		.domain_generation = domain_generation,
+		.executor_generation = executor_generations[1],
+		.expected_current_id = capsule_ids[1],
+		.expected_current_generation = generations[1],
+		.target_capsule_id = capsule_ids[0],
+		.target_lifecycle_generation = generations[0],
+	};
+	TEST_ASSERT(publish_dispatch_command(&mappings[1], command),
+		    "busy-target command did not publish");
+	kick_dispatch(runners[1].executor_fd, domain_generation,
+		      executor_generations[1], 2);
+	completion = consume_dispatch_completion(&mappings[1]);
+	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_TARGET_BUSY);
+	TEST_ASSERT_EQ(completion.owned_capsule_id, capsule_ids[1]);
+
+	command = (struct kvm_exec_command) {
+		.opcode = KVM_EXEC_CMD_RELEASE,
+		.request_sequence = 2,
+		.domain_generation = domain_generation,
+		.executor_generation = executor_generations[0],
+		.expected_current_id = capsule_ids[0],
+		.expected_current_generation = generations[0],
+	};
+	TEST_ASSERT(publish_dispatch_command(&mappings[0], command),
+		    "source release command did not publish");
+	kick_dispatch(runners[0].executor_fd, domain_generation,
+		      executor_generations[0], 2);
+	completion = consume_dispatch_completion(&mappings[0]);
+	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_RETURNED);
+	TEST_ASSERT_EQ(completion.owned_capsule_id, 0);
+
+	command = (struct kvm_exec_command) {
+		.opcode = KVM_EXEC_CMD_SWITCH,
+		.request_sequence = 3,
+		.domain_generation = domain_generation,
+		.executor_generation = executor_generations[1],
+		.expected_current_id = capsule_ids[1],
+		.expected_current_generation = generations[1],
+		.target_capsule_id = capsule_ids[0],
+		.target_lifecycle_generation = generations[0],
+	};
+	TEST_ASSERT(publish_dispatch_command(&mappings[1], command),
+		    "destination claim command did not publish");
+	kick_dispatch(runners[1].executor_fd, domain_generation,
+		      executor_generations[1], 3);
+	completion = consume_dispatch_completion(&mappings[1]);
+	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_APPLIED);
+	TEST_ASSERT_EQ(completion.owned_capsule_id, capsule_ids[0]);
+
+	command = (struct kvm_exec_command) {
+		.opcode = KVM_EXEC_CMD_SWITCH,
+		.request_sequence = 3,
+		.domain_generation = domain_generation,
+		.executor_generation = executor_generations[0],
+		.target_capsule_id = capsule_ids[1],
+		.target_lifecycle_generation = generations[1],
+	};
+	TEST_ASSERT(publish_dispatch_command(&mappings[0], command),
+		    "released target command did not publish");
+	kick_dispatch(runners[0].executor_fd, domain_generation,
+		      executor_generations[0], 3);
+	completion = consume_dispatch_completion(&mappings[0]);
+	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_APPLIED);
+	TEST_ASSERT_EQ(completion.owned_capsule_id, capsule_ids[1]);
+
+	control_domain(domain_fd, KVM_EXEC_PAUSE);
+	control_domain(domain_fd, KVM_EXEC_DRAIN);
+	for (i = 0; i < 2; i++) {
+		pthread_join(threads[i], NULL);
+		TEST_ASSERT(!runners[i].ret,
+			    "migration runner %d returned %d errno %d", i,
+			    runners[i].ret, runners[i].error);
+		TEST_ASSERT_EQ(runners[i].run.return_reason,
+			       KVM_EXEC_RETURN_DOMAIN_PAUSED);
+		munmap(mappings[i].header, KVM_EXEC_DISPATCH_MMAP_SIZE);
+		close(runners[i].executor_fd);
+		detach_vcpu(domain_fd, capsule_ids[i], generations[i]);
+	}
+	close(domain_fd);
+	kvm_vm_free(vms[1]);
+	kvm_vm_free(vms[0]);
 }
 
 static void run_executor_boundary_test(int kvm_fd, bool pause)
@@ -2406,12 +3167,16 @@ int main(int argc, char **argv)
 			   KVM_CAP_VCPU_EXEC_DOMAIN);
 	TEST_REQUIRE((capability & (KVM_EXEC_FEATURE_BASE_OBJECTS |
 				    KVM_EXEC_FEATURE_INTRA_VM_CHAIN |
-				    KVM_EXEC_FEATURE_CROSS_VM_CHAIN)) ==
+				    KVM_EXEC_FEATURE_CROSS_VM_CHAIN |
+				    KVM_EXEC_FEATURE_DYNAMIC_DISPATCH)) ==
 		     (KVM_EXEC_FEATURE_BASE_OBJECTS |
 		      KVM_EXEC_FEATURE_INTRA_VM_CHAIN |
-		      KVM_EXEC_FEATURE_CROSS_VM_CHAIN));
+		      KVM_EXEC_FEATURE_CROSS_VM_CHAIN |
+		      KVM_EXEC_FEATURE_DYNAMIC_DISPATCH));
 
 	test_cross_vm_feature_dependencies(kvm_fd);
+	test_dynamic_dispatch_uapi_layout();
+	test_dynamic_dispatch_mapping(kvm_fd);
 	test_create_empty_domain(kvm_fd);
 	test_one_capsule_run_and_legacy_restore(kvm_fd);
 	test_strict_cpu_placement(kvm_fd);
@@ -2438,6 +3203,10 @@ int main(int argc, char **argv)
 	test_trace_signal_releases_references(kvm_fd, false);
 	test_trace_signal_releases_references(kvm_fd, true);
 	test_halted_trace_pause_and_drain(kvm_fd);
+	test_dynamic_kick_and_cancel(kvm_fd);
+	test_dynamic_ring_backpressure_and_corruption(kvm_fd);
+	test_dynamic_cross_vm_seeded_trace(kvm_fd);
+	test_dynamic_two_executor_migration(kvm_fd);
 	close(kvm_fd);
 	return 0;
 }
