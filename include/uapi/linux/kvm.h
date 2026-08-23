@@ -884,6 +884,7 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_FEATURE_INTRA_VM_CHAIN	(1ULL << 1)
 #define KVM_EXEC_FEATURE_CROSS_VM_CHAIN	(1ULL << 2)
 #define KVM_EXEC_FEATURE_DYNAMIC_DISPATCH (1ULL << 3)
+#define KVM_EXEC_FEATURE_SYNC_EXITS	(1ULL << 4)
 #define KVM_EXEC_CPU_ANY		((__u32)-1)
 
 #define KVM_EXEC_TRACE_MAX_ENTRIES	256U
@@ -901,6 +902,7 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_RETURN_DISPATCH_EMPTY	8
 #define KVM_EXEC_RETURN_COMPLETION_FULL	9
 #define KVM_EXEC_RETURN_DISPATCH_CORRUPT	10
+#define KVM_EXEC_RETURN_INVALID_COMPLETION 11
 
 #define KVM_EXEC_DISPATCH_ABI_VERSION	1U
 #define KVM_EXEC_DISPATCH_RING_ENTRIES	32U
@@ -922,6 +924,9 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_COMPLETE_TARGET_BUSY	7U
 #define KVM_EXEC_COMPLETE_CROSS_VM_DISABLED 8U
 #define KVM_EXEC_COMPLETE_REJECTED	9U
+#define KVM_EXEC_COMPLETE_EXIT_PENDING	10U
+
+#define KVM_EXEC_EXIT_F_COMPLETION_PENDING (1U << 0)
 
 #define KVM_EXEC_CANCEL_ACCEPTED		1U
 #define KVM_EXEC_CANCEL_APPLIED		2U
@@ -1101,7 +1106,9 @@ struct kvm_exec_run_dispatch {
 	__u64 command_head;
 	__u64 completion_tail;
 	__u64 corruption_count;
-	__u64 reserved[2];
+	__u64 exit_sequence;
+	__u32 exit_flags;
+	__u32 reserved0;
 };
 
 struct kvm_exec_kick {
