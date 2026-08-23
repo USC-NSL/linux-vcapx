@@ -13,6 +13,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "apic.h"
 #include "kvm_util.h"
 #include "processor.h"
 #include "test_util.h"
@@ -213,6 +214,10 @@ static uint64_t trace_last_tsc[4];
 static uint64_t trace_tsc_errors[4];
 static uint64_t trace_nmi_counts[4];
 static uint64_t trace_nmi_errors;
+static uint64_t trace_irq_counts[4];
+static uint64_t trace_irq_errors;
+
+#define TRACE_IRQ_VECTOR 0x40
 
 static void guest_trace_nmi_handler(struct ex_regs *regs)
 {
@@ -220,6 +225,14 @@ static void guest_trace_nmi_handler(struct ex_regs *regs)
 		trace_nmi_counts[regs->rdi]++;
 	else
 		trace_nmi_errors++;
+}
+
+static void guest_trace_irq_handler(struct ex_regs *regs)
+{
+	if (regs->rdi < ARRAY_SIZE(trace_irq_counts))
+		trace_irq_counts[regs->rdi]++;
+	else
+		trace_irq_errors++;
 }
 
 static void guest_single_step_trace(uint64_t id)
@@ -245,6 +258,15 @@ static void guest_single_step_trace(uint64_t id)
 			WRITE_ONCE(trace_tsc_errors[id], 1);
 		WRITE_ONCE(trace_last_tsc[id], now);
 	}
+}
+
+static void guest_interrupt_single_step_trace(uint64_t id)
+{
+	x2apic_enable();
+	x2apic_write_reg(APIC_ICR, APIC_DEST_SELF | APIC_INT_ASSERT |
+			 APIC_DM_FIXED | TRACE_IRQ_VECTOR);
+	asm volatile("sti");
+	guest_single_step_trace(id);
 }
 
 static void test_same_vm_single_step_trace(int kvm_fd)
@@ -584,18 +606,20 @@ static void test_cross_vm_state_and_seeded_traces(int kvm_fd)
 	struct kvm_fpu fpu[4], observed_fpu;
 	struct kvm_regs regs[4], observed_regs;
 	struct kvm_vcpu *vcpus[4];
+	void *guest_code = guest_interrupt_single_step_trace;
 	uint64_t exits_before[4];
 	struct kvm_vm *vm_a, *vm_b;
 	uint64_t *counts[2], *errors[2], *stacks[2], *stack_errors[2];
 	uint64_t *tsc_errors[2], *nmi_counts[2], *nmi_errors[2];
+	uint64_t *irq_counts[2], *irq_errors[2];
 	uint64_t domain_generation, executor_generation;
 	uint64_t expected_switches;
 	int domain_fd, executor_fd, stats_fds[4], ret, i, vm_index;
 
-	vm_a = vm_create_with_one_vcpu(&vcpus[0], guest_single_step_trace);
-	vcpus[2] = vm_vcpu_add(vm_a, 1, guest_single_step_trace);
-	vm_b = vm_create_with_one_vcpu(&vcpus[1], guest_single_step_trace);
-	vcpus[3] = vm_vcpu_add(vm_b, 1, guest_single_step_trace);
+	vm_a = vm_create_with_one_vcpu(&vcpus[0], guest_code);
+	vcpus[2] = vm_vcpu_add(vm_a, 1, guest_code);
+	vm_b = vm_create_with_one_vcpu(&vcpus[1], guest_code);
+	vcpus[3] = vm_vcpu_add(vm_b, 1, guest_code);
 
 	for (i = 0; i < 4; i++) {
 		vcpu_args_set(vcpus[i], 1, i);
@@ -616,6 +640,10 @@ static void test_cross_vm_state_and_seeded_traces(int kvm_fd)
 				     guest_trace_nmi_handler);
 	vm_install_exception_handler(vm_b, NMI_VECTOR,
 				     guest_trace_nmi_handler);
+	vm_install_exception_handler(vm_a, TRACE_IRQ_VECTOR,
+				     guest_trace_irq_handler);
+	vm_install_exception_handler(vm_b, TRACE_IRQ_VECTOR,
+				     guest_trace_irq_handler);
 
 	for (vm_index = 0; vm_index < 2; vm_index++) {
 		struct kvm_vm *vm = vm_index ? vm_b : vm_a;
@@ -632,6 +660,10 @@ static void test_cross_vm_state_and_seeded_traces(int kvm_fd)
 			addr_gva2hva(vm, (vm_vaddr_t)trace_nmi_counts);
 		nmi_errors[vm_index] =
 			addr_gva2hva(vm, (vm_vaddr_t)&trace_nmi_errors);
+		irq_counts[vm_index] =
+			addr_gva2hva(vm, (vm_vaddr_t)trace_irq_counts);
+		irq_errors[vm_index] =
+			addr_gva2hva(vm, (vm_vaddr_t)&trace_irq_errors);
 		memset(counts[vm_index], 0, sizeof(trace_counts));
 		memset(errors[vm_index], 0, sizeof(trace_state_errors));
 		memset(stacks[vm_index], 0, sizeof(trace_stacks));
@@ -642,6 +674,8 @@ static void test_cross_vm_state_and_seeded_traces(int kvm_fd)
 		memset(tsc_errors[vm_index], 0, sizeof(trace_tsc_errors));
 		memset(nmi_counts[vm_index], 0, sizeof(trace_nmi_counts));
 		WRITE_ONCE(*nmi_errors[vm_index], 0);
+		memset(irq_counts[vm_index], 0, sizeof(trace_irq_counts));
+		WRITE_ONCE(*irq_errors[vm_index], 0);
 	}
 
 	for (i = 0; i < 4; i++) {
@@ -695,9 +729,12 @@ static void test_cross_vm_state_and_seeded_traces(int kvm_fd)
 		TEST_ASSERT_EQ(READ_ONCE(stack_errors[vm_index][i]), 0);
 		TEST_ASSERT_EQ(READ_ONCE(tsc_errors[vm_index][i]), 0);
 		TEST_ASSERT_EQ(READ_ONCE(nmi_counts[vm_index][i]), 1);
+		TEST_ASSERT_EQ(READ_ONCE(irq_counts[vm_index][i]), 1);
 	}
 	TEST_ASSERT_EQ(READ_ONCE(*nmi_errors[0]), 0);
 	TEST_ASSERT_EQ(READ_ONCE(*nmi_errors[1]), 0);
+	TEST_ASSERT_EQ(READ_ONCE(*irq_errors[0]), 0);
+	TEST_ASSERT_EQ(READ_ONCE(*irq_errors[1]), 0);
 
 	seeded_entries[0] = fixed_entries[3];
 	for (i = 1; i < ARRAY_SIZE(seeded_entries); i++) {
