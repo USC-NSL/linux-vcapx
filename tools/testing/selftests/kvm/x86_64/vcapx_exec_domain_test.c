@@ -2512,6 +2512,7 @@ static void test_sync_exit_kick_preserves_completion(int kvm_fd)
 	struct kvm_exec_completion completion;
 	struct dispatch_mapping mapping;
 	struct dispatch_run_arg run_arg;
+	struct pause_after_progress_arg pause_arg;
 	struct kvm_vcpu *vcpu;
 	struct kvm_vm *vm;
 	uint64_t *pio_value, *pio_progress;
@@ -2575,19 +2576,20 @@ static void test_sync_exit_kick_preserves_completion(int kvm_fd)
 	TEST_ASSERT_EQ(READ_ONCE(*pio_progress), 1);
 	TEST_ASSERT_EQ(READ_ONCE(*pio_value), response);
 
-	/* A prior kick request may surface once before the write retires. */
-	for (kick = 0; kick < 8; kick++) {
-		run = run_dispatch_once(executor_fd, domain_generation,
-					executor_generation);
-		if (run.vcpu_exit_reason == KVM_EXIT_HLT)
-			break;
-		TEST_ASSERT_EQ(run.return_reason, KVM_EXEC_RETURN_SIGNAL);
-		TEST_ASSERT_EQ(run.run_result, -EINTR);
-	}
-	TEST_ASSERT_EQ(run.vcpu_exit_reason, KVM_EXIT_HLT);
+	pause_arg = (struct pause_after_progress_arg) {
+		.progress = pio_progress,
+		.domain_fd = domain_fd,
+	};
+	TEST_ASSERT(!pthread_create(&thread, NULL, pause_after_progress,
+				    &pause_arg),
+		    "pthread_create failed");
+	run = run_dispatch_once(executor_fd, domain_generation,
+				executor_generation);
+	pthread_join(thread, NULL);
+	TEST_ASSERT_EQ(run.return_reason, KVM_EXEC_RETURN_DOMAIN_PAUSED);
+	TEST_ASSERT_EQ(run.run_result, -EINTR);
 	TEST_ASSERT_EQ(READ_ONCE(*pio_progress), 2);
 
-	control_domain(domain_fd, KVM_EXEC_PAUSE);
 	control_domain(domain_fd, KVM_EXEC_DRAIN);
 	munmap(mapping.header, KVM_EXEC_DISPATCH_MMAP_SIZE);
 	close(executor_fd);
