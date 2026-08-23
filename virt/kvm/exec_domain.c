@@ -1321,6 +1321,7 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 	u64 seen_kick_epoch;
 	u32 initial_cpu, final_cpu;
 	bool active = false;
+	bool completion_pending = false;
 	int command_ret, run_ret, ret;
 
 	if (copy_from_user(&run, argp, sizeof(run)))
@@ -1372,11 +1373,15 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 
 	for (;;) {
 		u64 kick_epoch = atomic64_read(&executor->kick_epoch);
-		bool completion_pending = false;
 		bool entry_allowed;
+		bool kick_pending;
 
 		mutex_lock(&domain->lock);
 		if (domain->stopping || domain->paused) {
+			if (completion_pending) {
+				kvm_exec_dispatch_publish(executor, &completion);
+				completion_pending = false;
+			}
 			run.return_reason = domain->stopping ?
 				KVM_EXEC_RETURN_DOMAIN_STOPPING :
 				KVM_EXEC_RETURN_DOMAIN_PAUSED;
@@ -1396,26 +1401,32 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 			seen_kick_epoch = kick_epoch;
 		}
 
-		memset(&completion, 0, sizeof(completion));
-		command_ret = kvm_exec_dispatch_consume(executor, &completion);
-		if (command_ret == -EPROTO) {
-			run.return_reason = KVM_EXEC_RETURN_DISPATCH_CORRUPT;
-			run.run_result = -EPROTO;
-			break;
+		command_ret = 0;
+		if (!completion_pending) {
+			memset(&completion, 0, sizeof(completion));
+			command_ret = kvm_exec_dispatch_consume(executor, &completion);
+			if (command_ret == -EPROTO) {
+				run.return_reason =
+					KVM_EXEC_RETURN_DISPATCH_CORRUPT;
+				run.run_result = -EPROTO;
+				break;
+			}
+			if (command_ret == -ENOSPC) {
+				run.return_reason =
+					KVM_EXEC_RETURN_COMPLETION_FULL;
+				run.run_result = -ENOSPC;
+				break;
+			}
+			if (command_ret > 0) {
+				if (completion.status == KVM_EXEC_COMPLETE_APPLIED &&
+				    completion.owned_capsule_id)
+					completion_pending = true;
+				else
+					kvm_exec_dispatch_publish(executor,
+								  &completion);
+			}
 		}
-		if (command_ret == -ENOSPC) {
-			run.return_reason = KVM_EXEC_RETURN_COMPLETION_FULL;
-			run.run_result = -ENOSPC;
-			break;
-		}
-		if (command_ret > 0) {
-			if (completion.status == KVM_EXEC_COMPLETE_APPLIED &&
-			    completion.owned_capsule_id)
-				completion_pending = true;
-			else
-				kvm_exec_dispatch_publish(executor, &completion);
-		}
-		if (!command_ret &&
+		if (!command_ret && !completion_pending &&
 		    (run.flags & KVM_EXEC_DISPATCH_F_RETURN_IF_EMPTY)) {
 			run.return_reason = KVM_EXEC_RETURN_DISPATCH_EMPTY;
 			break;
@@ -1423,12 +1434,20 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 
 		mutex_lock(&domain->lock);
 		if (domain->stopping) {
+			if (completion_pending) {
+				kvm_exec_dispatch_publish(executor, &completion);
+				completion_pending = false;
+			}
 			run.return_reason = KVM_EXEC_RETURN_DOMAIN_STOPPING;
 			run.run_result = -EINTR;
 			mutex_unlock(&domain->lock);
 			break;
 		}
 		if (domain->paused) {
+			if (completion_pending) {
+				kvm_exec_dispatch_publish(executor, &completion);
+				completion_pending = false;
+			}
 			run.return_reason = KVM_EXEC_RETURN_DOMAIN_PAUSED;
 			run.run_result = -EINTR;
 			mutex_unlock(&domain->lock);
@@ -1459,8 +1478,10 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 		mutex_unlock(&domain->lock);
 
 		if (mutex_lock_killable(&capsule->vcpu->mutex)) {
-			if (completion_pending)
+			if (completion_pending) {
 				kvm_exec_dispatch_publish(executor, &completion);
+				completion_pending = false;
+			}
 			mutex_lock(&domain->lock);
 			capsule->running = false;
 			mutex_unlock(&domain->lock);
@@ -1468,13 +1489,14 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 			run.run_result = -EINTR;
 			break;
 		}
+		kick_pending = atomic64_read(&executor->kick_epoch) !=
+			       seen_kick_epoch;
 		entry_allowed = !READ_ONCE(domain->stopping) &&
 				!READ_ONCE(domain->paused) &&
-				atomic64_read(&executor->kick_epoch) ==
-					seen_kick_epoch &&
+				!kick_pending &&
 				capsule->vcpu->exec_capsule == capsule &&
 				kvm_arch_vcpu_exec_domain_supported(capsule->vcpu);
-		if (completion_pending) {
+		if (completion_pending && !kick_pending) {
 			if (entry_allowed) {
 				completion.entry_attempt_ns = ktime_get_ns();
 				WRITE_ONCE(header->last_entry_sequence,
@@ -1483,6 +1505,7 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 					   completion.entry_attempt_ns);
 			}
 			kvm_exec_dispatch_publish(executor, &completion);
+			completion_pending = false;
 		}
 		if (!entry_allowed) {
 			run_ret = -EINTR;
