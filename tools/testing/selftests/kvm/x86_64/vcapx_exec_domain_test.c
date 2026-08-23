@@ -2168,7 +2168,7 @@ static void guest_sync_pio(void)
 		     :
 		     : "a" (value), "d" (SYNC_EXIT_PIO_PORT));
 	WRITE_ONCE(sync_exit_pio_progress, 2);
-	asm volatile("hlt");
+	asm volatile("int3");
 }
 
 static void guest_sync_mmio(void)
@@ -2179,7 +2179,7 @@ static void guest_sync_mmio(void)
 	WRITE_ONCE(sync_exit_mmio_progress, 1);
 	WRITE_ONCE(*(uint64_t *)(TRACE_MMIO_GPA + 8), ~value);
 	WRITE_ONCE(sync_exit_mmio_progress, 2);
-	asm volatile("hlt");
+	asm volatile("int3");
 }
 
 static struct kvm_exec_run_dispatch
@@ -2212,6 +2212,9 @@ static void test_dynamic_synchronous_exits(int kvm_fd)
 		.target_lifecycle_generation = 16,
 	};
 	struct kvm_exec_domain_control control = { .size = sizeof(control) };
+	struct kvm_guest_debug debug = {
+		.control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_SW_BP,
+	};
 	struct kvm_exec_trace_entry legacy_entry = {
 		.capsule_id = 61,
 		.lifecycle_generation = 16,
@@ -2249,6 +2252,8 @@ static void test_dynamic_synchronous_exits(int kvm_fd)
 	mmio_vm = vm_create_with_one_vcpu(&mmio_vcpu, guest_sync_mmio);
 	disable_nested_cpuid(pio_vcpu);
 	disable_nested_cpuid(mmio_vcpu);
+	vcpu_guest_debug_set(pio_vcpu, &debug);
+	vcpu_guest_debug_set(mmio_vcpu, &debug);
 	vcpu_regs_get(pio_vcpu, &saved_regs);
 	sigemptyset(&blocked_mask);
 	sigaddset(&blocked_mask, SIGUSR1);
@@ -2368,7 +2373,7 @@ static void test_dynamic_synchronous_exits(int kvm_fd)
 	completion = consume_dispatch_completion(&mapping);
 	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_EXIT_PENDING);
 	TEST_ASSERT_EQ(completion.owned_capsule_id, 61);
-	TEST_ASSERT_EQ(run.vcpu_exit_reason, KVM_EXIT_HLT);
+	TEST_ASSERT_EQ(run.vcpu_exit_reason, KVM_EXIT_DEBUG);
 	TEST_ASSERT_EQ(run.exit_sequence, 3);
 	TEST_ASSERT_EQ(run.exit_flags, 0);
 	TEST_ASSERT_EQ(READ_ONCE(*pio_progress), 2);
@@ -2417,7 +2422,7 @@ static void test_dynamic_synchronous_exits(int kvm_fd)
 	TEST_ASSERT_EQ(READ_ONCE(*mmio_progress), 1);
 	run = run_dispatch_once(executor_fd, domain_generation,
 				executor_generation);
-	TEST_ASSERT_EQ(run.vcpu_exit_reason, KVM_EXIT_HLT);
+	TEST_ASSERT_EQ(run.vcpu_exit_reason, KVM_EXIT_DEBUG);
 	TEST_ASSERT_EQ(run.exit_sequence, 3);
 	TEST_ASSERT_EQ(run.exit_flags, 0);
 	TEST_ASSERT_EQ(READ_ONCE(*mmio_progress), 2);
@@ -2452,6 +2457,9 @@ static void test_sync_domain_close_pending(int kvm_fd, bool close_on_write)
 		.lifecycle_generation = 36,
 	};
 	struct kvm_exec_domain_control control = { .size = sizeof(control) };
+	struct kvm_guest_debug debug = {
+		.control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_SW_BP,
+	};
 	struct kvm_exec_run_dispatch run;
 	struct kvm_exec_completion completion;
 	struct dispatch_mapping mapping;
@@ -2464,6 +2472,7 @@ static void test_sync_domain_close_pending(int kvm_fd, bool close_on_write)
 
 	vm = vm_create_with_one_vcpu(&vcpu, guest_sync_pio);
 	disable_nested_cpuid(vcpu);
+	vcpu_guest_debug_set(vcpu, &debug);
 	pio_value = addr_gva2hva(vm, (vm_vaddr_t)&sync_exit_pio_value);
 	pio_progress = addr_gva2hva(vm,
 				    (vm_vaddr_t)&sync_exit_pio_progress);
@@ -2514,7 +2523,7 @@ static void test_sync_domain_close_pending(int kvm_fd, bool close_on_write)
 		TEST_ASSERT_EQ(READ_ONCE(*pio_progress), 1);
 	}
 	vcpu_run(vcpu);
-	TEST_ASSERT_KVM_EXIT_REASON(vcpu, KVM_EXIT_HLT);
+	TEST_ASSERT_KVM_EXIT_REASON(vcpu, KVM_EXIT_DEBUG);
 	TEST_ASSERT_EQ(READ_ONCE(*pio_value), response);
 	TEST_ASSERT_EQ(READ_ONCE(*pio_progress), 2);
 	kvm_vm_free(vm);
