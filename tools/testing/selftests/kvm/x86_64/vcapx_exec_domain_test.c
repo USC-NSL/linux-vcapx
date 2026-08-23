@@ -97,6 +97,9 @@ static void test_cross_vm_feature_dependencies(int kvm_fd)
 	create.requested_features = KVM_EXEC_FEATURE_INTRA_VM_CHAIN |
 				    KVM_EXEC_FEATURE_CROSS_VM_CHAIN;
 	assert_ioctl_errno(kvm_fd, KVM_CREATE_EXEC_DOMAIN, &create, EINVAL);
+	create.requested_features = KVM_EXEC_FEATURE_BASE_OBJECTS |
+				    KVM_EXEC_FEATURE_SYNC_EXITS;
+	assert_ioctl_errno(kvm_fd, KVM_CREATE_EXEC_DOMAIN, &create, EINVAL);
 
 	create.requested_features = complete_features;
 	domain_fd = ioctl(kvm_fd, KVM_CREATE_EXEC_DOMAIN, &create);
@@ -117,6 +120,8 @@ static void test_dynamic_dispatch_uapi_layout(void)
 	TEST_ASSERT_EQ(KVM_EXEC_DISPATCH_COMMAND_OFFSET, 256);
 	TEST_ASSERT_EQ(KVM_EXEC_DISPATCH_COMPLETION_OFFSET, 4096);
 	TEST_ASSERT_EQ(KVM_EXEC_DISPATCH_MMAP_SIZE, 8192);
+	TEST_ASSERT_EQ(offsetof(struct kvm_exec_run_dispatch, exit_sequence), 88);
+	TEST_ASSERT_EQ(offsetof(struct kvm_exec_run_dispatch, exit_flags), 96);
 }
 
 static void test_dynamic_dispatch_mapping(int kvm_fd)
@@ -2143,6 +2148,378 @@ static void *dispatch_runner(void *opaque)
 	return NULL;
 }
 
+#define SYNC_EXIT_PIO_PORT 0xe8
+
+static uint64_t sync_exit_pio_value;
+static uint64_t sync_exit_pio_progress;
+static uint64_t sync_exit_mmio_value;
+static uint64_t sync_exit_mmio_progress;
+
+static void guest_sync_pio(void)
+{
+	uint32_t value;
+
+	asm volatile("inl %w1, %0"
+		     : "=a" (value)
+		     : "d" (SYNC_EXIT_PIO_PORT));
+	WRITE_ONCE(sync_exit_pio_value, value);
+	WRITE_ONCE(sync_exit_pio_progress, 1);
+	asm volatile("outl %0, %w1"
+		     :
+		     : "a" (value), "d" (SYNC_EXIT_PIO_PORT));
+	WRITE_ONCE(sync_exit_pio_progress, 2);
+	asm volatile("hlt");
+}
+
+static void guest_sync_mmio(void)
+{
+	uint64_t value = READ_ONCE(*(uint64_t *)TRACE_MMIO_GPA);
+
+	WRITE_ONCE(sync_exit_mmio_value, value);
+	WRITE_ONCE(sync_exit_mmio_progress, 1);
+	WRITE_ONCE(*(uint64_t *)(TRACE_MMIO_GPA + 8), ~value);
+	WRITE_ONCE(sync_exit_mmio_progress, 2);
+	asm volatile("hlt");
+}
+
+static struct kvm_exec_run_dispatch
+run_dispatch_once(int executor_fd, uint64_t domain_generation,
+		  uint64_t executor_generation)
+{
+	struct kvm_exec_run_dispatch run = {
+		.size = sizeof(run),
+		.flags = KVM_EXEC_DISPATCH_F_RETURN_IF_EMPTY,
+		.domain_generation = domain_generation,
+		.executor_generation = executor_generation,
+	};
+	int ret = ioctl(executor_fd, KVM_EXEC_RUN_DISPATCH, &run);
+
+	TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_EXEC_RUN_DISPATCH, ret));
+	return run;
+}
+
+static void test_dynamic_synchronous_exits(int kvm_fd)
+{
+	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
+				  KVM_EXEC_FEATURE_INTRA_VM_CHAIN |
+				  KVM_EXEC_FEATURE_CROSS_VM_CHAIN |
+				  KVM_EXEC_FEATURE_DYNAMIC_DISPATCH |
+				  KVM_EXEC_FEATURE_SYNC_EXITS;
+	struct kvm_exec_command command = {
+		.opcode = KVM_EXEC_CMD_SWITCH,
+		.request_sequence = 1,
+		.target_capsule_id = 61,
+		.target_lifecycle_generation = 16,
+	};
+	struct kvm_exec_domain_control control = { .size = sizeof(control) };
+	struct kvm_exec_trace_entry legacy_entry = {
+		.capsule_id = 61,
+		.lifecycle_generation = 16,
+	};
+	struct kvm_exec_run legacy_run = {
+		.size = sizeof(legacy_run),
+		.request_sequence = 1,
+		.target_capsule_id = 61,
+		.target_lifecycle_generation = 16,
+	};
+	struct kvm_exec_run_trace legacy_trace = {
+		.size = sizeof(legacy_trace),
+		.request_sequence = 1,
+		.entries = (uintptr_t)&legacy_entry,
+		.nr_entries = 1,
+		.repeat_count = 1,
+	};
+	struct kvm_exec_run_dispatch run;
+	struct kvm_exec_completion completion;
+	struct dispatch_mapping mapping;
+	struct kvm_signal_mask *kvm_sigmask;
+	struct kvm_regs saved_regs;
+	struct kvm_vcpu *pio_vcpu, *mmio_vcpu;
+	struct kvm_vm *pio_vm, *mmio_vm;
+	sigset_t blocked_mask, original_mask;
+	uint64_t *pio_value, *pio_progress, *mmio_value, *mmio_progress;
+	uint64_t domain_generation, executor_generation;
+	uint32_t pio_response = 0xa55ac33c;
+	uint64_t mmio_response = 0xfedcba9876543210ULL;
+	uint16_t saved_port;
+	uint32_t saved_mmio_len;
+	int domain_fd, executor_fd, received_signal;
+
+	pio_vm = vm_create_with_one_vcpu(&pio_vcpu, guest_sync_pio);
+	mmio_vm = vm_create_with_one_vcpu(&mmio_vcpu, guest_sync_mmio);
+	disable_nested_cpuid(pio_vcpu);
+	disable_nested_cpuid(mmio_vcpu);
+	vcpu_regs_get(pio_vcpu, &saved_regs);
+	sigemptyset(&blocked_mask);
+	sigaddset(&blocked_mask, SIGUSR1);
+	TEST_ASSERT(!pthread_sigmask(SIG_BLOCK, &blocked_mask, &original_mask),
+		    "blocking synchronous-exit signal failed");
+	kvm_sigmask = alloca(offsetof(struct kvm_signal_mask, sigset) +
+			     sizeof(sigset_t));
+	kvm_sigmask->len = 8;
+	TEST_ASSERT(!pthread_sigmask(0, NULL,
+				     (sigset_t *)kvm_sigmask->sigset),
+		    "reading synchronous-exit signal mask failed");
+	sigdelset((sigset_t *)kvm_sigmask->sigset, SIGUSR1);
+	vcpu_ioctl(pio_vcpu, KVM_SET_SIGNAL_MASK, kvm_sigmask);
+	virt_map(mmio_vm, TRACE_MMIO_GPA, TRACE_MMIO_GPA, 1);
+	pio_value = addr_gva2hva(pio_vm, (vm_vaddr_t)&sync_exit_pio_value);
+	pio_progress = addr_gva2hva(pio_vm,
+				    (vm_vaddr_t)&sync_exit_pio_progress);
+	mmio_value = addr_gva2hva(mmio_vm,
+				  (vm_vaddr_t)&sync_exit_mmio_value);
+	mmio_progress = addr_gva2hva(mmio_vm,
+				     (vm_vaddr_t)&sync_exit_mmio_progress);
+	WRITE_ONCE(*pio_progress, 0);
+	WRITE_ONCE(*mmio_progress, 0);
+
+	domain_fd = create_domain_with_features(kvm_fd, 2, 1, features,
+						&domain_generation);
+	attach_vcpu(domain_fd, pio_vcpu->fd, 61, 16);
+	attach_vcpu(domain_fd, mmio_vcpu->fd, 62, 26);
+	executor_fd = create_executor(domain_fd, 0x708, &executor_generation);
+	legacy_run.domain_generation = domain_generation;
+	legacy_run.executor_generation = executor_generation;
+	legacy_trace.domain_generation = domain_generation;
+	legacy_trace.executor_generation = executor_generation;
+	assert_ioctl_errno(executor_fd, KVM_EXEC_RUN, &legacy_run,
+			   EOPNOTSUPP);
+	assert_ioctl_errno(executor_fd, KVM_EXEC_RUN_TRACE, &legacy_trace,
+			   EOPNOTSUPP);
+	mapping = map_dispatch(executor_fd);
+	command.domain_generation = domain_generation;
+	command.executor_generation = executor_generation;
+	TEST_ASSERT(publish_dispatch_command(&mapping, command),
+		    "initial synchronous-exit command did not publish");
+
+	run = run_dispatch_once(executor_fd, domain_generation,
+				executor_generation);
+	completion = consume_dispatch_completion(&mapping);
+	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_APPLIED);
+	TEST_ASSERT_EQ(run.return_reason, KVM_EXEC_RETURN_VCPU_EXIT);
+	TEST_ASSERT_EQ(run.vcpu_exit_reason, KVM_EXIT_IO);
+	TEST_ASSERT_EQ(run.exit_sequence, 1);
+	TEST_ASSERT_EQ(run.exit_flags,
+		       KVM_EXEC_EXIT_F_COMPLETION_PENDING);
+	TEST_ASSERT_EQ(run.owned_capsule_id, 61);
+	TEST_ASSERT_EQ(READ_ONCE(*pio_progress), 0);
+
+	/* Immutable exit metadata must be restored before KVM will reenter. */
+	saved_port = pio_vcpu->run->io.port;
+	pio_vcpu->run->io.port++;
+	run = run_dispatch_once(executor_fd, domain_generation,
+				executor_generation);
+	TEST_ASSERT_EQ(run.return_reason,
+		       KVM_EXEC_RETURN_INVALID_COMPLETION);
+	TEST_ASSERT_EQ(run.run_result, -EINVAL);
+	TEST_ASSERT_EQ(run.exit_sequence, 1);
+	TEST_ASSERT_EQ(run.exit_flags,
+		       KVM_EXEC_EXIT_F_COMPLETION_PENDING);
+	TEST_ASSERT_EQ(READ_ONCE(*pio_progress), 0);
+	pio_vcpu->run->io.port = saved_port;
+
+	/* Pause cannot discard an instruction that still needs completion. */
+	control_domain(domain_fd, KVM_EXEC_PAUSE);
+	assert_ioctl_errno(domain_fd, KVM_EXEC_DRAIN, &control, EBUSY);
+	assert_ioctl_errno(pio_vcpu->fd, KVM_SET_REGS, &saved_regs, EBUSY);
+	control_domain(domain_fd, KVM_EXEC_RESUME);
+
+	memcpy((uint8_t *)pio_vcpu->run + pio_vcpu->run->io.data_offset,
+	       &pio_response, sizeof(pio_response));
+	TEST_ASSERT(!pthread_kill(pthread_self(), SIGUSR1),
+		    "queuing synchronous-exit signal failed");
+	run = run_dispatch_once(executor_fd, domain_generation,
+				executor_generation);
+	TEST_ASSERT_EQ(run.return_reason, KVM_EXEC_RETURN_SIGNAL);
+	TEST_ASSERT_EQ(run.run_result, -EINTR);
+	TEST_ASSERT_EQ(run.owned_capsule_id, 61);
+	TEST_ASSERT_EQ(run.exit_sequence, 1);
+	TEST_ASSERT_EQ(run.exit_flags, 0);
+	TEST_ASSERT_EQ(READ_ONCE(*pio_progress), 0);
+	TEST_ASSERT(!sigwait(&blocked_mask, &received_signal),
+		    "consuming synchronous-exit signal failed");
+	TEST_ASSERT_EQ(received_signal, SIGUSR1);
+
+	run = run_dispatch_once(executor_fd, domain_generation,
+				executor_generation);
+	TEST_ASSERT_EQ(run.vcpu_exit_reason, KVM_EXIT_IO);
+	TEST_ASSERT_EQ(run.exit_sequence, 2);
+	TEST_ASSERT_EQ(run.exit_flags,
+		       KVM_EXEC_EXIT_F_COMPLETION_PENDING);
+	TEST_ASSERT_EQ(READ_ONCE(*pio_value), pio_response);
+	TEST_ASSERT_EQ(READ_ONCE(*pio_progress), 1);
+	control_domain(domain_fd, KVM_EXEC_PAUSE);
+	assert_ioctl_errno(domain_fd, KVM_EXEC_DRAIN, &control, EBUSY);
+	control_domain(domain_fd, KVM_EXEC_RESUME);
+
+	/* A command may arrive, but ownership cannot change before reentry. */
+	command = (struct kvm_exec_command) {
+		.opcode = KVM_EXEC_CMD_RELEASE,
+		.request_sequence = 2,
+		.domain_generation = domain_generation,
+		.executor_generation = executor_generation,
+		.expected_current_id = 61,
+		.expected_current_generation = 16,
+	};
+	TEST_ASSERT(publish_dispatch_command(&mapping, command),
+		    "pending-exit release did not publish");
+	run = run_dispatch_once(executor_fd, domain_generation,
+				executor_generation);
+	completion = consume_dispatch_completion(&mapping);
+	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_EXIT_PENDING);
+	TEST_ASSERT_EQ(completion.owned_capsule_id, 61);
+	TEST_ASSERT_EQ(run.vcpu_exit_reason, KVM_EXIT_HLT);
+	TEST_ASSERT_EQ(run.exit_sequence, 3);
+	TEST_ASSERT_EQ(run.exit_flags, 0);
+	TEST_ASSERT_EQ(READ_ONCE(*pio_progress), 2);
+
+	command = (struct kvm_exec_command) {
+		.opcode = KVM_EXEC_CMD_SWITCH,
+		.request_sequence = 3,
+		.domain_generation = domain_generation,
+		.executor_generation = executor_generation,
+		.expected_current_id = 61,
+		.expected_current_generation = 16,
+		.target_capsule_id = 62,
+		.target_lifecycle_generation = 26,
+	};
+	TEST_ASSERT(publish_dispatch_command(&mapping, command),
+		    "MMIO capsule command did not publish");
+	run = run_dispatch_once(executor_fd, domain_generation,
+				executor_generation);
+	completion = consume_dispatch_completion(&mapping);
+	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_APPLIED);
+	TEST_ASSERT_EQ(run.vcpu_exit_reason, KVM_EXIT_MMIO);
+	TEST_ASSERT_EQ(run.owned_capsule_id, 62);
+	TEST_ASSERT_EQ(run.exit_sequence, 1);
+	TEST_ASSERT_EQ(run.exit_flags,
+		       KVM_EXEC_EXIT_F_COMPLETION_PENDING);
+
+	saved_mmio_len = mmio_vcpu->run->mmio.len;
+	mmio_vcpu->run->mmio.len = 0;
+	run = run_dispatch_once(executor_fd, domain_generation,
+				executor_generation);
+	TEST_ASSERT_EQ(run.return_reason,
+		       KVM_EXEC_RETURN_INVALID_COMPLETION);
+	TEST_ASSERT_EQ(run.exit_sequence, 1);
+	TEST_ASSERT_EQ(READ_ONCE(*mmio_progress), 0);
+	mmio_vcpu->run->mmio.len = saved_mmio_len;
+	memcpy(mmio_vcpu->run->mmio.data, &mmio_response,
+	       sizeof(mmio_response));
+
+	run = run_dispatch_once(executor_fd, domain_generation,
+				executor_generation);
+	TEST_ASSERT_EQ(run.vcpu_exit_reason, KVM_EXIT_MMIO);
+	TEST_ASSERT_EQ(run.exit_sequence, 2);
+	TEST_ASSERT_EQ(run.exit_flags,
+		       KVM_EXEC_EXIT_F_COMPLETION_PENDING);
+	TEST_ASSERT_EQ(READ_ONCE(*mmio_value), mmio_response);
+	TEST_ASSERT_EQ(READ_ONCE(*mmio_progress), 1);
+	run = run_dispatch_once(executor_fd, domain_generation,
+				executor_generation);
+	TEST_ASSERT_EQ(run.vcpu_exit_reason, KVM_EXIT_HLT);
+	TEST_ASSERT_EQ(run.exit_sequence, 3);
+	TEST_ASSERT_EQ(run.exit_flags, 0);
+	TEST_ASSERT_EQ(READ_ONCE(*mmio_progress), 2);
+
+	control_domain(domain_fd, KVM_EXEC_PAUSE);
+	control_domain(domain_fd, KVM_EXEC_DRAIN);
+	detach_vcpu(domain_fd, 61, 16);
+	detach_vcpu(domain_fd, 62, 26);
+	munmap(mapping.header, KVM_EXEC_DISPATCH_MMAP_SIZE);
+	close(executor_fd);
+	close(domain_fd);
+	kvm_vm_free(mmio_vm);
+	kvm_vm_free(pio_vm);
+	TEST_ASSERT(!pthread_sigmask(SIG_SETMASK, &original_mask, NULL),
+		    "restoring synchronous-exit signal mask failed");
+}
+
+static void test_sync_domain_close_pending(int kvm_fd, bool close_on_write)
+{
+	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
+				  KVM_EXEC_FEATURE_DYNAMIC_DISPATCH |
+				  KVM_EXEC_FEATURE_SYNC_EXITS;
+	struct kvm_exec_command command = {
+		.opcode = KVM_EXEC_CMD_SWITCH,
+		.request_sequence = 1,
+		.target_capsule_id = 63,
+		.target_lifecycle_generation = 36,
+	};
+	struct kvm_exec_detach_vcpu detach = {
+		.size = sizeof(detach),
+		.capsule_id = 63,
+		.lifecycle_generation = 36,
+	};
+	struct kvm_exec_domain_control control = { .size = sizeof(control) };
+	struct kvm_exec_run_dispatch run;
+	struct kvm_exec_completion completion;
+	struct dispatch_mapping mapping;
+	struct kvm_vcpu *vcpu;
+	struct kvm_vm *vm;
+	uint64_t *pio_value, *pio_progress;
+	uint64_t domain_generation, executor_generation;
+	uint32_t response = 0x13579bdf;
+	int domain_fd, executor_fd;
+
+	vm = vm_create_with_one_vcpu(&vcpu, guest_sync_pio);
+	disable_nested_cpuid(vcpu);
+	pio_value = addr_gva2hva(vm, (vm_vaddr_t)&sync_exit_pio_value);
+	pio_progress = addr_gva2hva(vm,
+				    (vm_vaddr_t)&sync_exit_pio_progress);
+	WRITE_ONCE(*pio_progress, 0);
+	domain_fd = create_domain_with_features(kvm_fd, 1, 1, features,
+						&domain_generation);
+	attach_vcpu(domain_fd, vcpu->fd, 63, 36);
+	executor_fd = create_executor(domain_fd, 0x808,
+				      &executor_generation);
+	mapping = map_dispatch(executor_fd);
+	command.domain_generation = domain_generation;
+	command.executor_generation = executor_generation;
+	TEST_ASSERT(publish_dispatch_command(&mapping, command),
+		    "close-pending command did not publish");
+	run = run_dispatch_once(executor_fd, domain_generation,
+				executor_generation);
+	completion = consume_dispatch_completion(&mapping);
+	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_APPLIED);
+	TEST_ASSERT_EQ(run.vcpu_exit_reason, KVM_EXIT_IO);
+	TEST_ASSERT_EQ(run.exit_sequence, 1);
+	TEST_ASSERT_EQ(run.exit_flags,
+		       KVM_EXEC_EXIT_F_COMPLETION_PENDING);
+
+	if (close_on_write) {
+		memcpy((uint8_t *)vcpu->run + vcpu->run->io.data_offset,
+		       &response, sizeof(response));
+		run = run_dispatch_once(executor_fd, domain_generation,
+					executor_generation);
+		TEST_ASSERT_EQ(run.vcpu_exit_reason, KVM_EXIT_IO);
+		TEST_ASSERT_EQ(run.exit_sequence, 2);
+		TEST_ASSERT_EQ(run.exit_flags,
+			       KVM_EXEC_EXIT_F_COMPLETION_PENDING);
+		TEST_ASSERT_EQ(READ_ONCE(*pio_progress), 1);
+	}
+
+	munmap(mapping.header, KVM_EXEC_DISPATCH_MMAP_SIZE);
+	close(executor_fd);
+	control_domain(domain_fd, KVM_EXEC_PAUSE);
+	assert_ioctl_errno(domain_fd, KVM_EXEC_DRAIN, &control, EBUSY);
+	assert_ioctl_errno(domain_fd, KVM_EXEC_DETACH_VCPU, &detach, EBUSY);
+	close(domain_fd);
+
+	if (!close_on_write) {
+		memcpy((uint8_t *)vcpu->run + vcpu->run->io.data_offset,
+		       &response, sizeof(response));
+		vcpu_run(vcpu);
+		TEST_ASSERT_KVM_EXIT_REASON(vcpu, KVM_EXIT_IO);
+		TEST_ASSERT_EQ(READ_ONCE(*pio_progress), 1);
+	}
+	vcpu_run(vcpu);
+	TEST_ASSERT_KVM_EXIT_REASON(vcpu, KVM_EXIT_HLT);
+	TEST_ASSERT_EQ(READ_ONCE(*pio_value), response);
+	TEST_ASSERT_EQ(READ_ONCE(*pio_progress), 2);
+	kvm_vm_free(vm);
+}
+
 static void test_dynamic_kick_and_cancel(int kvm_fd)
 {
 	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
@@ -3183,11 +3560,13 @@ int main(int argc, char **argv)
 	TEST_REQUIRE((capability & (KVM_EXEC_FEATURE_BASE_OBJECTS |
 				    KVM_EXEC_FEATURE_INTRA_VM_CHAIN |
 				    KVM_EXEC_FEATURE_CROSS_VM_CHAIN |
-				    KVM_EXEC_FEATURE_DYNAMIC_DISPATCH)) ==
+				    KVM_EXEC_FEATURE_DYNAMIC_DISPATCH |
+				    KVM_EXEC_FEATURE_SYNC_EXITS)) ==
 		     (KVM_EXEC_FEATURE_BASE_OBJECTS |
 		      KVM_EXEC_FEATURE_INTRA_VM_CHAIN |
 		      KVM_EXEC_FEATURE_CROSS_VM_CHAIN |
-		      KVM_EXEC_FEATURE_DYNAMIC_DISPATCH));
+		      KVM_EXEC_FEATURE_DYNAMIC_DISPATCH |
+		      KVM_EXEC_FEATURE_SYNC_EXITS));
 	if (argc == 2 && !strcmp(argv[1], "--dynamic-kick-cancel-only")) {
 		test_dynamic_kick_and_cancel(kvm_fd);
 		close(kvm_fd);
@@ -3225,6 +3604,9 @@ int main(int argc, char **argv)
 	test_halted_trace_pause_and_drain(kvm_fd);
 	test_dynamic_kick_and_cancel(kvm_fd);
 	test_dynamic_ring_backpressure_and_corruption(kvm_fd);
+	test_dynamic_synchronous_exits(kvm_fd);
+	test_sync_domain_close_pending(kvm_fd, false);
+	test_sync_domain_close_pending(kvm_fd, true);
 	test_dynamic_cross_vm_seeded_trace(kvm_fd);
 	test_dynamic_two_executor_migration(kvm_fd);
 	close(kvm_fd);
