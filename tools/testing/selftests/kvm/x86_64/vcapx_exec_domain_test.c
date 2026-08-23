@@ -12,6 +12,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "apic.h"
@@ -2072,17 +2073,31 @@ static struct kvm_exec_completion
 consume_dispatch_completion(struct dispatch_mapping *mapping)
 {
 	struct kvm_exec_completion completion;
+	struct timespec now, deadline;
 	uint64_t head;
-	int i;
 
-	for (i = 0; i < 1000000; i++) {
+	TEST_ASSERT(!clock_gettime(CLOCK_MONOTONIC, &now),
+		    "clock_gettime failed, errno: %d", errno);
+	deadline = timespec_add_ns(now, 10ULL * NSEC_PER_SEC);
+	for (;;) {
 		head = mapping->header->completion_head;
 		if (__atomic_load_n(&mapping->header->completion_tail,
 				    __ATOMIC_ACQUIRE) != head)
 			break;
+		TEST_ASSERT(!clock_gettime(CLOCK_MONOTONIC, &now),
+			    "clock_gettime failed, errno: %d", errno);
+		TEST_ASSERT(timespec_to_ns(timespec_sub(deadline, now)) > 0,
+			    "timed out waiting for dispatch completion: command=%llu/%llu completion=%llu/%llu kick=%llu consumed=%llu applied=%llu entry=%llu",
+			    (unsigned long long)mapping->header->command_head,
+			    (unsigned long long)mapping->header->command_tail,
+			    (unsigned long long)head,
+			    (unsigned long long)mapping->header->completion_tail,
+			    (unsigned long long)mapping->header->last_kick_sequence,
+			    (unsigned long long)mapping->header->last_consumed_sequence,
+			    (unsigned long long)mapping->header->last_applied_sequence,
+			    (unsigned long long)mapping->header->last_entry_sequence);
 		sched_yield();
 	}
-	TEST_ASSERT(i < 1000000, "timed out waiting for dispatch completion");
 	completion = mapping->completions[head % KVM_EXEC_DISPATCH_RING_ENTRIES];
 	__atomic_store_n(&mapping->header->completion_head, head + 1,
 			 __ATOMIC_RELEASE);
@@ -3173,6 +3188,11 @@ int main(int argc, char **argv)
 		      KVM_EXEC_FEATURE_INTRA_VM_CHAIN |
 		      KVM_EXEC_FEATURE_CROSS_VM_CHAIN |
 		      KVM_EXEC_FEATURE_DYNAMIC_DISPATCH));
+	if (argc == 2 && !strcmp(argv[1], "--dynamic-kick-cancel-only")) {
+		test_dynamic_kick_and_cancel(kvm_fd);
+		close(kvm_fd);
+		return 0;
+	}
 
 	test_cross_vm_feature_dependencies(kvm_fd);
 	test_dynamic_dispatch_uapi_layout();

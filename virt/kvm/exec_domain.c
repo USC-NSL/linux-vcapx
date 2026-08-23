@@ -1470,6 +1470,8 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 		}
 		entry_allowed = !READ_ONCE(domain->stopping) &&
 				!READ_ONCE(domain->paused) &&
+				atomic64_read(&executor->kick_epoch) ==
+					seen_kick_epoch &&
 				capsule->vcpu->exec_capsule == capsule &&
 				kvm_arch_vcpu_exec_domain_supported(capsule->vcpu);
 		if (completion_pending) {
