@@ -883,6 +883,7 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_FEATURE_BASE_OBJECTS	(1ULL << 0)
 #define KVM_EXEC_FEATURE_INTRA_VM_CHAIN	(1ULL << 1)
 #define KVM_EXEC_FEATURE_CROSS_VM_CHAIN	(1ULL << 2)
+#define KVM_EXEC_FEATURE_DYNAMIC_DISPATCH (1ULL << 3)
 #define KVM_EXEC_CPU_ANY		((__u32)-1)
 
 #define KVM_EXEC_TRACE_MAX_ENTRIES	256U
@@ -897,6 +898,35 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_RETURN_CPU_MIGRATED	5
 #define KVM_EXEC_RETURN_TRACE_COMPLETE	6
 #define KVM_EXEC_RETURN_TRACE_TARGET_BUSY 7
+#define KVM_EXEC_RETURN_DISPATCH_EMPTY	8
+#define KVM_EXEC_RETURN_COMPLETION_FULL	9
+#define KVM_EXEC_RETURN_DISPATCH_CORRUPT	10
+
+#define KVM_EXEC_DISPATCH_ABI_VERSION	1U
+#define KVM_EXEC_DISPATCH_RING_ENTRIES	32U
+#define KVM_EXEC_DISPATCH_COMMAND_OFFSET	256U
+#define KVM_EXEC_DISPATCH_COMPLETION_OFFSET 4096U
+#define KVM_EXEC_DISPATCH_MMAP_SIZE	8192U
+
+#define KVM_EXEC_DISPATCH_F_RETURN_IF_EMPTY (1U << 0)
+
+#define KVM_EXEC_CMD_SWITCH		1U
+#define KVM_EXEC_CMD_RELEASE		2U
+
+#define KVM_EXEC_COMPLETE_APPLIED	1U
+#define KVM_EXEC_COMPLETE_RETURNED	2U
+#define KVM_EXEC_COMPLETE_CANCELLED_BEFORE_APPLY 3U
+#define KVM_EXEC_COMPLETE_CURRENT_MISMATCH 4U
+#define KVM_EXEC_COMPLETE_TARGET_STALE	5U
+#define KVM_EXEC_COMPLETE_TARGET_UNKNOWN	6U
+#define KVM_EXEC_COMPLETE_TARGET_BUSY	7U
+#define KVM_EXEC_COMPLETE_CROSS_VM_DISABLED 8U
+#define KVM_EXEC_COMPLETE_REJECTED	9U
+
+#define KVM_EXEC_CANCEL_ACCEPTED		1U
+#define KVM_EXEC_CANCEL_APPLIED		2U
+#define KVM_EXEC_CANCEL_ALREADY_CANCELLED 3U
+#define KVM_EXEC_CANCEL_STALE		4U
 
 struct kvm_exec_domain_create {
 	__u32 size;
@@ -993,6 +1023,108 @@ struct kvm_exec_run_trace {
 };
 
 /*
+ * Userspace is the sole command producer and completion consumer.  KVM is the
+ * sole command consumer and completion producer.  Producers fill an entry and
+ * release-store the corresponding tail; consumers acquire-load the tail before
+ * reading the entry and release-store the head after consuming it.
+ */
+struct kvm_exec_dispatch_header {
+	__u32 abi_version;
+	__u32 region_size;
+	__u32 command_offset;
+	__u32 completion_offset;
+	__u32 command_entries;
+	__u32 completion_entries;
+	__u32 command_entry_size;
+	__u32 completion_entry_size;
+	__u64 command_head;
+	__u64 command_tail;
+	__u64 completion_head;
+	__u64 completion_tail;
+	__u64 kernel_corruption_count;
+	__u64 kernel_kick_count;
+	__u64 last_kick_sequence;
+	__u64 last_kick_ns;
+	__u64 last_consumed_sequence;
+	__u64 last_applied_sequence;
+	__u64 last_entry_sequence;
+	__u64 last_entry_ns;
+	__u64 reserved[16];
+};
+
+struct kvm_exec_command {
+	__u32 size;
+	__u16 opcode;
+	__u16 flags;
+	__u64 request_sequence;
+	__u64 domain_generation;
+	__u64 executor_generation;
+	__u64 expected_current_id;
+	__u64 expected_current_generation;
+	__u64 target_capsule_id;
+	__u64 target_lifecycle_generation;
+	__u64 reserved0;
+	__u64 user_cookie;
+	__u64 reserved[2];
+};
+
+struct kvm_exec_completion {
+	__u32 size;
+	__u16 status;
+	__u16 flags;
+	__u64 request_sequence;
+	__u64 domain_generation;
+	__u64 executor_generation;
+	__u64 user_cookie;
+	__u64 previous_capsule_id;
+	__u64 previous_lifecycle_generation;
+	__u64 owned_capsule_id;
+	__u64 owned_lifecycle_generation;
+	__u64 consumed_ns;
+	__u64 applied_ns;
+	__u64 entry_attempt_ns;
+	__u64 reserved[2];
+};
+
+struct kvm_exec_run_dispatch {
+	__u32 size;
+	__u32 flags;
+	__u64 domain_generation;
+	__u64 executor_generation;
+	__u64 user_cookie;
+	__u32 return_reason;
+	__s32 run_result;
+	__u32 vcpu_exit_reason;
+	__u32 current_cpu;
+	__u64 owned_capsule_id;
+	__u64 owned_lifecycle_generation;
+	__u64 command_head;
+	__u64 completion_tail;
+	__u64 corruption_count;
+	__u64 reserved[2];
+};
+
+struct kvm_exec_kick {
+	__u32 size;
+	__u32 flags;
+	__u64 domain_generation;
+	__u64 executor_generation;
+	__u64 request_sequence;
+	__u64 reserved[2];
+};
+
+struct kvm_exec_cancel {
+	__u32 size;
+	__u32 flags;
+	__u64 domain_generation;
+	__u64 executor_generation;
+	__u64 request_sequence;
+	__u32 status;
+	__u32 reserved0;
+	__u64 reserved[2];
+};
+
+/*
  * ioctls for /dev/kvm fds:
  */
 #define KVM_GET_API_VERSION       _IO(KVMIO,   0x00)
@@ -1031,6 +1163,10 @@ struct kvm_exec_run_trace {
 #define KVM_EXEC_RUN              _IOWR(KVMIO, 0xf6, struct kvm_exec_run)
 #define KVM_EXEC_RUN_TRACE        _IOWR(KVMIO, 0xf7, \
 				       struct kvm_exec_run_trace)
+#define KVM_EXEC_RUN_DISPATCH     _IOWR(KVMIO, 0xf8, \
+				       struct kvm_exec_run_dispatch)
+#define KVM_EXEC_KICK             _IOW(KVMIO,  0xf9, struct kvm_exec_kick)
+#define KVM_EXEC_CANCEL           _IOWR(KVMIO, 0xfa, struct kvm_exec_cancel)
 
 /*
  * Extension capability list.
