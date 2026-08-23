@@ -2328,12 +2328,12 @@ static void guest_async_pio_write(void)
 	asm volatile("outw %%ax, %%dx" : : "a"(value),
 		     "d"((uint16_t)ASYNC_PIO_TEST_PORT));
 	WRITE_ONCE(async_pio_progress, 1);
-	asm volatile("hlt");
+	asm volatile("ud2");
 }
 
 static void guest_async_recipient(void)
 {
-	asm volatile("hlt");
+	asm volatile("ud2");
 }
 
 static void guest_async_pio_ring_full(void)
@@ -2346,7 +2346,7 @@ static void guest_async_pio_ring_full(void)
 			     "d"((uint16_t)ASYNC_PIO_TEST_PORT));
 		WRITE_ONCE(async_pio_ring_progress, i + 1);
 	}
-	asm volatile("hlt");
+	asm volatile("ud2");
 }
 
 struct pause_after_progress_arg {
@@ -2831,7 +2831,7 @@ static void test_async_pio_write_switch(int kvm_fd)
 		    "asynchronous runner failed, ret %d errno %d",
 		    run_arg.ret, run_arg.error);
 	TEST_ASSERT_EQ(run_arg.run.return_reason, KVM_EXEC_RETURN_VCPU_EXIT);
-	TEST_ASSERT_EQ(run_arg.run.vcpu_exit_reason, KVM_EXIT_HLT);
+	TEST_ASSERT_EQ(run_arg.run.vcpu_exit_reason, KVM_EXIT_SHUTDOWN);
 	TEST_ASSERT_EQ(mapping.header->executor_return_count, 1);
 	TEST_ASSERT_EQ(READ_ONCE(*progress), 0);
 
@@ -2861,7 +2861,7 @@ static void test_async_pio_write_switch(int kvm_fd)
 	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_APPLIED);
 	TEST_ASSERT_EQ(completion.executor_return_count, 2);
 	TEST_ASSERT_EQ(run.return_reason, KVM_EXEC_RETURN_VCPU_EXIT);
-	TEST_ASSERT_EQ(run.vcpu_exit_reason, KVM_EXIT_HLT);
+	TEST_ASSERT_EQ(run.vcpu_exit_reason, KVM_EXIT_SHUTDOWN);
 	TEST_ASSERT_EQ(READ_ONCE(*progress), 1);
 
 	control_domain(domain_fd, KVM_EXEC_PAUSE);
@@ -2990,7 +2990,7 @@ static void test_async_pio_ring_full_fallback(int kvm_fd)
 	completion = consume_dispatch_completion(&mapping);
 	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_APPLIED);
 	TEST_ASSERT_EQ(run.return_reason, KVM_EXEC_RETURN_VCPU_EXIT);
-	TEST_ASSERT_EQ(run.vcpu_exit_reason, KVM_EXIT_HLT);
+	TEST_ASSERT_EQ(run.vcpu_exit_reason, KVM_EXIT_SHUTDOWN);
 	TEST_ASSERT_EQ(READ_ONCE(*progress),
 		       KVM_EXEC_DISPATCH_RING_ENTRIES + 1);
 
@@ -3088,7 +3088,7 @@ static void test_async_pio_pause_outstanding(int kvm_fd)
 	completion = consume_dispatch_completion(&mapping);
 	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_APPLIED);
 	TEST_ASSERT_EQ(run.return_reason, KVM_EXEC_RETURN_VCPU_EXIT);
-	TEST_ASSERT_EQ(run.vcpu_exit_reason, KVM_EXIT_HLT);
+	TEST_ASSERT_EQ(run.vcpu_exit_reason, KVM_EXIT_SHUTDOWN);
 	TEST_ASSERT_EQ(READ_ONCE(*progress), 1);
 	TEST_ASSERT_EQ(mapping.header->async_exit_request_count, 1);
 	TEST_ASSERT_EQ(mapping.header->async_exit_completion_count, 1);
