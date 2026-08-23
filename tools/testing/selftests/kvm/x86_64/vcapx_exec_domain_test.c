@@ -3581,6 +3581,13 @@ int main(int argc, char **argv)
 		close(kvm_fd);
 		return 0;
 	}
+	if (argc == 2 && !strcmp(argv[1], "--sync-exits-only")) {
+		test_dynamic_synchronous_exits(kvm_fd);
+		test_sync_domain_close_pending(kvm_fd, false);
+		test_sync_domain_close_pending(kvm_fd, true);
+		close(kvm_fd);
+		return 0;
+	}
 
 	test_cross_vm_feature_dependencies(kvm_fd);
 	test_dynamic_dispatch_uapi_layout();
