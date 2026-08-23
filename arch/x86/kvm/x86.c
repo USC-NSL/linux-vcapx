@@ -11333,6 +11333,16 @@ bool kvm_arch_vcpu_exec_completion_pending(struct kvm_vcpu *vcpu)
 	return vcpu->arch.complete_userspace_io;
 }
 
+bool kvm_arch_vcpu_exec_copy_pio_data(struct kvm_vcpu *vcpu, void *data,
+				      size_t len)
+{
+	if (len > PAGE_SIZE)
+		return false;
+
+	memcpy(data, vcpu->arch.pio_data, len);
+	return true;
+}
+
 int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
 {
 	struct kvm_queued_exception *ex = &vcpu->arch.exception;

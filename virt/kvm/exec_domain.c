@@ -29,6 +29,7 @@ struct kvm_exec_exit_state {
 	u32 reason;
 	u8 direction;
 	u8 data[8];
+	bool payload_valid;
 	bool completion_pending;
 	bool async_request_pending;
 	bool async_completion_ready;
@@ -142,6 +143,12 @@ bool __weak kvm_arch_vcpu_exec_domain_supported(struct kvm_vcpu *vcpu)
 }
 
 bool __weak kvm_arch_vcpu_exec_completion_pending(struct kvm_vcpu *vcpu)
+{
+	return false;
+}
+
+bool __weak kvm_arch_vcpu_exec_copy_pio_data(struct kvm_vcpu *vcpu,
+					     void *data, size_t len)
 {
 	return false;
 }
@@ -1167,8 +1174,9 @@ static void kvm_exec_snapshot_exit(struct kvm_vcpu *vcpu,
 		    run->io.data_offset >= PAGE_SIZE &&
 		    run->io.data_offset < 2 * PAGE_SIZE &&
 		    bytes <= 2 * PAGE_SIZE - run->io.data_offset)
-			memcpy(exit->data, (void *)run + run->io.data_offset,
-			       bytes);
+			exit->payload_valid =
+				kvm_arch_vcpu_exec_copy_pio_data(vcpu,
+								 exit->data, bytes);
 	} else if (run->exit_reason == KVM_EXIT_MMIO) {
 		exit->address = run->mmio.phys_addr;
 		exit->len = run->mmio.len;
@@ -1196,7 +1204,8 @@ static bool kvm_exec_async_pio_write(struct kvm_exec_domain *domain,
 	       exit->reason == KVM_EXIT_IO &&
 	       exit->direction == KVM_EXIT_IO_OUT && exit->count == 1 &&
 	       (exit->len == 1 || exit->len == 2 || exit->len == 4) &&
-	       exit->completion_pending && exit->data_offset >= PAGE_SIZE &&
+	       exit->completion_pending && exit->payload_valid &&
+	       exit->data_offset >= PAGE_SIZE &&
 	       exit->data_offset < 2 * PAGE_SIZE &&
 	       exit->len <= 2 * PAGE_SIZE - exit->data_offset;
 }

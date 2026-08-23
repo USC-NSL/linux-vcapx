@@ -1482,6 +1482,8 @@ int kvm_arch_vcpu_ioctl_set_guest_debug(struct kvm_vcpu *vcpu,
 int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu);
 bool kvm_arch_vcpu_exec_domain_supported(struct kvm_vcpu *vcpu);
 bool kvm_arch_vcpu_exec_completion_pending(struct kvm_vcpu *vcpu);
+bool kvm_arch_vcpu_exec_copy_pio_data(struct kvm_vcpu *vcpu, void *data,
+				      size_t len);
 u64 kvm_exec_supported_features(void);
 
 int kvm_dev_ioctl_create_exec_domain(void __user *argp);
