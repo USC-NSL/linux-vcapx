@@ -186,12 +186,16 @@ bool kvm_exec_domain_vcpu_ioctl_allowed(struct kvm_vcpu *vcpu,
 {
 	struct kvm_exec_capsule *capsule = vcpu->exec_capsule;
 
-	if (!capsule || READ_ONCE(capsule->running))
+	if (!capsule)
+		return false;
+	/* kvm_vcpu_ioctl() already serializes KVM_INTERRUPT with vCPU entry. */
+	if (ioctl == KVM_INTERRUPT)
+		return true;
+	if (READ_ONCE(capsule->running))
 		return false;
 
-	return ioctl == KVM_INTERRUPT ||
-	       (READ_ONCE(capsule->domain->paused) &&
-		!READ_ONCE(capsule->exit.completion_pending));
+	return READ_ONCE(capsule->domain->paused) &&
+	       !READ_ONCE(capsule->exit.completion_pending);
 }
 
 static bool kvm_exec_has_pending_exit_locked(struct kvm_exec_domain *domain)
