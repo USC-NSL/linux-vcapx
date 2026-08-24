@@ -313,8 +313,12 @@ static void kvm_exec_release_ownership_locked(struct kvm_exec_domain *domain)
 	list_for_each_entry(executor, &domain->executors, node)
 		executor->current_capsule = NULL;
 	xa_for_each(&domain->capsules, index, capsule) {
-		if (!capsule->running)
+		if (!capsule->running) {
 			capsule->owner = NULL;
+			atomic_cmpxchg(&capsule->block_reason,
+				       KVM_EXEC_BLOCK_VMM_EXIT,
+				       KVM_EXEC_BLOCK_NONE);
+		}
 	}
 }
 
@@ -2488,12 +2492,16 @@ static long kvm_exec_query_executor(struct kvm_exec_executor *executor,
 	query.current_capsule_id = 0;
 	query.current_lifecycle_generation = 0;
 	capsule = executor->current_capsule;
-	if (domain->stopping) {
-		query.state = KVM_EXEC_EXECUTOR_STATE_STOPPING;
-	} else if (capsule) {
+	if (capsule) {
 		query.current_capsule_id = capsule->capsule_id;
 		query.current_lifecycle_generation =
 			capsule->lifecycle_generation;
+	}
+	if (domain->stopping) {
+		query.state = KVM_EXEC_EXECUTOR_STATE_STOPPING;
+	} else if (domain->paused) {
+		query.state = KVM_EXEC_EXECUTOR_STATE_PAUSED;
+	} else if (capsule) {
 		block_reason = atomic_read(&capsule->block_reason);
 		if (capsule->exit.completion_pending)
 			query.state =

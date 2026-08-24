@@ -4372,6 +4372,96 @@ static void test_malformed_and_stale_requests(int kvm_fd)
 	close(vm_fd);
 }
 
+static void test_lifecycle_query_validation(int kvm_fd)
+{
+	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
+				  KVM_EXEC_FEATURE_DYNAMIC_DISPATCH |
+				  KVM_EXEC_FEATURE_SYNC_EXITS |
+				  KVM_EXEC_FEATURE_LIFECYCLE_STATE;
+	struct kvm_exec_query_capsule capsule = {
+		.size = sizeof(capsule),
+		.capsule_id = 19,
+		.lifecycle_generation = 23,
+	};
+	struct kvm_exec_query_executor executor = {
+		.size = sizeof(executor),
+	};
+	uint64_t domain_generation, executor_generation;
+	int domain_fd, executor_fd, vm_fd, vcpu_fd, ret;
+
+	create_raw_vm_vcpu(kvm_fd, &vm_fd, &vcpu_fd);
+	domain_fd = create_domain_with_features(kvm_fd, 1, 1, features,
+						&domain_generation);
+	attach_vcpu(domain_fd, vcpu_fd, 19, 23);
+	executor_fd = create_executor(domain_fd, 0x1917,
+				      &executor_generation);
+	capsule.domain_generation = domain_generation;
+	executor.domain_generation = domain_generation;
+	executor.executor_generation = executor_generation;
+
+	ret = ioctl(domain_fd, KVM_EXEC_QUERY_CAPSULE, &capsule);
+	TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_EXEC_QUERY_CAPSULE, ret));
+	TEST_ASSERT_EQ(capsule.state, KVM_EXEC_CAPSULE_STATE_READY);
+	ret = ioctl(executor_fd, KVM_EXEC_QUERY_EXECUTOR, &executor);
+	TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_EXEC_QUERY_EXECUTOR, ret));
+	TEST_ASSERT_EQ(executor.state, KVM_EXEC_EXECUTOR_STATE_IDLE);
+
+	capsule.size--;
+	assert_ioctl_errno(domain_fd, KVM_EXEC_QUERY_CAPSULE, &capsule,
+			   EINVAL);
+	capsule.size++;
+	capsule.flags = 1;
+	assert_ioctl_errno(domain_fd, KVM_EXEC_QUERY_CAPSULE, &capsule,
+			   EINVAL);
+	capsule.flags = 0;
+	capsule.domain_generation++;
+	assert_ioctl_errno(domain_fd, KVM_EXEC_QUERY_CAPSULE, &capsule,
+			   ESTALE);
+	capsule.domain_generation--;
+	capsule.lifecycle_generation++;
+	assert_ioctl_errno(domain_fd, KVM_EXEC_QUERY_CAPSULE, &capsule,
+			   ESTALE);
+	capsule.lifecycle_generation--;
+	capsule.reserved[0] = 1;
+	assert_ioctl_errno(domain_fd, KVM_EXEC_QUERY_CAPSULE, &capsule,
+			   EINVAL);
+	capsule.reserved[0] = 0;
+
+	executor.size--;
+	assert_ioctl_errno(executor_fd, KVM_EXEC_QUERY_EXECUTOR, &executor,
+			   EINVAL);
+	executor.size++;
+	executor.flags = 1;
+	assert_ioctl_errno(executor_fd, KVM_EXEC_QUERY_EXECUTOR, &executor,
+			   EINVAL);
+	executor.flags = 0;
+	executor.domain_generation++;
+	assert_ioctl_errno(executor_fd, KVM_EXEC_QUERY_EXECUTOR, &executor,
+			   ESTALE);
+	executor.domain_generation--;
+	executor.executor_generation++;
+	assert_ioctl_errno(executor_fd, KVM_EXEC_QUERY_EXECUTOR, &executor,
+			   ESTALE);
+	executor.executor_generation--;
+	executor.reserved[0] = 1;
+	assert_ioctl_errno(executor_fd, KVM_EXEC_QUERY_EXECUTOR, &executor,
+			   EINVAL);
+	executor.reserved[0] = 0;
+
+	control_domain(domain_fd, KVM_EXEC_PAUSE);
+	control_domain(domain_fd, KVM_EXEC_DRAIN);
+	memset(&executor.state, 0,
+	       sizeof(executor) - offsetof(struct kvm_exec_query_executor, state));
+	ret = ioctl(executor_fd, KVM_EXEC_QUERY_EXECUTOR, &executor);
+	TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_EXEC_QUERY_EXECUTOR, ret));
+	TEST_ASSERT_EQ(executor.state, KVM_EXEC_EXECUTOR_STATE_PAUSED);
+	detach_vcpu(domain_fd, 19, 23);
+	close(executor_fd);
+	close(domain_fd);
+	close(vcpu_fd);
+	close(vm_fd);
+}
+
 static void test_deterministic_malformed_fuzz(int kvm_fd)
 {
 	struct kvm_exec_domain_create create;
@@ -4665,6 +4755,7 @@ int main(int argc, char **argv)
 	test_fd_close_orders(kvm_fd);
 	test_wrong_mm(kvm_fd, argv[0]);
 	test_malformed_and_stale_requests(kvm_fd);
+	test_lifecycle_query_validation(kvm_fd);
 	test_deterministic_malformed_fuzz(kvm_fd);
 	test_same_vm_single_step_trace(kvm_fd);
 	test_trace_validation_and_cross_vm_rejection(kvm_fd);
