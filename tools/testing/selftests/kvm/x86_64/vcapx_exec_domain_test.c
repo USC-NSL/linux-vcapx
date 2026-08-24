@@ -104,6 +104,9 @@ static void test_cross_vm_feature_dependencies(int kvm_fd)
 				    KVM_EXEC_FEATURE_DYNAMIC_DISPATCH |
 				    KVM_EXEC_FEATURE_ASYNC_PIO_WRITE;
 	assert_ioctl_errno(kvm_fd, KVM_CREATE_EXEC_DOMAIN, &create, EINVAL);
+	create.requested_features = KVM_EXEC_FEATURE_BASE_OBJECTS |
+				    KVM_EXEC_FEATURE_RETURN_KICK;
+	assert_ioctl_errno(kvm_fd, KVM_CREATE_EXEC_DOMAIN, &create, EINVAL);
 
 	create.requested_features = complete_features;
 	domain_fd = ioctl(kvm_fd, KVM_CREATE_EXEC_DOMAIN, &create);
@@ -2243,11 +2246,13 @@ static void publish_exit_completion(struct dispatch_mapping *mapping,
 			 __ATOMIC_RELEASE);
 }
 
-static void kick_dispatch(int executor_fd, uint64_t domain_generation,
-			  uint64_t executor_generation, uint64_t sequence)
+static void kick_dispatch_flags(int executor_fd, uint64_t domain_generation,
+				uint64_t executor_generation, uint64_t sequence,
+				uint32_t flags)
 {
 	struct kvm_exec_kick kick = {
 		.size = sizeof(kick),
+		.flags = flags,
 		.domain_generation = domain_generation,
 		.executor_generation = executor_generation,
 		.request_sequence = sequence,
@@ -2255,6 +2260,13 @@ static void kick_dispatch(int executor_fd, uint64_t domain_generation,
 	int ret = ioctl(executor_fd, KVM_EXEC_KICK, &kick);
 
 	TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_EXEC_KICK, ret));
+}
+
+static void kick_dispatch(int executor_fd, uint64_t domain_generation,
+			  uint64_t executor_generation, uint64_t sequence)
+{
+	kick_dispatch_flags(executor_fd, domain_generation,
+			    executor_generation, sequence, 0);
 }
 
 static uint32_t cancel_dispatch(int executor_fd, uint64_t domain_generation,
@@ -3205,6 +3217,72 @@ static void test_sync_domain_close_pending(int kvm_fd, bool close_on_write)
 		    "restoring signal action failed, errno %d", errno);
 }
 
+static void test_dynamic_return_kick(int kvm_fd)
+{
+	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
+				  KVM_EXEC_FEATURE_DYNAMIC_DISPATCH |
+				  KVM_EXEC_FEATURE_RETURN_KICK;
+	struct kvm_exec_command command = {
+		.opcode = KVM_EXEC_CMD_SWITCH,
+		.request_sequence = 1,
+		.target_capsule_id = 40,
+		.target_lifecycle_generation = 6,
+	};
+	struct dispatch_run_arg run_arg = { };
+	struct kvm_exec_completion completion;
+	struct dispatch_mapping mapping;
+	struct kvm_vcpu *vcpu;
+	struct kvm_vm *vm;
+	uint64_t *started;
+	uint64_t domain_generation, executor_generation;
+	pthread_t thread;
+	int domain_fd;
+
+	vm = vm_create_with_one_vcpu(&vcpu, guest_spin_irqs_disabled);
+	disable_nested_cpuid(vcpu);
+	started = guest_started_hva(vm);
+	domain_fd = create_domain_with_features(kvm_fd, 1, 1, features,
+						&domain_generation);
+	attach_vcpu(domain_fd, vcpu->fd, 40, 6);
+	run_arg.executor_fd = create_executor(domain_fd, 0x700,
+					      &executor_generation);
+	mapping = map_dispatch(run_arg.executor_fd);
+	command.domain_generation = domain_generation;
+	command.executor_generation = executor_generation;
+	TEST_ASSERT(publish_dispatch_command(&mapping, command),
+		    "return-kick command was unexpectedly full");
+	run_arg.run = (struct kvm_exec_run_dispatch) {
+		.size = sizeof(run_arg.run),
+		.domain_generation = domain_generation,
+		.executor_generation = executor_generation,
+	};
+	TEST_ASSERT(!pthread_create(&thread, NULL, dispatch_runner, &run_arg),
+		    "pthread_create failed");
+	completion = consume_dispatch_completion(&mapping);
+	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_APPLIED);
+	wait_for_guest(started);
+
+	kick_dispatch_flags(run_arg.executor_fd, domain_generation,
+			    executor_generation, 2,
+			    KVM_EXEC_KICK_F_RETURN_TO_VMM);
+	pthread_join(thread, NULL);
+	TEST_ASSERT(!run_arg.ret,
+		    "return-kick runner failed, ret %d errno %d",
+		    run_arg.ret, run_arg.error);
+	TEST_ASSERT_EQ(run_arg.run.return_reason, KVM_EXEC_RETURN_SIGNAL);
+	TEST_ASSERT_EQ(run_arg.run.run_result, -EINTR);
+	TEST_ASSERT_EQ(run_arg.run.owned_capsule_id, 40);
+	TEST_ASSERT_EQ(mapping.header->executor_return_count, 1);
+
+	control_domain(domain_fd, KVM_EXEC_PAUSE);
+	control_domain(domain_fd, KVM_EXEC_DRAIN);
+	munmap(mapping.header, KVM_EXEC_DISPATCH_MMAP_SIZE);
+	close(run_arg.executor_fd);
+	detach_vcpu(domain_fd, 40, 6);
+	close(domain_fd);
+	kvm_vm_free(vm);
+}
+
 static void test_dynamic_kick_and_cancel(int kvm_fd)
 {
 	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
@@ -3219,6 +3297,7 @@ static void test_dynamic_kick_and_cancel(int kvm_fd)
 		.user_cookie = 0x701,
 	};
 	struct dispatch_run_arg run_arg = { };
+	struct kvm_exec_kick unsupported_kick;
 	struct kvm_exec_cancel stale_cancel = {
 		.size = sizeof(stale_cancel),
 		.request_sequence = 6,
@@ -3241,6 +3320,18 @@ static void test_dynamic_kick_and_cancel(int kvm_fd)
 	run_arg.executor_fd = create_executor(domain_fd, 0x701,
 					      &executor_generation);
 	mapping = map_dispatch(run_arg.executor_fd);
+	unsupported_kick = (struct kvm_exec_kick) {
+		.size = sizeof(unsupported_kick),
+		.flags = KVM_EXEC_KICK_F_RETURN_TO_VMM,
+		.domain_generation = domain_generation,
+		.executor_generation = executor_generation,
+		.request_sequence = 1,
+	};
+	assert_ioctl_errno(run_arg.executor_fd, KVM_EXEC_KICK,
+			   &unsupported_kick, EOPNOTSUPP);
+	unsupported_kick.flags = 1U << 31;
+	assert_ioctl_errno(run_arg.executor_fd, KVM_EXEC_KICK,
+			   &unsupported_kick, EINVAL);
 	command.domain_generation = domain_generation;
 	command.executor_generation = executor_generation;
 	TEST_ASSERT(publish_dispatch_command(&mapping, command),
@@ -4247,14 +4338,17 @@ int main(int argc, char **argv)
 				    KVM_EXEC_FEATURE_CROSS_VM_CHAIN |
 				    KVM_EXEC_FEATURE_DYNAMIC_DISPATCH |
 				    KVM_EXEC_FEATURE_SYNC_EXITS |
-				    KVM_EXEC_FEATURE_ASYNC_PIO_WRITE)) ==
+				    KVM_EXEC_FEATURE_ASYNC_PIO_WRITE |
+				    KVM_EXEC_FEATURE_RETURN_KICK)) ==
 		     (KVM_EXEC_FEATURE_BASE_OBJECTS |
 		      KVM_EXEC_FEATURE_INTRA_VM_CHAIN |
 		      KVM_EXEC_FEATURE_CROSS_VM_CHAIN |
 		      KVM_EXEC_FEATURE_DYNAMIC_DISPATCH |
 		      KVM_EXEC_FEATURE_SYNC_EXITS |
-		      KVM_EXEC_FEATURE_ASYNC_PIO_WRITE));
+		      KVM_EXEC_FEATURE_ASYNC_PIO_WRITE |
+		      KVM_EXEC_FEATURE_RETURN_KICK));
 	if (argc == 2 && !strcmp(argv[1], "--dynamic-kick-cancel-only")) {
+		test_dynamic_return_kick(kvm_fd);
 		test_dynamic_kick_and_cancel(kvm_fd);
 		close(kvm_fd);
 		return 0;
@@ -4304,6 +4398,7 @@ int main(int argc, char **argv)
 	test_trace_signal_releases_references(kvm_fd, false);
 	test_trace_signal_releases_references(kvm_fd, true);
 	test_halted_trace_pause_and_drain(kvm_fd);
+	test_dynamic_return_kick(kvm_fd);
 	test_dynamic_kick_and_cancel(kvm_fd);
 	test_dynamic_ring_backpressure_and_corruption(kvm_fd);
 	test_dynamic_synchronous_exits(kvm_fd);

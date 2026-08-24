@@ -15,7 +15,8 @@
 #define KVM_EXEC_SUPPORTED_FEATURES \
 	(KVM_EXEC_FEATURE_BASE_OBJECTS | KVM_EXEC_FEATURE_INTRA_VM_CHAIN | \
 	 KVM_EXEC_FEATURE_CROSS_VM_CHAIN | KVM_EXEC_FEATURE_DYNAMIC_DISPATCH | \
-	 KVM_EXEC_FEATURE_SYNC_EXITS | KVM_EXEC_FEATURE_ASYNC_PIO_WRITE)
+	 KVM_EXEC_FEATURE_SYNC_EXITS | KVM_EXEC_FEATURE_ASYNC_PIO_WRITE | \
+	 KVM_EXEC_FEATURE_RETURN_KICK)
 
 struct kvm_exec_domain;
 struct kvm_exec_executor;
@@ -61,6 +62,8 @@ struct kvm_exec_executor {
 	spinlock_t dispatch_lock;
 	wait_queue_head_t dispatch_wait;
 	atomic64_t kick_epoch;
+	atomic64_t return_kick_epoch;
+	u64 consumed_return_kick_epoch;
 	u64 command_head;
 	u64 completion_tail;
 	u64 exit_request_tail;
@@ -541,6 +544,7 @@ static int kvm_exec_create_executor(struct kvm_exec_domain *domain,
 	spin_lock_init(&executor->dispatch_lock);
 	init_waitqueue_head(&executor->dispatch_wait);
 	atomic64_set(&executor->kick_epoch, 0);
+	atomic64_set(&executor->return_kick_epoch, 0);
 	INIT_LIST_HEAD(&executor->node);
 	kref_get(&domain->kref);
 	if (domain->negotiated_features & KVM_EXEC_FEATURE_DYNAMIC_DISPATCH) {
@@ -1695,6 +1699,18 @@ static bool kvm_exec_ready(struct kvm_exec_executor *executor, u64 kick_epoch)
 	       exit_completion_tail != executor->exit_completion_head;
 }
 
+static bool
+kvm_exec_consume_return_kick(struct kvm_exec_executor *executor,
+			     bool mapped_boundary)
+{
+	u64 epoch = atomic64_read(&executor->return_kick_epoch);
+
+	if (epoch == executor->consumed_return_kick_epoch)
+		return false;
+	executor->consumed_return_kick_epoch = epoch;
+	return !mapped_boundary;
+}
+
 static void kvm_exec_dispatch_run_owner(struct kvm_exec_executor *executor,
 					struct kvm_exec_run_dispatch *run)
 {
@@ -1786,8 +1802,10 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 		bool entry_allowed;
 		bool invalid_completion = false;
 		bool async_published = false;
+		bool mapped_boundary;
 		bool pending_after_run = false;
 		bool kick_pending;
+		bool return_to_vmm;
 		bool strict_migrated;
 		u32 reported_exit_reason;
 
@@ -1815,6 +1833,19 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 			mutex_unlock(&domain->lock);
 			seen_kick_epoch = kick_epoch;
 		}
+
+		mutex_lock(&domain->lock);
+		capsule = executor->current_capsule;
+		mapped_boundary = capsule &&
+			capsule->exit.async_request_pending;
+		return_to_vmm = kvm_exec_consume_return_kick(executor, mapped_boundary);
+		if (return_to_vmm) {
+			run.return_reason = KVM_EXEC_RETURN_SIGNAL;
+			run.run_result = -EINTR;
+			mutex_unlock(&domain->lock);
+			break;
+		}
+		mutex_unlock(&domain->lock);
 
 		async_ret = 0;
 		if (domain->negotiated_features &
@@ -2094,7 +2125,8 @@ static long kvm_exec_kick(struct kvm_exec_executor *executor,
 
 	if (copy_from_user(&kick, argp, sizeof(kick)))
 		return -EFAULT;
-	if (kick.size != sizeof(kick) || kick.flags ||
+	if (kick.size != sizeof(kick) ||
+	    kick.flags & ~KVM_EXEC_KICK_F_RETURN_TO_VMM ||
 	    !kick.request_sequence ||
 	    memchr_inv(kick.reserved, 0, sizeof(kick.reserved)))
 		return -EINVAL;
@@ -2102,6 +2134,9 @@ static long kvm_exec_kick(struct kvm_exec_executor *executor,
 	if (ret)
 		return ret;
 	if (!(domain->negotiated_features & KVM_EXEC_FEATURE_DYNAMIC_DISPATCH))
+		return -EOPNOTSUPP;
+	if ((kick.flags & KVM_EXEC_KICK_F_RETURN_TO_VMM) &&
+	    !(domain->negotiated_features & KVM_EXEC_FEATURE_RETURN_KICK))
 		return -EOPNOTSUPP;
 	if (kick.domain_generation != domain->generation ||
 	    kick.executor_generation != executor->generation)
@@ -2115,6 +2150,8 @@ static long kvm_exec_kick(struct kvm_exec_executor *executor,
 		return -ESHUTDOWN;
 	}
 	epoch = atomic64_inc_return(&executor->kick_epoch);
+	if (kick.flags & KVM_EXEC_KICK_F_RETURN_TO_VMM)
+		atomic64_inc(&executor->return_kick_epoch);
 	header = kvm_exec_dispatch_header(executor);
 	WRITE_ONCE(header->kernel_kick_count, epoch);
 	WRITE_ONCE(header->last_kick_sequence, kick.request_sequence);
@@ -2381,6 +2418,8 @@ int kvm_dev_ioctl_create_exec_domain(void __user *argp)
 	       KVM_EXEC_FEATURE_SYNC_EXITS)) !=
 	     (KVM_EXEC_FEATURE_DYNAMIC_DISPATCH |
 	      KVM_EXEC_FEATURE_SYNC_EXITS)) ||
+	    ((create.requested_features & KVM_EXEC_FEATURE_RETURN_KICK) &&
+	     !(create.requested_features & KVM_EXEC_FEATURE_DYNAMIC_DISPATCH)) ||
 	    memchr_inv(create.reserved, 0, sizeof(create.reserved)))
 		return -EINVAL;
 

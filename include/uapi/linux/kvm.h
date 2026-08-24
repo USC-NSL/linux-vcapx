@@ -886,6 +886,7 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_FEATURE_DYNAMIC_DISPATCH (1ULL << 3)
 #define KVM_EXEC_FEATURE_SYNC_EXITS	(1ULL << 4)
 #define KVM_EXEC_FEATURE_ASYNC_PIO_WRITE (1ULL << 5)
+#define KVM_EXEC_FEATURE_RETURN_KICK	(1ULL << 6)
 #define KVM_EXEC_CPU_ANY		((__u32)-1)
 
 #define KVM_EXEC_TRACE_MAX_ENTRIES	256U
@@ -1176,6 +1177,8 @@ struct kvm_exec_kick {
 	__u64 request_sequence;
 	__u64 reserved[2];
 };
+
+#define KVM_EXEC_KICK_F_RETURN_TO_VMM	(1U << 0)
 
 struct kvm_exec_cancel {
 	__u32 size;
