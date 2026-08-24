@@ -2755,7 +2755,8 @@ static void test_async_pio_write_switch(int kvm_fd)
 				  KVM_EXEC_FEATURE_CROSS_VM_CHAIN |
 				  KVM_EXEC_FEATURE_DYNAMIC_DISPATCH |
 				  KVM_EXEC_FEATURE_SYNC_EXITS |
-				  KVM_EXEC_FEATURE_ASYNC_PIO_WRITE;
+				  KVM_EXEC_FEATURE_ASYNC_PIO_WRITE |
+				  KVM_EXEC_FEATURE_RETURN_KICK;
 	struct kvm_exec_command command = {
 		.opcode = KVM_EXEC_CMD_SWITCH,
 		.request_sequence = 1,
@@ -2814,6 +2815,9 @@ static void test_async_pio_write_switch(int kvm_fd)
 	TEST_ASSERT_EQ(request.count, 1);
 	TEST_ASSERT_EQ(*(uint16_t *)request.data, 0xa5c3);
 	TEST_ASSERT_EQ(READ_ONCE(*progress), 0);
+	kick_dispatch_flags(run_arg.executor_fd, domain_generation,
+			    executor_generation, 2,
+			    KVM_EXEC_KICK_F_RETURN_TO_VMM);
 	usleep(20000);
 	TEST_ASSERT_EQ(mapping.header->executor_return_count, 0);
 
@@ -2841,7 +2845,7 @@ static void test_async_pio_write_switch(int kvm_fd)
 	TEST_ASSERT(publish_dispatch_command(&mapping, command),
 		    "asynchronous recipient command did not publish");
 	kick_dispatch(run_arg.executor_fd, domain_generation,
-		      executor_generation, 2);
+		      executor_generation, 3);
 	completion = consume_dispatch_completion(&mapping);
 	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_APPLIED);
 	TEST_ASSERT_EQ(completion.previous_capsule_id, 71);
