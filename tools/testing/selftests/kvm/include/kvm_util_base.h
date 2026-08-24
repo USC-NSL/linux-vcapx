@@ -840,6 +840,9 @@ vm_paddr_t vm_alloc_page_table(struct kvm_vm *vm);
 struct kvm_vm *____vm_create(struct vm_shape shape);
 struct kvm_vm *__vm_create(struct vm_shape shape, uint32_t nr_runnable_vcpus,
 			   uint64_t nr_extra_pages);
+struct kvm_vm *__vm_create_without_irqchip(struct vm_shape shape,
+					   uint32_t nr_runnable_vcpus,
+					   uint64_t nr_extra_pages);
 
 static inline struct kvm_vm *vm_create_barebones(void)
 {

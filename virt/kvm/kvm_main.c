@@ -4634,6 +4634,7 @@ out_free1:
 		r = kvm_arch_vcpu_ioctl(filp, ioctl, arg);
 	}
 out:
+	kvm_exec_domain_vcpu_ioctl_complete(vcpu, ioctl, r);
 	mutex_unlock(&vcpu->mutex);
 	kfree(fpu);
 	kfree(kvm_sregs);

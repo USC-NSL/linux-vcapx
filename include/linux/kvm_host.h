@@ -1489,6 +1489,8 @@ u64 kvm_exec_supported_features(void);
 int kvm_dev_ioctl_create_exec_domain(void __user *argp);
 bool kvm_exec_domain_vcpu_ioctl_allowed(struct kvm_vcpu *vcpu,
 					unsigned int ioctl);
+void kvm_exec_domain_vcpu_ioctl_complete(struct kvm_vcpu *vcpu,
+					 unsigned int ioctl, long result);
 struct kvm_vcpu *kvm_vcpu_from_fd(int fd, struct file **filep);
 int kvm_vcpu_run(struct kvm_vcpu *vcpu);
 

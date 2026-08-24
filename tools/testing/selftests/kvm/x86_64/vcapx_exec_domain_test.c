@@ -126,6 +126,8 @@ static void test_dynamic_dispatch_uapi_layout(void)
 	TEST_ASSERT_EQ(sizeof(struct kvm_exec_run_dispatch), 104);
 	TEST_ASSERT_EQ(sizeof(struct kvm_exec_kick), 48);
 	TEST_ASSERT_EQ(sizeof(struct kvm_exec_cancel), 56);
+	TEST_ASSERT_EQ(sizeof(struct kvm_exec_query_capsule), 144);
+	TEST_ASSERT_EQ(sizeof(struct kvm_exec_query_executor), 152);
 	TEST_ASSERT_EQ(KVM_EXEC_DISPATCH_COMMAND_OFFSET, 256);
 	TEST_ASSERT_EQ(KVM_EXEC_DISPATCH_COMPLETION_OFFSET, 4096);
 	TEST_ASSERT_EQ(KVM_EXEC_EXIT_REQUEST_OFFSET, 8192);
@@ -1967,6 +1969,25 @@ static void test_two_executor_claim_race(int kvm_fd)
 }
 
 static uint64_t guest_started;
+static uint64_t halt_wake_progress;
+static uint64_t halt_wake_interrupts;
+
+#define HALT_WAKE_VECTOR 0x42
+
+static void guest_halt_wake_handler(struct ex_regs *regs)
+{
+	WRITE_ONCE(halt_wake_interrupts,
+		   READ_ONCE(halt_wake_interrupts) + 1);
+}
+
+static void guest_halt_then_spin(void)
+{
+	WRITE_ONCE(halt_wake_progress, 1);
+	asm volatile("sti; hlt; cli" ::: "memory");
+	WRITE_ONCE(halt_wake_progress, 2);
+	for (;;)
+		asm volatile("pause");
+}
 
 static void guest_spin(void)
 {
@@ -4002,6 +4023,169 @@ static void test_attached_capsule_accepts_interrupt_before_entry(int kvm_fd)
 	close(vm_fd);
 }
 
+static void test_halt_wake_requires_exact_dispatch(int kvm_fd)
+{
+	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
+				  KVM_EXEC_FEATURE_DYNAMIC_DISPATCH |
+				  KVM_EXEC_FEATURE_SYNC_EXITS |
+				  KVM_EXEC_FEATURE_RETURN_KICK |
+				  KVM_EXEC_FEATURE_LIFECYCLE_STATE;
+	struct kvm_exec_query_capsule capsule = {
+		.size = sizeof(capsule),
+		.capsule_id = 81,
+		.lifecycle_generation = 7,
+	};
+	struct kvm_exec_query_executor executor = {
+		.size = sizeof(executor),
+	};
+	struct kvm_exec_command command = {
+		.opcode = KVM_EXEC_CMD_SWITCH,
+		.request_sequence = 1,
+		.target_capsule_id = 81,
+		.target_lifecycle_generation = 7,
+	};
+	struct kvm_exec_completion completion;
+	struct kvm_exec_run_dispatch run;
+	struct dispatch_run_arg run_arg = { };
+	struct dispatch_mapping mapping;
+	struct kvm_interrupt irq = { .irq = HALT_WAKE_VECTOR };
+	struct kvm_vcpu *vcpu;
+	struct kvm_vm *vm;
+	uint64_t *progress, *interrupts;
+	uint64_t domain_generation, executor_generation;
+	pthread_t thread;
+	int domain_fd, executor_fd, ret, i;
+
+	vm = __vm_create_without_irqchip(VM_SHAPE_DEFAULT, 1, 0);
+	vcpu = vm_vcpu_add(vm, 0, guest_halt_then_spin);
+	disable_nested_cpuid(vcpu);
+	vm_init_descriptor_tables(vm);
+	vcpu_init_descriptor_tables(vcpu);
+	vm_install_exception_handler(vm, HALT_WAKE_VECTOR,
+				     guest_halt_wake_handler);
+	progress = addr_gva2hva(vm, (vm_vaddr_t)&halt_wake_progress);
+	interrupts = addr_gva2hva(vm, (vm_vaddr_t)&halt_wake_interrupts);
+	WRITE_ONCE(*progress, 0);
+	WRITE_ONCE(*interrupts, 0);
+
+	domain_fd = create_domain_with_features(kvm_fd, 1, 1, features,
+						&domain_generation);
+	attach_vcpu(domain_fd, vcpu->fd, 81, 7);
+	executor_fd = create_executor(domain_fd, 0x8127,
+				      &executor_generation);
+	mapping = map_dispatch(executor_fd);
+	command.domain_generation = domain_generation;
+	command.executor_generation = executor_generation;
+	TEST_ASSERT(publish_dispatch_command(&mapping, command),
+		    "failed to publish initial halt command");
+	run = run_dispatch_once(executor_fd, domain_generation,
+				executor_generation);
+	TEST_ASSERT_EQ(run.return_reason, KVM_EXEC_RETURN_VCPU_EXIT);
+	TEST_ASSERT_EQ(run.vcpu_exit_reason, KVM_EXIT_HLT);
+	completion = consume_dispatch_completion(&mapping);
+	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_APPLIED);
+	TEST_ASSERT_EQ(READ_ONCE(*progress), 1);
+
+	capsule.domain_generation = domain_generation;
+	ret = ioctl(domain_fd, KVM_EXEC_QUERY_CAPSULE, &capsule);
+	TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_EXEC_QUERY_CAPSULE, ret));
+	TEST_ASSERT_EQ(capsule.state, KVM_EXEC_CAPSULE_STATE_BLOCKED_HLT);
+	TEST_ASSERT_EQ(capsule.block_reason, KVM_EXEC_BLOCK_HLT);
+	TEST_ASSERT_EQ(capsule.owner_executor_generation,
+		       executor_generation);
+	TEST_ASSERT_EQ(capsule.owner_cookie, 0x8127);
+	TEST_ASSERT_EQ(capsule.run_count, 1);
+	TEST_ASSERT_EQ(capsule.exit_count, 1);
+	TEST_ASSERT_EQ(capsule.halt_count, 1);
+	TEST_ASSERT_EQ(capsule.wake_count, 0);
+	TEST_ASSERT(capsule.runtime_ns, "halted capsule recorded no runtime");
+
+	executor.domain_generation = domain_generation;
+	executor.executor_generation = executor_generation;
+	ret = ioctl(executor_fd, KVM_EXEC_QUERY_EXECUTOR, &executor);
+	TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_EXEC_QUERY_EXECUTOR, ret));
+	TEST_ASSERT_EQ(executor.state,
+		       KVM_EXEC_EXECUTOR_STATE_BLOCKED_HLT);
+	TEST_ASSERT_EQ(executor.current_capsule_id, 81);
+	TEST_ASSERT_EQ(executor.run_count, 1);
+	TEST_ASSERT_EQ(executor.exit_count, 1);
+	TEST_ASSERT(executor.runtime_ns >= capsule.runtime_ns,
+		    "executor runtime is smaller than capsule runtime");
+
+	command.request_sequence = 2;
+	command.expected_current_id = 81;
+	command.expected_current_generation = 7;
+	TEST_ASSERT(publish_dispatch_command(&mapping, command),
+		    "failed to publish blocked-capsule command");
+	run = run_dispatch_once(executor_fd, domain_generation,
+				executor_generation);
+	TEST_ASSERT_EQ(run.return_reason, KVM_EXEC_RETURN_DISPATCH_EMPTY);
+	completion = consume_dispatch_completion(&mapping);
+	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_TARGET_BLOCKED);
+	TEST_ASSERT_EQ(READ_ONCE(*progress), 1);
+
+	ret = ioctl(vcpu->fd, KVM_INTERRUPT, &irq);
+	TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_INTERRUPT, ret));
+	for (i = 0; i < 10000; i++)
+		sched_yield();
+	TEST_ASSERT_EQ(READ_ONCE(*progress), 1);
+	memset(&capsule.state, 0,
+	       sizeof(capsule) - offsetof(struct kvm_exec_query_capsule, state));
+	ret = ioctl(domain_fd, KVM_EXEC_QUERY_CAPSULE, &capsule);
+	TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_EXEC_QUERY_CAPSULE, ret));
+	TEST_ASSERT_EQ(capsule.state, KVM_EXEC_CAPSULE_STATE_READY);
+	TEST_ASSERT_EQ(capsule.block_reason, KVM_EXEC_BLOCK_NONE);
+	TEST_ASSERT_EQ(capsule.wake_count, 1);
+
+	command.request_sequence = 3;
+	TEST_ASSERT(publish_dispatch_command(&mapping, command),
+		    "failed to publish woken-capsule command");
+	run_arg.executor_fd = executor_fd;
+	run_arg.run = (struct kvm_exec_run_dispatch) {
+		.size = sizeof(run_arg.run),
+		.domain_generation = domain_generation,
+		.executor_generation = executor_generation,
+	};
+	TEST_ASSERT(!pthread_create(&thread, NULL, dispatch_runner, &run_arg),
+		    "pthread_create failed");
+	wait_for_trace_progress(progress, 1);
+	kick_dispatch_flags(executor_fd, domain_generation, executor_generation,
+			    100, KVM_EXEC_KICK_F_RETURN_TO_VMM);
+	pthread_join(thread, NULL);
+	TEST_ASSERT(!run_arg.ret,
+		    "woken dispatch returned %d errno %d", run_arg.ret,
+		    run_arg.error);
+	TEST_ASSERT_EQ(run_arg.run.return_reason, KVM_EXEC_RETURN_SIGNAL);
+	completion = consume_dispatch_completion(&mapping);
+	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_APPLIED);
+	TEST_ASSERT_EQ(READ_ONCE(*progress), 2);
+	TEST_ASSERT_EQ(READ_ONCE(*interrupts), 1);
+
+	command = (struct kvm_exec_command) {
+		.opcode = KVM_EXEC_CMD_RELEASE,
+		.request_sequence = 4,
+		.domain_generation = domain_generation,
+		.executor_generation = executor_generation,
+		.expected_current_id = 81,
+		.expected_current_generation = 7,
+	};
+	TEST_ASSERT(publish_dispatch_command(&mapping, command),
+		    "failed to publish release command");
+	run = run_dispatch_once(executor_fd, domain_generation,
+				executor_generation);
+	TEST_ASSERT_EQ(run.return_reason, KVM_EXEC_RETURN_DISPATCH_EMPTY);
+	completion = consume_dispatch_completion(&mapping);
+	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_RETURNED);
+
+	control_domain(domain_fd, KVM_EXEC_PAUSE);
+	control_domain(domain_fd, KVM_EXEC_DRAIN);
+	detach_vcpu(domain_fd, 81, 7);
+	munmap(mapping.header, KVM_EXEC_DISPATCH_MMAP_SIZE);
+	close(executor_fd);
+	close(domain_fd);
+	kvm_vm_free(vm);
+}
+
 static void test_fd_close_orders(int kvm_fd)
 {
 	static const int orders[24][4] = {
@@ -4392,17 +4576,24 @@ int main(int argc, char **argv)
 				    KVM_EXEC_FEATURE_DYNAMIC_DISPATCH |
 				    KVM_EXEC_FEATURE_SYNC_EXITS |
 				    KVM_EXEC_FEATURE_ASYNC_PIO_WRITE |
-				    KVM_EXEC_FEATURE_RETURN_KICK)) ==
+				    KVM_EXEC_FEATURE_RETURN_KICK |
+				    KVM_EXEC_FEATURE_LIFECYCLE_STATE)) ==
 		     (KVM_EXEC_FEATURE_BASE_OBJECTS |
 		      KVM_EXEC_FEATURE_INTRA_VM_CHAIN |
 		      KVM_EXEC_FEATURE_CROSS_VM_CHAIN |
 		      KVM_EXEC_FEATURE_DYNAMIC_DISPATCH |
 		      KVM_EXEC_FEATURE_SYNC_EXITS |
 		      KVM_EXEC_FEATURE_ASYNC_PIO_WRITE |
-		      KVM_EXEC_FEATURE_RETURN_KICK));
+		      KVM_EXEC_FEATURE_RETURN_KICK |
+		      KVM_EXEC_FEATURE_LIFECYCLE_STATE));
 	if (argc == 2 && !strcmp(argv[1], "--dynamic-kick-cancel-only")) {
 		test_dynamic_return_kick(kvm_fd);
 		test_dynamic_kick_and_cancel(kvm_fd);
+		close(kvm_fd);
+		return 0;
+	}
+	if (argc == 2 && !strcmp(argv[1], "--halt-wake-only")) {
+		test_halt_wake_requires_exact_dispatch(kvm_fd);
 		close(kvm_fd);
 		return 0;
 	}
@@ -4433,6 +4624,7 @@ int main(int argc, char **argv)
 	test_two_executor_claim_race(kvm_fd);
 	test_pause_drain_and_runner_signal(kvm_fd);
 	test_attached_capsule_accepts_interrupt_before_entry(kvm_fd);
+	test_halt_wake_requires_exact_dispatch(kvm_fd);
 	test_fd_close_orders(kvm_fd);
 	test_wrong_mm(kvm_fd, argv[0]);
 	test_malformed_and_stale_requests(kvm_fd);

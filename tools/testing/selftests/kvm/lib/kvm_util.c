@@ -352,8 +352,10 @@ static uint64_t vm_nr_pages_required(enum vm_guest_mode mode,
 	return vm_adjust_num_guest_pages(mode, nr_pages);
 }
 
-struct kvm_vm *__vm_create(struct vm_shape shape, uint32_t nr_runnable_vcpus,
-			   uint64_t nr_extra_pages)
+static struct kvm_vm *__vm_create_common(struct vm_shape shape,
+					 uint32_t nr_runnable_vcpus,
+					 uint64_t nr_extra_pages,
+					 bool create_irqchip)
 {
 	uint64_t nr_pages = vm_nr_pages_required(shape.mode, nr_runnable_vcpus,
 						 nr_extra_pages);
@@ -381,9 +383,25 @@ struct kvm_vm *__vm_create(struct vm_shape shape, uint32_t nr_runnable_vcpus,
 	slot0 = memslot2region(vm, 0);
 	ucall_init(vm, slot0->region.guest_phys_addr + slot0->region.memory_size);
 
-	kvm_arch_vm_post_create(vm);
+	if (create_irqchip)
+		kvm_arch_vm_post_create(vm);
 
 	return vm;
+}
+
+struct kvm_vm *__vm_create(struct vm_shape shape, uint32_t nr_runnable_vcpus,
+			   uint64_t nr_extra_pages)
+{
+	return __vm_create_common(shape, nr_runnable_vcpus, nr_extra_pages,
+				  true);
+}
+
+struct kvm_vm *__vm_create_without_irqchip(struct vm_shape shape,
+					   uint32_t nr_runnable_vcpus,
+					   uint64_t nr_extra_pages)
+{
+	return __vm_create_common(shape, nr_runnable_vcpus, nr_extra_pages,
+				  false);
 }
 
 /*

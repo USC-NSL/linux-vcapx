@@ -887,6 +887,7 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_FEATURE_SYNC_EXITS	(1ULL << 4)
 #define KVM_EXEC_FEATURE_ASYNC_PIO_WRITE (1ULL << 5)
 #define KVM_EXEC_FEATURE_RETURN_KICK	(1ULL << 6)
+#define KVM_EXEC_FEATURE_LIFECYCLE_STATE (1ULL << 7)
 #define KVM_EXEC_CPU_ANY		((__u32)-1)
 
 #define KVM_EXEC_TRACE_MAX_ENTRIES	256U
@@ -929,6 +930,25 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_COMPLETE_CROSS_VM_DISABLED 8U
 #define KVM_EXEC_COMPLETE_REJECTED	9U
 #define KVM_EXEC_COMPLETE_EXIT_PENDING	10U
+#define KVM_EXEC_COMPLETE_TARGET_BLOCKED 11U
+
+#define KVM_EXEC_CAPSULE_STATE_READY		1U
+#define KVM_EXEC_CAPSULE_STATE_RUNNING		2U
+#define KVM_EXEC_CAPSULE_STATE_BLOCKED_HLT	3U
+#define KVM_EXEC_CAPSULE_STATE_BLOCKED_VMM	4U
+#define KVM_EXEC_CAPSULE_STATE_COMPLETION_PENDING 5U
+#define KVM_EXEC_CAPSULE_STATE_STOPPING		6U
+
+#define KVM_EXEC_BLOCK_NONE	0U
+#define KVM_EXEC_BLOCK_HLT	1U
+#define KVM_EXEC_BLOCK_VMM_EXIT	2U
+
+#define KVM_EXEC_EXECUTOR_STATE_IDLE		1U
+#define KVM_EXEC_EXECUTOR_STATE_RUNNING		2U
+#define KVM_EXEC_EXECUTOR_STATE_BLOCKED_HLT	3U
+#define KVM_EXEC_EXECUTOR_STATE_BLOCKED_VMM	4U
+#define KVM_EXEC_EXECUTOR_STATE_COMPLETION_PENDING 5U
+#define KVM_EXEC_EXECUTOR_STATE_STOPPING		6U
 
 #define KVM_EXEC_EXIT_F_COMPLETION_PENDING (1U << 0)
 
@@ -1191,6 +1211,48 @@ struct kvm_exec_cancel {
 	__u64 reserved[2];
 };
 
+struct kvm_exec_query_capsule {
+	__u32 size;
+	__u32 flags;
+	__u64 domain_generation;
+	__u64 capsule_id;
+	__u64 lifecycle_generation;
+	__u32 state;
+	__u32 block_reason;
+	__u64 owner_executor_generation;
+	__u64 owner_cookie;
+	__u64 exit_sequence;
+	__u64 run_count;
+	__u64 exit_count;
+	__u64 halt_count;
+	__u64 wake_count;
+	__u64 runtime_ns;
+	__u32 last_cpu;
+	__u32 reserved0;
+	__u64 reserved[4];
+};
+
+struct kvm_exec_query_executor {
+	__u32 size;
+	__u32 flags;
+	__u64 domain_generation;
+	__u64 executor_generation;
+	__u64 executor_cookie;
+	__u32 state;
+	__u32 current_cpu;
+	__u64 current_capsule_id;
+	__u64 current_lifecycle_generation;
+	__u64 run_count;
+	__u64 switch_count;
+	__u64 release_count;
+	__u64 rejected_count;
+	__u64 cancelled_count;
+	__u64 exit_count;
+	__u64 failure_count;
+	__u64 runtime_ns;
+	__u64 reserved[4];
+};
+
 /*
  * ioctls for /dev/kvm fds:
  */
@@ -1234,6 +1296,10 @@ struct kvm_exec_cancel {
 				       struct kvm_exec_run_dispatch)
 #define KVM_EXEC_KICK             _IOW(KVMIO,  0xf9, struct kvm_exec_kick)
 #define KVM_EXEC_CANCEL           _IOWR(KVMIO, 0xfa, struct kvm_exec_cancel)
+#define KVM_EXEC_QUERY_CAPSULE    _IOWR(KVMIO, 0xfb, \
+				       struct kvm_exec_query_capsule)
+#define KVM_EXEC_QUERY_EXECUTOR   _IOWR(KVMIO, 0xfc, \
+				       struct kvm_exec_query_executor)
 
 /*
  * Extension capability list.
