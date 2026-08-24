@@ -2098,6 +2098,13 @@ struct dispatch_run_arg {
 	int error;
 };
 
+struct interrupt_arg {
+	int vcpu_fd;
+	int ret;
+	int error;
+	bool started;
+};
+
 static struct dispatch_mapping map_dispatch(int executor_fd)
 {
 	struct dispatch_mapping mapping;
@@ -2290,6 +2297,18 @@ static void *dispatch_runner(void *opaque)
 
 	errno = 0;
 	arg->ret = ioctl(arg->executor_fd, KVM_EXEC_RUN_DISPATCH, &arg->run);
+	arg->error = errno;
+	return NULL;
+}
+
+static void *interrupt_runner(void *opaque)
+{
+	struct interrupt_arg *arg = opaque;
+	struct kvm_interrupt irq = { .irq = 32 };
+
+	__atomic_store_n(&arg->started, true, __ATOMIC_RELEASE);
+	errno = 0;
+	arg->ret = ioctl(arg->vcpu_fd, KVM_INTERRUPT, &irq);
 	arg->error = errno;
 	return NULL;
 }
@@ -3231,7 +3250,7 @@ static void test_sync_domain_close_pending(int kvm_fd, bool close_on_write)
 		    "restoring signal action failed, errno %d", errno);
 }
 
-static void test_dynamic_return_kick(int kvm_fd)
+static void test_dynamic_return_kick_once(int kvm_fd)
 {
 	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
 				  KVM_EXEC_FEATURE_DYNAMIC_DISPATCH |
@@ -3245,11 +3264,12 @@ static void test_dynamic_return_kick(int kvm_fd)
 	struct dispatch_run_arg run_arg = { };
 	struct kvm_exec_completion completion;
 	struct dispatch_mapping mapping;
+	struct interrupt_arg interrupt_arg = { };
 	struct kvm_vcpu *vcpu;
 	struct kvm_vm *vm;
 	uint64_t *started;
 	uint64_t domain_generation, executor_generation;
-	pthread_t thread;
+	pthread_t interrupt_thread, thread;
 	int domain_fd;
 
 	vm = vm_create_with_one_vcpu(&vcpu, guest_spin_irqs_disabled);
@@ -3275,6 +3295,13 @@ static void test_dynamic_return_kick(int kvm_fd)
 	completion = consume_dispatch_completion(&mapping);
 	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_APPLIED);
 	wait_for_guest(started);
+	interrupt_arg.vcpu_fd = vcpu->fd;
+	TEST_ASSERT(!pthread_create(&interrupt_thread, NULL, interrupt_runner,
+				    &interrupt_arg),
+		    "pthread_create failed");
+	while (!__atomic_load_n(&interrupt_arg.started, __ATOMIC_ACQUIRE))
+		sched_yield();
+	usleep(20000);
 
 	kick_dispatch_flags(run_arg.executor_fd, domain_generation,
 			    executor_generation, 2,
@@ -3283,6 +3310,10 @@ static void test_dynamic_return_kick(int kvm_fd)
 	TEST_ASSERT(!run_arg.ret,
 		    "return-kick runner failed, ret %d errno %d",
 		    run_arg.ret, run_arg.error);
+	pthread_join(interrupt_thread, NULL);
+	TEST_ASSERT(interrupt_arg.ret == -1 && interrupt_arg.error == ENXIO,
+		    "attached interrupt returned %d errno %d, expected ENXIO",
+		    interrupt_arg.ret, interrupt_arg.error);
 	TEST_ASSERT_EQ(run_arg.run.return_reason, KVM_EXEC_RETURN_SIGNAL);
 	TEST_ASSERT_EQ(run_arg.run.run_result, -EINTR);
 	TEST_ASSERT_EQ(run_arg.run.owned_capsule_id, 40);
@@ -3295,6 +3326,14 @@ static void test_dynamic_return_kick(int kvm_fd)
 	detach_vcpu(domain_fd, 40, 6);
 	close(domain_fd);
 	kvm_vm_free(vm);
+}
+
+static void test_dynamic_return_kick(int kvm_fd)
+{
+	uint32_t i;
+
+	for (i = 0; i < 64; i++)
+		test_dynamic_return_kick_once(kvm_fd);
 }
 
 static void test_dynamic_kick_and_cancel(int kvm_fd)
