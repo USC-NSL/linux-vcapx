@@ -1976,6 +1976,7 @@ static uint64_t halt_wake_stress_interrupts;
 
 #define HALT_WAKE_VECTOR 0x42
 #define HALT_WAKE_STRESS_ITERATIONS 256
+#define INTERRUPT_MIGRATION_ITERATIONS 512
 #define LIFECYCLE_STRESS_ITERATIONS 64
 
 static void guest_halt_wake_handler(struct ex_regs *regs)
@@ -4558,6 +4559,224 @@ static void test_halt_wake_dispatch_stress(int kvm_fd)
 	kvm_vm_free(vm);
 }
 
+static void test_cross_vm_halt_interrupt_migration(int kvm_fd)
+{
+	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
+				  KVM_EXEC_FEATURE_INTRA_VM_CHAIN |
+				  KVM_EXEC_FEATURE_CROSS_VM_CHAIN |
+				  KVM_EXEC_FEATURE_DYNAMIC_DISPATCH |
+				  KVM_EXEC_FEATURE_SYNC_EXITS |
+				  KVM_EXEC_FEATURE_LIFECYCLE_STATE;
+	const uint64_t capsule_ids[2] = { 831, 842 };
+	const uint64_t generations[2] = { 13, 24 };
+	struct kvm_exec_query_capsule capsules[2] = { };
+	struct kvm_exec_query_executor executor = {
+		.size = sizeof(executor),
+	};
+	struct kvm_exec_command command;
+	struct kvm_exec_completion completion;
+	struct kvm_exec_run_dispatch run;
+	struct dispatch_mapping mapping;
+	struct kvm_interrupt irq = { .irq = HALT_WAKE_VECTOR };
+	struct kvm_vcpu *vcpus[2];
+	struct kvm_vm *vms[2];
+	uint64_t *blocks[2], *interrupts[2];
+	uint64_t expected_interrupts[2] = { };
+	uint64_t domain_generation, executor_generation;
+	uint64_t capsule_runtime = 0, sequence = 0;
+	int domain_fd, executor_fd, current = -1;
+	int target, other, ret, i, j;
+
+	for (i = 0; i < 2; i++) {
+		vms[i] = __vm_create_without_irqchip(VM_SHAPE_DEFAULT, 1, 0);
+		vcpus[i] = vm_vcpu_add(vms[i], 0, guest_halt_wake_stress);
+		disable_nested_cpuid(vcpus[i]);
+		vm_init_descriptor_tables(vms[i]);
+		vcpu_init_descriptor_tables(vcpus[i]);
+		vm_install_exception_handler(vms[i], HALT_WAKE_VECTOR,
+					     guest_halt_wake_stress_handler);
+		blocks[i] = addr_gva2hva(vms[i],
+					 (vm_vaddr_t)&halt_wake_stress_blocks);
+		interrupts[i] =
+			addr_gva2hva(vms[i],
+				     (vm_vaddr_t)&halt_wake_stress_interrupts);
+		WRITE_ONCE(*blocks[i], 0);
+		WRITE_ONCE(*interrupts[i], 0);
+	}
+
+	domain_fd = create_domain_with_features(kvm_fd, 2, 1, features,
+						&domain_generation);
+	for (i = 0; i < 2; i++)
+		attach_vcpu(domain_fd, vcpus[i]->fd, capsule_ids[i],
+			    generations[i]);
+	executor_fd = create_executor(domain_fd, 0x830,
+				      &executor_generation);
+	mapping = map_dispatch(executor_fd);
+
+	for (target = 0; target < 2; target++) {
+		command = (struct kvm_exec_command) {
+			.opcode = KVM_EXEC_CMD_SWITCH,
+			.request_sequence = ++sequence,
+			.domain_generation = domain_generation,
+			.executor_generation = executor_generation,
+			.expected_current_id = current < 0 ? 0 :
+				capsule_ids[current],
+			.expected_current_generation = current < 0 ? 0 :
+				generations[current],
+			.target_capsule_id = capsule_ids[target],
+			.target_lifecycle_generation = generations[target],
+		};
+		TEST_ASSERT(publish_dispatch_command(&mapping, command),
+			    "initial interrupt-migration command did not publish");
+		run = run_dispatch_once(executor_fd, domain_generation,
+					executor_generation);
+		TEST_ASSERT_EQ(run.return_reason, KVM_EXEC_RETURN_VCPU_EXIT);
+		TEST_ASSERT_EQ(run.vcpu_exit_reason, KVM_EXIT_HLT);
+		completion = consume_dispatch_completion(&mapping);
+		TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_APPLIED);
+		TEST_ASSERT_EQ(READ_ONCE(*blocks[target]), 1);
+		TEST_ASSERT_EQ(READ_ONCE(*interrupts[target]), 0);
+		current = target;
+	}
+
+	for (i = 0; i < INTERRUPT_MIGRATION_ITERATIONS; i++) {
+		target = 1 - current;
+		other = current;
+		capsules[target] = (struct kvm_exec_query_capsule) {
+			.size = sizeof(capsules[target]),
+			.domain_generation = domain_generation,
+			.capsule_id = capsule_ids[target],
+			.lifecycle_generation = generations[target],
+		};
+		ret = ioctl(domain_fd, KVM_EXEC_QUERY_CAPSULE,
+			    &capsules[target]);
+		TEST_ASSERT(!ret,
+			    KVM_IOCTL_ERROR(KVM_EXEC_QUERY_CAPSULE, ret));
+		TEST_ASSERT_EQ(capsules[target].state,
+			       KVM_EXEC_CAPSULE_STATE_BLOCKED_HLT);
+		TEST_ASSERT_EQ(capsules[target].wake_count,
+			       expected_interrupts[target]);
+
+		ret = ioctl(vcpus[target]->fd, KVM_INTERRUPT, &irq);
+		TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_INTERRUPT, ret));
+		for (j = 0; j < 32; j++)
+			sched_yield();
+		TEST_ASSERT_EQ(READ_ONCE(*blocks[target]),
+			       expected_interrupts[target] + 1);
+		TEST_ASSERT_EQ(READ_ONCE(*interrupts[target]),
+			       expected_interrupts[target]);
+		TEST_ASSERT_EQ(READ_ONCE(*interrupts[other]),
+			       expected_interrupts[other]);
+
+		memset(&capsules[target].state, 0,
+		       sizeof(capsules[target]) -
+		       offsetof(struct kvm_exec_query_capsule, state));
+		ret = ioctl(domain_fd, KVM_EXEC_QUERY_CAPSULE,
+			    &capsules[target]);
+		TEST_ASSERT(!ret,
+			    KVM_IOCTL_ERROR(KVM_EXEC_QUERY_CAPSULE, ret));
+		TEST_ASSERT_EQ(capsules[target].state,
+			       KVM_EXEC_CAPSULE_STATE_READY);
+		TEST_ASSERT_EQ(capsules[target].wake_count,
+			       expected_interrupts[target] + 1);
+
+		command = (struct kvm_exec_command) {
+			.opcode = KVM_EXEC_CMD_SWITCH,
+			.request_sequence = ++sequence,
+			.domain_generation = domain_generation,
+			.executor_generation = executor_generation,
+			.expected_current_id = capsule_ids[current],
+			.expected_current_generation = generations[current],
+			.target_capsule_id = capsule_ids[target],
+			.target_lifecycle_generation = generations[target],
+		};
+		TEST_ASSERT(publish_dispatch_command(&mapping, command),
+			    "interrupt-migration command did not publish");
+		run = run_dispatch_once(executor_fd, domain_generation,
+					executor_generation);
+		TEST_ASSERT_EQ(run.return_reason, KVM_EXEC_RETURN_VCPU_EXIT);
+		TEST_ASSERT_EQ(run.vcpu_exit_reason, KVM_EXIT_HLT);
+		completion = consume_dispatch_completion(&mapping);
+		TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_APPLIED);
+		TEST_ASSERT_EQ(completion.previous_capsule_id,
+			       capsule_ids[current]);
+		TEST_ASSERT_EQ(completion.owned_capsule_id,
+			       capsule_ids[target]);
+		expected_interrupts[target]++;
+		TEST_ASSERT_EQ(READ_ONCE(*blocks[target]),
+			       expected_interrupts[target] + 1);
+		TEST_ASSERT_EQ(READ_ONCE(*interrupts[target]),
+			       expected_interrupts[target]);
+		TEST_ASSERT_EQ(READ_ONCE(*interrupts[other]),
+			       expected_interrupts[other]);
+		current = target;
+	}
+
+	command = (struct kvm_exec_command) {
+		.opcode = KVM_EXEC_CMD_RELEASE,
+		.request_sequence = ++sequence,
+		.domain_generation = domain_generation,
+		.executor_generation = executor_generation,
+		.expected_current_id = capsule_ids[current],
+		.expected_current_generation = generations[current],
+	};
+	TEST_ASSERT(publish_dispatch_command(&mapping, command),
+		    "interrupt-migration release did not publish");
+	run = run_dispatch_once(executor_fd, domain_generation,
+				executor_generation);
+	TEST_ASSERT_EQ(run.return_reason, KVM_EXEC_RETURN_DISPATCH_EMPTY);
+	completion = consume_dispatch_completion(&mapping);
+	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_RETURNED);
+	control_domain(domain_fd, KVM_EXEC_PAUSE);
+	control_domain(domain_fd, KVM_EXEC_DRAIN);
+
+	for (i = 0; i < 2; i++) {
+		capsules[i] = (struct kvm_exec_query_capsule) {
+			.size = sizeof(capsules[i]),
+			.domain_generation = domain_generation,
+			.capsule_id = capsule_ids[i],
+			.lifecycle_generation = generations[i],
+		};
+		ret = ioctl(domain_fd, KVM_EXEC_QUERY_CAPSULE, &capsules[i]);
+		TEST_ASSERT(!ret,
+			    KVM_IOCTL_ERROR(KVM_EXEC_QUERY_CAPSULE, ret));
+		TEST_ASSERT_EQ(capsules[i].state,
+			       KVM_EXEC_CAPSULE_STATE_BLOCKED_HLT);
+		TEST_ASSERT_EQ(capsules[i].owner_executor_generation, 0);
+		TEST_ASSERT_EQ(capsules[i].run_count,
+			       expected_interrupts[i] + 1);
+		TEST_ASSERT_EQ(capsules[i].exit_count, capsules[i].run_count);
+		TEST_ASSERT_EQ(capsules[i].halt_count, capsules[i].run_count);
+		TEST_ASSERT_EQ(capsules[i].wake_count, expected_interrupts[i]);
+		TEST_ASSERT_EQ(READ_ONCE(*interrupts[i]),
+			       expected_interrupts[i]);
+		capsule_runtime += capsules[i].runtime_ns;
+	}
+	executor.domain_generation = domain_generation;
+	executor.executor_generation = executor_generation;
+	ret = ioctl(executor_fd, KVM_EXEC_QUERY_EXECUTOR, &executor);
+	TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_EXEC_QUERY_EXECUTOR, ret));
+	TEST_ASSERT_EQ(executor.state, KVM_EXEC_EXECUTOR_STATE_PAUSED);
+	TEST_ASSERT_EQ(executor.current_capsule_id, 0);
+	TEST_ASSERT_EQ(executor.run_count,
+		       INTERRUPT_MIGRATION_ITERATIONS + 2);
+	TEST_ASSERT_EQ(executor.exit_count, executor.run_count);
+	TEST_ASSERT_EQ(executor.switch_count, executor.run_count);
+	TEST_ASSERT_EQ(executor.release_count, 1);
+	TEST_ASSERT_EQ(executor.rejected_count, 0);
+	TEST_ASSERT_EQ(executor.cancelled_count, 0);
+	TEST_ASSERT_EQ(executor.failure_count, 0);
+	TEST_ASSERT_EQ(executor.runtime_ns, capsule_runtime);
+
+	munmap(mapping.header, KVM_EXEC_DISPATCH_MMAP_SIZE);
+	close(executor_fd);
+	for (i = 0; i < 2; i++)
+		detach_vcpu(domain_fd, capsule_ids[i], generations[i]);
+	close(domain_fd);
+	kvm_vm_free(vms[1]);
+	kvm_vm_free(vms[0]);
+}
+
 static void test_fd_close_orders(int kvm_fd)
 {
 	static const int orders[24][4] = {
@@ -5213,6 +5432,11 @@ int main(int argc, char **argv)
 		close(kvm_fd);
 		return 0;
 	}
+	if (argc == 2 && !strcmp(argv[1], "--interrupt-migration-only")) {
+		test_cross_vm_halt_interrupt_migration(kvm_fd);
+		close(kvm_fd);
+		return 0;
+	}
 	if (argc == 2 && !strcmp(argv[1], "--lifecycle-stress-only")) {
 		test_repeated_capsule_lifecycle(kvm_fd);
 		close(kvm_fd);
@@ -5252,6 +5476,7 @@ int main(int argc, char **argv)
 	test_attached_capsule_accepts_interrupt_before_entry(kvm_fd);
 	test_halt_wake_requires_exact_dispatch(kvm_fd);
 	test_halt_wake_dispatch_stress(kvm_fd);
+	test_cross_vm_halt_interrupt_migration(kvm_fd);
 	test_fd_close_orders(kvm_fd);
 	test_repeated_capsule_lifecycle(kvm_fd);
 	test_wrong_mm(kvm_fd, argv[0]);
