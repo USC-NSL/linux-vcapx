@@ -3569,7 +3569,9 @@ static void test_dynamic_kick_and_cancel(int kvm_fd)
 static void test_dynamic_ring_backpressure_and_corruption(int kvm_fd)
 {
 	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
-				  KVM_EXEC_FEATURE_DYNAMIC_DISPATCH;
+				  KVM_EXEC_FEATURE_DYNAMIC_DISPATCH |
+				  KVM_EXEC_FEATURE_SYNC_EXITS |
+				  KVM_EXEC_FEATURE_LIFECYCLE_STATE;
 	struct kvm_exec_command command = {
 		.opcode = KVM_EXEC_CMD_SWITCH,
 		.target_capsule_id = 999,
@@ -3580,6 +3582,9 @@ static void test_dynamic_ring_backpressure_and_corruption(int kvm_fd)
 		.flags = KVM_EXEC_DISPATCH_F_RETURN_IF_EMPTY,
 	};
 	struct kvm_exec_completion completion;
+	struct kvm_exec_query_executor query = {
+		.size = sizeof(query),
+	};
 	struct dispatch_mapping mapping;
 	uint64_t domain_generation, executor_generation;
 	int domain_fd, executor_fd, ret, i;
@@ -3662,6 +3667,13 @@ static void test_dynamic_ring_backpressure_and_corruption(int kvm_fd)
 	TEST_ASSERT_EQ(run.run_result, -EPROTO);
 	TEST_ASSERT_EQ(run.corruption_count, 1);
 	TEST_ASSERT_EQ(mapping.header->kernel_corruption_count, 1);
+	query.domain_generation = domain_generation;
+	query.executor_generation = executor_generation;
+	ret = ioctl(executor_fd, KVM_EXEC_QUERY_EXECUTOR, &query);
+	TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_EXEC_QUERY_EXECUTOR, ret));
+	TEST_ASSERT_EQ(query.failure_count, 2);
+	TEST_ASSERT(query.rejected_count > KVM_EXEC_DISPATCH_RING_ENTRIES,
+		    "rejected command accounting did not advance");
 
 	munmap(mapping.header, KVM_EXEC_DISPATCH_MMAP_SIZE);
 	close(executor_fd);
@@ -4176,6 +4188,31 @@ static void test_halt_wake_requires_exact_dispatch(int kvm_fd)
 	TEST_ASSERT_EQ(run.return_reason, KVM_EXEC_RETURN_DISPATCH_EMPTY);
 	completion = consume_dispatch_completion(&mapping);
 	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_RETURNED);
+	memset(&executor.state, 0,
+	       sizeof(executor) - offsetof(struct kvm_exec_query_executor, state));
+	ret = ioctl(executor_fd, KVM_EXEC_QUERY_EXECUTOR, &executor);
+	TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_EXEC_QUERY_EXECUTOR, ret));
+	TEST_ASSERT_EQ(executor.state, KVM_EXEC_EXECUTOR_STATE_IDLE);
+	TEST_ASSERT_EQ(executor.current_capsule_id, 0);
+	TEST_ASSERT_EQ(executor.run_count, 2);
+	TEST_ASSERT_EQ(executor.switch_count, 1);
+	TEST_ASSERT_EQ(executor.release_count, 1);
+	TEST_ASSERT_EQ(executor.rejected_count, 1);
+	TEST_ASSERT_EQ(executor.cancelled_count, 0);
+	TEST_ASSERT_EQ(executor.exit_count, 1);
+	TEST_ASSERT_EQ(executor.failure_count, 0);
+	memset(&capsule.state, 0,
+	       sizeof(capsule) - offsetof(struct kvm_exec_query_capsule, state));
+	ret = ioctl(domain_fd, KVM_EXEC_QUERY_CAPSULE, &capsule);
+	TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_EXEC_QUERY_CAPSULE, ret));
+	TEST_ASSERT_EQ(capsule.state, KVM_EXEC_CAPSULE_STATE_READY);
+	TEST_ASSERT_EQ(capsule.owner_executor_generation, 0);
+	TEST_ASSERT_EQ(capsule.owner_cookie, 0);
+	TEST_ASSERT_EQ(capsule.run_count, executor.run_count);
+	TEST_ASSERT_EQ(capsule.exit_count, executor.exit_count);
+	TEST_ASSERT_EQ(capsule.halt_count, 1);
+	TEST_ASSERT_EQ(capsule.wake_count, 1);
+	TEST_ASSERT_EQ(capsule.runtime_ns, executor.runtime_ns);
 
 	control_domain(domain_fd, KVM_EXEC_PAUSE);
 	control_domain(domain_fd, KVM_EXEC_DRAIN);

@@ -1888,6 +1888,17 @@ static bool kvm_exec_consume_return_kick(struct kvm_exec_executor *executor)
 	return executor->mapped_boundary_return_kick_epoch < epoch;
 }
 
+static bool kvm_exec_dispatch_failed(const struct kvm_exec_run_dispatch *run)
+{
+	if (run->return_reason == KVM_EXEC_RETURN_DISPATCH_EMPTY)
+		return !(run->flags & KVM_EXEC_DISPATCH_F_RETURN_IF_EMPTY);
+
+	return run->return_reason == KVM_EXEC_RETURN_CPU_MIGRATED ||
+	       run->return_reason == KVM_EXEC_RETURN_COMPLETION_FULL ||
+	       run->return_reason == KVM_EXEC_RETURN_DISPATCH_CORRUPT ||
+	       run->return_reason == KVM_EXEC_RETURN_INVALID_COMPLETION;
+}
+
 static void kvm_exec_dispatch_run_owner(struct kvm_exec_executor *executor,
 					struct kvm_exec_run_dispatch *run)
 {
@@ -2311,6 +2322,8 @@ command_done:
 	run.reserved0 = 0;
 	executor->return_count++;
 	WRITE_ONCE(header->executor_return_count, executor->return_count);
+	if (kvm_exec_dispatch_failed(&run))
+		atomic64_inc(&executor->failure_count);
 	ret = copy_to_user(argp, &run, sizeof(run)) ? -EFAULT : 0;
 	goto out_executor;
 
