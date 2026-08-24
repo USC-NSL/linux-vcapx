@@ -1980,6 +1980,16 @@ command_done:
 			run.run_result = -EINTR;
 			break;
 		}
+		/*
+		 * A dispatcher kick can race with the transition between two
+		 * kvm_vcpu_run() calls.  Remove any request left by a kick that the
+		 * dispatcher has already observed, then order that removal before the
+		 * final epoch check.  A later kick either changes the epoch and blocks
+		 * entry or observes capsule->running and interrupts the new run.
+		 */
+		kvm_clear_request(KVM_REQ_EXEC_DOMAIN_EXIT, capsule->vcpu);
+		/* Order the request removal before reading the writer's epoch. */
+		smp_mb__after_atomic();
 		kick_pending = atomic64_read(&executor->kick_epoch) !=
 			       seen_kick_epoch;
 		entry_allowed = !READ_ONCE(domain->stopping) &&
