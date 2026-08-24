@@ -2164,14 +2164,26 @@ static long kvm_exec_kick(struct kvm_exec_executor *executor,
 		return -ESHUTDOWN;
 	}
 	epoch = atomic64_inc_return(&executor->kick_epoch);
-	if (kick.flags & KVM_EXEC_KICK_F_RETURN_TO_VMM)
-		atomic64_inc(&executor->return_kick_epoch);
+	capsule = executor->current_capsule;
+	if (kick.flags & KVM_EXEC_KICK_F_RETURN_TO_VMM) {
+		u64 return_epoch =
+			atomic64_inc_return(&executor->return_kick_epoch);
+
+		/*
+		 * A mapped exit is already a userspace-visible service boundary.
+		 * If the return request races behind its publication, satisfy the
+		 * request at that boundary instead of forcing a redundant ioctl
+		 * return before the next exact command.
+		 */
+		if (capsule && capsule->exit.async_request_pending)
+			executor->mapped_boundary_return_kick_epoch =
+				return_epoch;
+	}
 	header = kvm_exec_dispatch_header(executor);
 	WRITE_ONCE(header->kernel_kick_count, epoch);
 	WRITE_ONCE(header->last_kick_sequence, kick.request_sequence);
 	WRITE_ONCE(header->last_kick_ns, ktime_get_ns());
 
-	capsule = executor->current_capsule;
 	if (capsule && capsule->running) {
 		kvm_make_request(KVM_REQ_EXEC_DOMAIN_EXIT, capsule->vcpu);
 		kvm_make_request(KVM_REQ_UNBLOCK, capsule->vcpu);
