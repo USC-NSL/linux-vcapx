@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/fsuid.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
@@ -4994,6 +4995,46 @@ static void test_wrong_mm(int kvm_fd, const char *self_path)
 	close(domain_fd);
 }
 
+struct credential_access_arg {
+	int domain_fd;
+	int ret;
+	int error;
+	uid_t old_fsuid;
+};
+
+static void *credential_access_runner(void *opaque)
+{
+	struct kvm_exec_domain_control control = { .size = sizeof(control) };
+	struct credential_access_arg *arg = opaque;
+
+	arg->old_fsuid = setfsuid(65534);
+	errno = 0;
+	arg->ret = ioctl(arg->domain_fd, KVM_EXEC_PAUSE, &control);
+	arg->error = errno;
+	setfsuid(arg->old_fsuid);
+	return NULL;
+}
+
+static void test_same_mm_credential_change(int kvm_fd)
+{
+	struct credential_access_arg arg = { };
+	uint64_t generation;
+	pthread_t thread;
+
+	if (geteuid())
+		return;
+	arg.domain_fd = create_domain(kvm_fd, 1, 1, &generation);
+	TEST_ASSERT(!pthread_create(&thread, NULL, credential_access_runner,
+				    &arg),
+		    "credential test thread creation failed");
+	pthread_join(thread, NULL);
+	TEST_ASSERT_EQ(arg.old_fsuid, 0);
+	TEST_ASSERT(arg.ret == -1 && arg.error == EACCES,
+		    "same-mm changed credential returned %d errno %d",
+		    arg.ret, arg.error);
+	close(arg.domain_fd);
+}
+
 static void test_malformed_and_stale_requests(int kvm_fd)
 {
 	struct kvm_exec_domain_create bad_create = {
@@ -5447,6 +5488,11 @@ int main(int argc, char **argv)
 		close(kvm_fd);
 		return 0;
 	}
+	if (argc == 2 && !strcmp(argv[1], "--credential-only")) {
+		test_same_mm_credential_change(kvm_fd);
+		close(kvm_fd);
+		return 0;
+	}
 	if (argc == 2 && !strcmp(argv[1], "--sync-exits-only")) {
 		test_dynamic_synchronous_exits(kvm_fd);
 		test_sync_exit_kick_preserves_completion(kvm_fd);
@@ -5480,6 +5526,7 @@ int main(int argc, char **argv)
 	test_fd_close_orders(kvm_fd);
 	test_repeated_capsule_lifecycle(kvm_fd);
 	test_wrong_mm(kvm_fd, argv[0]);
+	test_same_mm_credential_change(kvm_fd);
 	test_malformed_and_stale_requests(kvm_fd);
 	test_lifecycle_query_validation(kvm_fd);
 	test_deterministic_malformed_fuzz(kvm_fd);
