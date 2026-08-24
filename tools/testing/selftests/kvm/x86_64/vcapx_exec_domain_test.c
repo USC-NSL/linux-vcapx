@@ -2818,6 +2818,16 @@ static void test_async_pio_write_switch(int kvm_fd)
 	TEST_ASSERT_EQ(mapping.header->executor_return_count, 0);
 
 	publish_exit_completion(&mapping, request);
+	kick_dispatch(run_arg.executor_fd, domain_generation,
+		      executor_generation, request.exit_sequence);
+	/*
+	 * Completing the PIO instruction does not authorize the resident capsule
+	 * to continue.  The executor must remain in KVM until userspace publishes
+	 * an exact command for either this capsule or another target.
+	 */
+	usleep(20000);
+	TEST_ASSERT_EQ(READ_ONCE(*progress), 0);
+	TEST_ASSERT_EQ(mapping.header->executor_return_count, 0);
 	command = (struct kvm_exec_command) {
 		.opcode = KVM_EXEC_CMD_SWITCH,
 		.request_sequence = 2,

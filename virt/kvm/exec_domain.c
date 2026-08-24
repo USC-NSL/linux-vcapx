@@ -35,6 +35,7 @@ struct kvm_exec_exit_state {
 	bool async_request_pending;
 	bool async_completion_ready;
 	bool async_entry_authorized;
+	bool async_reentry_required;
 };
 
 struct kvm_exec_capsule {
@@ -64,6 +65,7 @@ struct kvm_exec_executor {
 	atomic64_t kick_epoch;
 	atomic64_t return_kick_epoch;
 	u64 consumed_return_kick_epoch;
+	u64 mapped_boundary_return_kick_epoch;
 	u64 command_head;
 	u64 completion_tail;
 	u64 exit_request_tail;
@@ -1303,9 +1305,12 @@ kvm_exec_async_publish(struct kvm_exec_executor *executor,
 	slot = &kvm_exec_exit_requests(executor)
 		[executor->exit_request_tail % KVM_EXEC_DISPATCH_RING_ENTRIES];
 	memcpy(slot, &request, sizeof(request));
+	executor->mapped_boundary_return_kick_epoch =
+		atomic64_read(&executor->return_kick_epoch);
 	capsule->exit.async_request_pending = true;
 	capsule->exit.async_completion_ready = false;
 	capsule->exit.async_entry_authorized = false;
+	capsule->exit.async_reentry_required = true;
 	executor->exit_request_tail++;
 	/* The request and capsule state are visible before userspace sees tail. */
 	smp_store_release(&header->exit_request_tail,
@@ -1378,7 +1383,8 @@ static bool kvm_exec_async_blocks_entry(struct kvm_exec_capsule *capsule)
 {
 	return capsule->exit.async_request_pending ||
 	       (capsule->exit.async_completion_ready &&
-		!capsule->exit.async_entry_authorized);
+		!capsule->exit.async_entry_authorized) ||
+	       capsule->exit.async_reentry_required;
 }
 
 static int
@@ -1619,6 +1625,7 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 	} else if (command.opcode == KVM_EXEC_CMD_RELEASE) {
 		if (current_capsule) {
 			current_capsule->exit.async_entry_authorized = false;
+			current_capsule->exit.async_reentry_required = false;
 			current_capsule->owner = NULL;
 		}
 		executor->current_capsule = NULL;
@@ -1627,6 +1634,7 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 		if (current_capsule != target) {
 			if (current_capsule) {
 				current_capsule->exit.async_entry_authorized = false;
+				current_capsule->exit.async_reentry_required = false;
 				current_capsule->owner = NULL;
 			}
 			target->owner = executor;
@@ -1634,6 +1642,7 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 		}
 		if (target->exit.async_completion_ready)
 			target->exit.async_entry_authorized = true;
+		target->exit.async_reentry_required = false;
 		status = KVM_EXEC_COMPLETE_APPLIED;
 	}
 	executor->inflight_sequence = 0;
@@ -1699,16 +1708,14 @@ static bool kvm_exec_ready(struct kvm_exec_executor *executor, u64 kick_epoch)
 	       exit_completion_tail != executor->exit_completion_head;
 }
 
-static bool
-kvm_exec_consume_return_kick(struct kvm_exec_executor *executor,
-			     bool mapped_boundary)
+static bool kvm_exec_consume_return_kick(struct kvm_exec_executor *executor)
 {
 	u64 epoch = atomic64_read(&executor->return_kick_epoch);
 
 	if (epoch == executor->consumed_return_kick_epoch)
 		return false;
 	executor->consumed_return_kick_epoch = epoch;
-	return !mapped_boundary;
+	return executor->mapped_boundary_return_kick_epoch < epoch;
 }
 
 static void kvm_exec_dispatch_run_owner(struct kvm_exec_executor *executor,
@@ -1802,7 +1809,6 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 		bool entry_allowed;
 		bool invalid_completion = false;
 		bool async_published = false;
-		bool mapped_boundary;
 		bool pending_after_run = false;
 		bool kick_pending;
 		bool return_to_vmm;
@@ -1836,9 +1842,7 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 
 		mutex_lock(&domain->lock);
 		capsule = executor->current_capsule;
-		mapped_boundary = capsule &&
-			capsule->exit.async_request_pending;
-		return_to_vmm = kvm_exec_consume_return_kick(executor, mapped_boundary);
+		return_to_vmm = kvm_exec_consume_return_kick(executor);
 		if (return_to_vmm) {
 			run.return_reason = KVM_EXEC_RETURN_SIGNAL;
 			run.run_result = -EINTR;
