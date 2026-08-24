@@ -3961,6 +3961,150 @@ static void test_dynamic_two_executor_migration(int kvm_fd)
 	kvm_vm_free(vms[0]);
 }
 
+static void test_accounting_across_executors(int kvm_fd)
+{
+	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
+				  KVM_EXEC_FEATURE_INTRA_VM_CHAIN |
+				  KVM_EXEC_FEATURE_CROSS_VM_CHAIN |
+				  KVM_EXEC_FEATURE_DYNAMIC_DISPATCH |
+				  KVM_EXEC_FEATURE_SYNC_EXITS |
+				  KVM_EXEC_FEATURE_LIFECYCLE_STATE;
+	const uint64_t capsule_ids[2] = { 941, 952 };
+	const uint64_t generations[2] = { 31, 42 };
+	struct kvm_exec_query_capsule capsules[2] = { };
+	struct kvm_exec_query_executor executors[2] = { };
+	struct dispatch_mapping mappings[2];
+	struct kvm_exec_completion completion;
+	struct kvm_exec_run_dispatch run;
+	struct kvm_exec_command command;
+	struct kvm_vcpu *vcpus[2];
+	struct kvm_vm *vms[2];
+	uint64_t domain_generation, executor_generations[2];
+	uint64_t capsule_runtime = 0, executor_runtime = 0;
+	int executor_fds[2], domain_fd, phase, target, ret, i;
+
+	for (i = 0; i < 2; i++) {
+		vms[i] = vm_create_with_one_vcpu(&vcpus[i],
+						 guest_async_recipient);
+		disable_nested_cpuid(vcpus[i]);
+	}
+	domain_fd = create_domain_with_features(kvm_fd, 2, 2, features,
+						&domain_generation);
+	for (i = 0; i < 2; i++) {
+		attach_vcpu(domain_fd, vcpus[i]->fd, capsule_ids[i],
+			    generations[i]);
+		executor_fds[i] =
+			create_executor(domain_fd, 0x940 + i,
+					&executor_generations[i]);
+		mappings[i] = map_dispatch(executor_fds[i]);
+	}
+
+	for (phase = 0; phase < 2; phase++) {
+		if (phase) {
+			for (i = 0; i < 2; i++) {
+				command = (struct kvm_exec_command) {
+					.opcode = KVM_EXEC_CMD_RELEASE,
+					.request_sequence = 2,
+					.domain_generation = domain_generation,
+					.executor_generation =
+						executor_generations[i],
+					.expected_current_id = capsule_ids[i],
+					.expected_current_generation =
+						generations[i],
+				};
+				TEST_ASSERT(publish_dispatch_command(&mappings[i], command),
+					    "accounting release did not publish");
+				run = run_dispatch_once(executor_fds[i],
+							domain_generation,
+							executor_generations[i]);
+				TEST_ASSERT_EQ(run.return_reason,
+					       KVM_EXEC_RETURN_DISPATCH_EMPTY);
+				completion = consume_dispatch_completion(&mappings[i]);
+				TEST_ASSERT_EQ(completion.status,
+					       KVM_EXEC_COMPLETE_RETURNED);
+			}
+		}
+
+		for (i = 0; i < 2; i++) {
+			target = phase ? 1 - i : i;
+			command = (struct kvm_exec_command) {
+				.opcode = KVM_EXEC_CMD_SWITCH,
+				.request_sequence = phase ? 3 : 1,
+				.domain_generation = domain_generation,
+				.executor_generation = executor_generations[i],
+				.target_capsule_id = capsule_ids[target],
+				.target_lifecycle_generation =
+					generations[target],
+			};
+			TEST_ASSERT(publish_dispatch_command(&mappings[i], command),
+				    "accounting switch did not publish");
+			run = run_dispatch_once(executor_fds[i], domain_generation,
+						executor_generations[i]);
+			TEST_ASSERT_EQ(run.return_reason,
+				       KVM_EXEC_RETURN_VCPU_EXIT);
+			TEST_ASSERT_EQ(run.vcpu_exit_reason, KVM_EXIT_SHUTDOWN);
+			completion = consume_dispatch_completion(&mappings[i]);
+			TEST_ASSERT_EQ(completion.status,
+				       KVM_EXEC_COMPLETE_APPLIED);
+			TEST_ASSERT_EQ(completion.owned_capsule_id,
+				       capsule_ids[target]);
+		}
+	}
+
+	control_domain(domain_fd, KVM_EXEC_PAUSE);
+	control_domain(domain_fd, KVM_EXEC_DRAIN);
+	for (i = 0; i < 2; i++) {
+		capsules[i] = (struct kvm_exec_query_capsule) {
+			.size = sizeof(capsules[i]),
+			.domain_generation = domain_generation,
+			.capsule_id = capsule_ids[i],
+			.lifecycle_generation = generations[i],
+		};
+		ret = ioctl(domain_fd, KVM_EXEC_QUERY_CAPSULE, &capsules[i]);
+		TEST_ASSERT(!ret,
+			    KVM_IOCTL_ERROR(KVM_EXEC_QUERY_CAPSULE, ret));
+		TEST_ASSERT_EQ(capsules[i].state,
+			       KVM_EXEC_CAPSULE_STATE_READY);
+		TEST_ASSERT_EQ(capsules[i].owner_executor_generation, 0);
+		TEST_ASSERT_EQ(capsules[i].run_count, 2);
+		TEST_ASSERT_EQ(capsules[i].exit_count, 2);
+		TEST_ASSERT(capsules[i].runtime_ns,
+			    "capsule %d recorded no runtime", i);
+		capsule_runtime += capsules[i].runtime_ns;
+
+		executors[i] = (struct kvm_exec_query_executor) {
+			.size = sizeof(executors[i]),
+			.domain_generation = domain_generation,
+			.executor_generation = executor_generations[i],
+		};
+		ret = ioctl(executor_fds[i], KVM_EXEC_QUERY_EXECUTOR,
+			    &executors[i]);
+		TEST_ASSERT(!ret,
+			    KVM_IOCTL_ERROR(KVM_EXEC_QUERY_EXECUTOR, ret));
+		TEST_ASSERT_EQ(executors[i].state,
+			       KVM_EXEC_EXECUTOR_STATE_PAUSED);
+		TEST_ASSERT_EQ(executors[i].current_capsule_id, 0);
+		TEST_ASSERT_EQ(executors[i].run_count, 2);
+		TEST_ASSERT_EQ(executors[i].exit_count, 2);
+		TEST_ASSERT_EQ(executors[i].switch_count, 2);
+		TEST_ASSERT_EQ(executors[i].release_count, 1);
+		TEST_ASSERT_EQ(executors[i].rejected_count, 0);
+		TEST_ASSERT_EQ(executors[i].cancelled_count, 0);
+		TEST_ASSERT_EQ(executors[i].failure_count, 0);
+		executor_runtime += executors[i].runtime_ns;
+	}
+	TEST_ASSERT_EQ(capsule_runtime, executor_runtime);
+
+	for (i = 0; i < 2; i++) {
+		munmap(mappings[i].header, KVM_EXEC_DISPATCH_MMAP_SIZE);
+		close(executor_fds[i]);
+		detach_vcpu(domain_fd, capsule_ids[i], generations[i]);
+	}
+	close(domain_fd);
+	kvm_vm_free(vms[1]);
+	kvm_vm_free(vms[0]);
+}
+
 static void run_executor_boundary_test(int kvm_fd, bool pause)
 {
 	struct executor_run_arg run_arg = { };
@@ -4454,9 +4598,6 @@ static void test_repeated_capsule_lifecycle(int kvm_fd)
 	struct kvm_exec_query_executor executor = {
 		.size = sizeof(executor),
 	};
-	struct kvm_guest_debug debug = {
-		.control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_SINGLESTEP,
-	};
 	struct kvm_exec_attach_vcpu stale_attach = {
 		.size = sizeof(stale_attach),
 		.capsule_id = 91,
@@ -4474,9 +4615,8 @@ static void test_repeated_capsule_lifecycle(int kvm_fd)
 	for (i = 0; i < LIFECYCLE_STRESS_ITERATIONS; i++) {
 		old_generation = 2ULL * i + 1;
 		new_generation = old_generation + 1;
-		vm = vm_create_with_one_vcpu(&vcpu, guest_spin);
+		vm = vm_create_with_one_vcpu(&vcpu, guest_async_recipient);
 		disable_nested_cpuid(vcpu);
-		vcpu_guest_debug_set(vcpu, &debug);
 		domain_fd = create_domain_with_features(kvm_fd, 1, 1,
 							features,
 							&domain_generation);
@@ -4498,7 +4638,7 @@ static void test_repeated_capsule_lifecycle(int kvm_fd)
 		run = run_dispatch_once(executor_fd, domain_generation,
 					executor_generation);
 		TEST_ASSERT_EQ(run.return_reason, KVM_EXEC_RETURN_VCPU_EXIT);
-		TEST_ASSERT_EQ(run.vcpu_exit_reason, KVM_EXIT_DEBUG);
+		TEST_ASSERT_EQ(run.vcpu_exit_reason, KVM_EXIT_SHUTDOWN);
 		completion = consume_dispatch_completion(&mapping);
 		TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_APPLIED);
 
@@ -4561,7 +4701,7 @@ static void test_repeated_capsule_lifecycle(int kvm_fd)
 		run = run_dispatch_once(executor_fd, domain_generation,
 					executor_generation);
 		TEST_ASSERT_EQ(run.return_reason, KVM_EXEC_RETURN_VCPU_EXIT);
-		TEST_ASSERT_EQ(run.vcpu_exit_reason, KVM_EXIT_DEBUG);
+		TEST_ASSERT_EQ(run.vcpu_exit_reason, KVM_EXIT_SHUTDOWN);
 		completion = consume_dispatch_completion(&mapping);
 		TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_APPLIED);
 
@@ -5078,6 +5218,11 @@ int main(int argc, char **argv)
 		close(kvm_fd);
 		return 0;
 	}
+	if (argc == 2 && !strcmp(argv[1], "--accounting-only")) {
+		test_accounting_across_executors(kvm_fd);
+		close(kvm_fd);
+		return 0;
+	}
 	if (argc == 2 && !strcmp(argv[1], "--sync-exits-only")) {
 		test_dynamic_synchronous_exits(kvm_fd);
 		test_sync_exit_kick_preserves_completion(kvm_fd);
@@ -5139,6 +5284,7 @@ int main(int argc, char **argv)
 	test_sync_domain_close_pending(kvm_fd, true);
 	test_dynamic_cross_vm_seeded_trace(kvm_fd);
 	test_dynamic_two_executor_migration(kvm_fd);
+	test_accounting_across_executors(kvm_fd);
 	close(kvm_fd);
 	return 0;
 }
