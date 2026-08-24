@@ -2589,7 +2589,7 @@ static void test_dynamic_synchronous_exits(int kvm_fd)
 	TEST_ASSERT_EQ(run.return_reason, KVM_EXEC_RETURN_SIGNAL);
 	TEST_ASSERT_EQ(run.run_result, -EINTR);
 	TEST_ASSERT_EQ(run.owned_capsule_id, 61);
-	TEST_ASSERT_EQ(run.exit_sequence, 1);
+	TEST_ASSERT_EQ(run.exit_sequence, 2);
 	TEST_ASSERT_EQ(run.exit_flags, 0);
 	TEST_ASSERT_EQ(READ_ONCE(*pio_progress), 0);
 	TEST_ASSERT(!sigwait(&blocked_mask, &received_signal),
@@ -2599,7 +2599,7 @@ static void test_dynamic_synchronous_exits(int kvm_fd)
 	run = run_dispatch_once(executor_fd, domain_generation,
 				executor_generation);
 	TEST_ASSERT_EQ(run.vcpu_exit_reason, KVM_EXIT_IO);
-	TEST_ASSERT_EQ(run.exit_sequence, 2);
+	TEST_ASSERT_EQ(run.exit_sequence, 3);
 	TEST_ASSERT_EQ(run.exit_flags,
 		       KVM_EXEC_EXIT_F_COMPLETION_PENDING);
 	TEST_ASSERT_EQ(READ_ONCE(*pio_value), pio_response);
@@ -2634,7 +2634,7 @@ static void test_dynamic_synchronous_exits(int kvm_fd)
 	TEST_ASSERT_EQ(completion.owned_capsule_id, 61);
 	TEST_ASSERT_EQ(run.return_reason, KVM_EXEC_RETURN_DOMAIN_PAUSED);
 	TEST_ASSERT_EQ(run.run_result, -EINTR);
-	TEST_ASSERT_EQ(run.exit_sequence, 2);
+	TEST_ASSERT_EQ(run.exit_sequence, 3);
 	TEST_ASSERT_EQ(run.exit_flags, 0);
 	TEST_ASSERT_EQ(READ_ONCE(*pio_progress), 2);
 	control_domain(domain_fd, KVM_EXEC_DRAIN);
@@ -3296,7 +3296,8 @@ static void test_dynamic_return_kick_once(int kvm_fd)
 {
 	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
 				  KVM_EXEC_FEATURE_DYNAMIC_DISPATCH |
-				  KVM_EXEC_FEATURE_RETURN_KICK;
+				  KVM_EXEC_FEATURE_RETURN_KICK |
+				  KVM_EXEC_FEATURE_SYNC_EXITS;
 	struct kvm_exec_command command = {
 		.opcode = KVM_EXEC_CMD_SWITCH,
 		.request_sequence = 1,
@@ -3359,6 +3360,8 @@ static void test_dynamic_return_kick_once(int kvm_fd)
 	TEST_ASSERT_EQ(run_arg.run.return_reason, KVM_EXEC_RETURN_SIGNAL);
 	TEST_ASSERT_EQ(run_arg.run.run_result, -EINTR);
 	TEST_ASSERT_EQ(run_arg.run.owned_capsule_id, 40);
+	TEST_ASSERT_EQ(run_arg.run.exit_sequence, 1);
+	TEST_ASSERT_EQ(run_arg.run.exit_flags, 0);
 	TEST_ASSERT_EQ(mapping.header->executor_return_count, 1);
 
 	control_domain(domain_fd, KVM_EXEC_PAUSE);

@@ -1345,14 +1345,21 @@ static void kvm_exec_snapshot_exit(struct kvm_vcpu *vcpu,
 	}
 }
 
+static u64 kvm_exec_next_exit_sequence_locked(struct kvm_exec_capsule *capsule)
+{
+	u64 sequence = ++capsule->next_exit_sequence;
+
+	if (!sequence)
+		sequence = ++capsule->next_exit_sequence;
+	return sequence;
+}
+
 static void kvm_exec_record_exit_locked(struct kvm_exec_capsule *capsule,
 					struct kvm_exec_exit_state *exit)
 {
 	bool completion_pending = exit->completion_pending;
 
-	exit->sequence = ++capsule->next_exit_sequence;
-	if (!exit->sequence)
-		exit->sequence = ++capsule->next_exit_sequence;
+	exit->sequence = kvm_exec_next_exit_sequence_locked(capsule);
 	exit->completion_pending = false;
 	capsule->exit = *exit;
 	WRITE_ONCE(capsule->exit.completion_pending, completion_pending);
@@ -1915,6 +1922,18 @@ static void kvm_exec_dispatch_run_owner(struct kvm_exec_executor *executor,
 	if (!(executor->domain->negotiated_features &
 	      KVM_EXEC_FEATURE_SYNC_EXITS))
 		return;
+	/*
+	 * A forced return is a distinct userspace service boundary even when it
+	 * does not replace capsule->exit.  Allocate its tag in the kernel so it
+	 * cannot collide with the next architectural KVM exit.  A return while a
+	 * read completion is still pending must retain the issuing exit's tag.
+	 */
+	if (run->return_reason == KVM_EXEC_RETURN_SIGNAL &&
+	    !capsule->exit.completion_pending) {
+		run->exit_sequence =
+			kvm_exec_next_exit_sequence_locked(capsule);
+		return;
+	}
 	if (capsule->exit.sequence) {
 		run->exit_sequence = capsule->exit.sequence;
 		if (capsule->exit.completion_pending)
