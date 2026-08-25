@@ -888,6 +888,7 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_FEATURE_ASYNC_PIO_WRITE (1ULL << 5)
 #define KVM_EXEC_FEATURE_RETURN_KICK	(1ULL << 6)
 #define KVM_EXEC_FEATURE_LIFECYCLE_STATE (1ULL << 7)
+#define KVM_EXEC_FEATURE_EXACT_INTERRUPT (1ULL << 8)
 #define KVM_EXEC_CPU_ANY		((__u32)-1)
 
 #define KVM_EXEC_TRACE_MAX_ENTRIES	256U
@@ -906,6 +907,7 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_RETURN_COMPLETION_FULL	9
 #define KVM_EXEC_RETURN_DISPATCH_CORRUPT	10
 #define KVM_EXEC_RETURN_INVALID_COMPLETION 11
+#define KVM_EXEC_RETURN_INTERRUPT_FAILED 12
 
 #define KVM_EXEC_DISPATCH_ABI_VERSION	2U
 #define KVM_EXEC_DISPATCH_RING_ENTRIES	32U
@@ -1201,6 +1203,19 @@ struct kvm_exec_kick {
 
 #define KVM_EXEC_KICK_F_RETURN_TO_VMM	(1U << 0)
 
+struct kvm_exec_interrupt {
+	__u32 size;
+	__u32 flags;
+	__u64 domain_generation;
+	__u64 executor_generation;
+	__u64 request_sequence;
+	__u64 capsule_id;
+	__u64 lifecycle_generation;
+	__u32 vector;
+	__u32 reserved0;
+	__u64 reserved[2];
+};
+
 struct kvm_exec_cancel {
 	__u32 size;
 	__u32 flags;
@@ -1251,7 +1266,10 @@ struct kvm_exec_query_executor {
 	__u64 exit_count;
 	__u64 failure_count;
 	__u64 runtime_ns;
-	__u64 reserved[4];
+	__u64 interrupt_queued_count;
+	__u64 interrupt_applied_count;
+	__u64 last_interrupt_sequence;
+	__u64 pending_interrupt_sequence;
 };
 
 /*
@@ -1301,6 +1319,8 @@ struct kvm_exec_query_executor {
 				       struct kvm_exec_query_capsule)
 #define KVM_EXEC_QUERY_EXECUTOR   _IOWR(KVMIO, 0xfc, \
 				       struct kvm_exec_query_executor)
+#define KVM_EXEC_INTERRUPT        _IOW(KVMIO,  0xfd, \
+				      struct kvm_exec_interrupt)
 
 /*
  * Extension capability list.

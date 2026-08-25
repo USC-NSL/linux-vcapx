@@ -11343,6 +11343,23 @@ bool kvm_arch_vcpu_exec_copy_pio_data(struct kvm_vcpu *vcpu, void *data,
 	return true;
 }
 
+int kvm_arch_vcpu_exec_inject_interrupt(struct kvm_vcpu *vcpu, u32 vector)
+{
+	struct kvm_interrupt irq = {
+		.irq = vector,
+	};
+
+	if (vector >= KVM_NR_INTERRUPTS)
+		return -EINVAL;
+	if (!kvm_vcpu_ready_for_interrupt_injection(vcpu)) {
+		vcpu->run->request_interrupt_window = 1;
+		return -EAGAIN;
+	}
+
+	vcpu->run->request_interrupt_window = 0;
+	return kvm_vcpu_ioctl_interrupt(vcpu, &irq);
+}
+
 int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
 {
 	struct kvm_queued_exception *ex = &vcpu->arch.exception;
