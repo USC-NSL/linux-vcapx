@@ -151,6 +151,7 @@ static const struct file_operations kvm_exec_executor_fops;
 
 static void kvm_exec_interrupt_clear_retained_halt(
 	struct kvm_exec_executor *executor);
+static void kvm_exec_interrupt_abort(struct kvm_exec_executor *executor);
 
 static struct kvm_exec_dispatch_header *
 kvm_exec_dispatch_header(struct kvm_exec_executor *executor)
@@ -1824,7 +1825,7 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 					command.request_sequence)) {
 		status = KVM_EXEC_COMPLETE_CANCELLED_BEFORE_APPLY;
 	} else if (command.opcode == KVM_EXEC_CMD_RELEASE) {
-		kvm_exec_interrupt_clear_retained_halt(executor);
+		kvm_exec_interrupt_abort(executor);
 		if (current_capsule) {
 			current_capsule->exit.async_entry_authorized = false;
 			current_capsule->exit.async_reentry_required = false;
@@ -1837,8 +1838,8 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 		atomic64_inc(&executor->release_count);
 		status = KVM_EXEC_COMPLETE_RETURNED;
 	} else {
-		kvm_exec_interrupt_clear_retained_halt(executor);
 		if (current_capsule != target) {
+			kvm_exec_interrupt_abort(executor);
 			if (current_capsule) {
 				current_capsule->exit.async_entry_authorized = false;
 				current_capsule->exit.async_reentry_required = false;
@@ -2213,11 +2214,13 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 			}
 		}
 
-		interrupt_pending =
-			kvm_exec_interrupt_snapshot(executor,
-						    &pending_interrupt);
+		/*
+		 * A pending interrupt may wait indefinitely for an open guest
+		 * window.  Keep exact scheduler commands consumable so RELEASE
+		 * and cross-capsule SWITCH can supersede that request.
+		 */
 		command_ret = 0;
-		if (!completion_pending && !interrupt_pending) {
+		if (!completion_pending) {
 			bool command_blocked;
 
 			mutex_lock(&domain->lock);
@@ -2251,6 +2254,9 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 			}
 		}
 command_done:
+		interrupt_pending =
+			kvm_exec_interrupt_snapshot(executor,
+						    &pending_interrupt);
 		mutex_lock(&domain->lock);
 		if (domain->stopping) {
 			kvm_exec_interrupt_abort(executor);
