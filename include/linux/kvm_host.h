@@ -168,7 +168,6 @@ static inline bool is_error_page(struct page *page)
 #define KVM_REQ_UNBLOCK			2
 #define KVM_REQ_DIRTY_RING_SOFT_FULL	3
 #define KVM_REQ_EXEC_DOMAIN_EXIT	4
-#define KVM_REQ_EXEC_DOMAIN_INTERRUPT	5
 #define KVM_REQUEST_ARCH_BASE		8
 
 /*
@@ -1494,7 +1493,6 @@ bool kvm_exec_domain_vcpu_ioctl_allowed(struct kvm_vcpu *vcpu,
 					unsigned int ioctl);
 void kvm_exec_domain_vcpu_ioctl_complete(struct kvm_vcpu *vcpu,
 					 unsigned int ioctl, long result);
-int kvm_exec_domain_vcpu_service_interrupt(struct kvm_vcpu *vcpu);
 struct kvm_vcpu *kvm_vcpu_from_fd(int fd, struct file **filep);
 int kvm_vcpu_run(struct kvm_vcpu *vcpu);
 

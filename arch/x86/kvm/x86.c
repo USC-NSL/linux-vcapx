@@ -10718,10 +10718,6 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
 	bool req_immediate_exit = false;
 
 	if (kvm_request_pending(vcpu)) {
-		r = kvm_exec_domain_vcpu_service_interrupt(vcpu);
-		if (r == -EAGAIN)
-			req_int_win = true;
-
 		if (kvm_vcpu_check_exec_domain_exit(vcpu)) {
 			r = -EINTR;
 			goto out;
