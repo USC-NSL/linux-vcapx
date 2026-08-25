@@ -2026,6 +2026,43 @@ static void kvm_exec_interrupt_abort(struct kvm_exec_executor *executor)
 	kvm_exec_interrupt_clear_retained_halt(executor);
 }
 
+int kvm_exec_domain_vcpu_service_interrupt(struct kvm_vcpu *vcpu)
+{
+	struct kvm_exec_capsule *capsule;
+	struct kvm_exec_executor *executor;
+	struct kvm_exec_pending_interrupt interrupt = { };
+	int ret;
+
+	if (!kvm_check_request(KVM_REQ_EXEC_DOMAIN_INTERRUPT, vcpu))
+		return 0;
+
+	capsule = READ_ONCE(vcpu->exec_capsule);
+	if (!capsule)
+		return 0;
+	executor = READ_ONCE(capsule->owner);
+	if (!executor || !kvm_exec_interrupt_snapshot(executor, &interrupt))
+		return 0;
+
+	if (interrupt.capsule_id != capsule->capsule_id ||
+	    interrupt.lifecycle_generation != capsule->lifecycle_generation)
+		ret = -ESTALE;
+	else
+		ret = kvm_arch_vcpu_exec_inject_interrupt(vcpu, interrupt.vector);
+
+	if (!ret) {
+		kvm_exec_interrupt_finish(executor, interrupt.sequence, true);
+		kvm_exec_interrupt_retain_halt(executor, &interrupt);
+		if (atomic_cmpxchg(&capsule->block_reason, KVM_EXEC_BLOCK_HLT,
+				   KVM_EXEC_BLOCK_NONE) == KVM_EXEC_BLOCK_HLT)
+			atomic64_inc(&capsule->wake_count);
+	} else if (ret != -EAGAIN) {
+		/* Let the dispatcher report and account the exact failure. */
+		kvm_make_request(KVM_REQ_EXEC_DOMAIN_EXIT, vcpu);
+	}
+
+	return ret;
+}
+
 static bool kvm_exec_dispatch_failed(const struct kvm_exec_run_dispatch *run)
 {
 	if (run->return_reason == KVM_EXEC_RETURN_DISPATCH_EMPTY)
@@ -2446,9 +2483,13 @@ command_done:
 				kvm_exec_snapshot_exit(capsule->vcpu,
 						       &observed_exit);
 		}
+		interrupt_pending =
+			kvm_exec_interrupt_snapshot(executor,
+						    &pending_interrupt);
 		interrupt_window_exit =
-			attempted_kvm_run && !run_ret && interrupt_waiting &&
-			reported_exit_reason == KVM_EXIT_IRQ_WINDOW_OPEN;
+			attempted_kvm_run && !run_ret &&
+			reported_exit_reason == KVM_EXIT_IRQ_WINDOW_OPEN &&
+			(interrupt_waiting || interrupt_pending);
 		final_cpu = get_cpu();
 		put_cpu();
 		strict_migrated =
@@ -2703,7 +2744,7 @@ static long kvm_exec_interrupt(struct kvm_exec_executor *executor,
 	WRITE_ONCE(header->kernel_kick_count, epoch);
 	WRITE_ONCE(header->last_kick_sequence, interrupt.request_sequence);
 	WRITE_ONCE(header->last_kick_ns, ktime_get_ns());
-	kvm_make_request(KVM_REQ_EXEC_DOMAIN_EXIT, capsule->vcpu);
+	kvm_make_request(KVM_REQ_EXEC_DOMAIN_INTERRUPT, capsule->vcpu);
 	kvm_make_request(KVM_REQ_UNBLOCK, capsule->vcpu);
 	kvm_vcpu_kick(capsule->vcpu);
 out:
