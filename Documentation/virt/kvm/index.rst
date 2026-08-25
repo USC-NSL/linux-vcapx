@@ -8,6 +8,7 @@ KVM
    :maxdepth: 2
 
    api
+   execution-domains
    devices/index
 
    arm/index
