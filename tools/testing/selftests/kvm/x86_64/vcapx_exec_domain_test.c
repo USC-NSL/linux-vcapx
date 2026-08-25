@@ -2022,15 +2022,15 @@ static void guest_exact_interrupt_handler(struct ex_regs *regs)
 		   READ_ONCE(exact_interrupt_count) + 1);
 }
 
-static void guest_exact_interrupt_spin(void)
+static void guest_exact_interrupt_then_halt(void)
 {
 	asm volatile("sti" ::: "memory");
 	WRITE_ONCE(guest_started, 1);
 	while (!READ_ONCE(exact_interrupt_count))
 		asm volatile("pause");
 	WRITE_ONCE(exact_interrupt_progress, 1);
-	for (;;)
-		asm volatile("pause");
+	asm volatile("cli; hlt" ::: "memory");
+	GUEST_ASSERT(0);
 }
 
 static void guest_spin(void)
@@ -4249,6 +4249,11 @@ static void test_exact_interrupt_avoids_executor_return(int kvm_fd)
 		.lifecycle_generation = 5,
 		.vector = HALT_WAKE_VECTOR,
 	};
+	struct kvm_exec_query_capsule capsule = {
+		.size = sizeof(capsule),
+		.capsule_id = 91,
+		.lifecycle_generation = 5,
+	};
 	struct kvm_exec_query_executor query = {
 		.size = sizeof(query),
 	};
@@ -4260,10 +4265,10 @@ static void test_exact_interrupt_avoids_executor_return(int kvm_fd)
 	uint64_t *started, *progress, *interrupts;
 	uint64_t domain_generation, executor_generation;
 	pthread_t thread;
-	int domain_fd, executor_fd, ret;
+	int domain_fd, executor_fd, i, ret;
 
 	vm = __vm_create_without_irqchip(VM_SHAPE_DEFAULT, 1, 0);
-	vcpu = vm_vcpu_add(vm, 0, guest_exact_interrupt_spin);
+	vcpu = vm_vcpu_add(vm, 0, guest_exact_interrupt_then_halt);
 	disable_nested_cpuid(vcpu);
 	vm_init_descriptor_tables(vm);
 	vcpu_init_descriptor_tables(vcpu);
@@ -4295,6 +4300,9 @@ static void test_exact_interrupt_avoids_executor_return(int kvm_fd)
 	TEST_ASSERT(!pthread_create(&thread, NULL, dispatch_runner, &run_arg),
 		    "pthread_create failed");
 	wait_for_guest(started);
+	completion = consume_dispatch_completion(&mapping);
+	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_APPLIED);
+	TEST_ASSERT_EQ(completion.executor_return_count, 0);
 
 	interrupt.domain_generation = domain_generation;
 	interrupt.executor_generation = executor_generation;
@@ -4302,12 +4310,29 @@ static void test_exact_interrupt_avoids_executor_return(int kvm_fd)
 	assert_ioctl_errno(executor_fd, KVM_EXEC_INTERRUPT, &interrupt,
 			   ESTALE);
 	interrupt.lifecycle_generation--;
+	interrupt.flags = 2;
+	assert_ioctl_errno(executor_fd, KVM_EXEC_INTERRUPT, &interrupt,
+			   EINVAL);
+	interrupt.flags = KVM_EXEC_INTERRUPT_F_RETAIN_HLT;
 	ret = ioctl(executor_fd, KVM_EXEC_INTERRUPT, &interrupt);
 	TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_EXEC_INTERRUPT, ret));
 	wait_for_trace_progress(interrupts, 0);
 	wait_for_trace_progress(progress, 0);
+	capsule.domain_generation = domain_generation;
+	for (i = 0; i < 10000; i++) {
+		memset(&capsule.state, 0,
+		       sizeof(capsule) - offsetof(struct kvm_exec_query_capsule,
+						 state));
+		ret = ioctl(domain_fd, KVM_EXEC_QUERY_CAPSULE, &capsule);
+		TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_EXEC_QUERY_CAPSULE, ret));
+		if (capsule.block_reason == KVM_EXEC_BLOCK_HLT)
+			break;
+		sched_yield();
+	}
+	TEST_ASSERT_EQ(capsule.state, KVM_EXEC_CAPSULE_STATE_BLOCKED_HLT);
+	TEST_ASSERT_EQ(capsule.block_reason, KVM_EXEC_BLOCK_HLT);
 	TEST_ASSERT(!__atomic_load_n(&run_arg.finished, __ATOMIC_ACQUIRE),
-		    "exact interrupt returned the executor to userspace");
+		    "retained exact-interrupt halt returned the executor");
 
 	query.domain_generation = domain_generation;
 	query.executor_generation = executor_generation;
@@ -4319,17 +4344,7 @@ static void test_exact_interrupt_avoids_executor_return(int kvm_fd)
 	TEST_ASSERT_EQ(query.last_interrupt_sequence, 100);
 	TEST_ASSERT_EQ(query.pending_interrupt_sequence, 0);
 	assert_ioctl_errno(executor_fd, KVM_EXEC_INTERRUPT, &interrupt,
-			   ESTALE);
-
-	kick_dispatch_flags(executor_fd, domain_generation, executor_generation,
-			    101, KVM_EXEC_KICK_F_RETURN_TO_VMM);
-	pthread_join(thread, NULL);
-	TEST_ASSERT(!run_arg.ret,
-		    "exact-interrupt dispatch returned %d errno %d",
-		    run_arg.ret, run_arg.error);
-	TEST_ASSERT_EQ(run_arg.run.return_reason, KVM_EXEC_RETURN_SIGNAL);
-	completion = consume_dispatch_completion(&mapping);
-	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_APPLIED);
+			   EAGAIN);
 
 	command = (struct kvm_exec_command) {
 		.opcode = KVM_EXEC_CMD_RELEASE,
@@ -4341,10 +4356,21 @@ static void test_exact_interrupt_avoids_executor_return(int kvm_fd)
 	};
 	TEST_ASSERT(publish_dispatch_command(&mapping, command),
 		    "failed to publish exact-interrupt release");
-	run_arg.run = run_dispatch_once(executor_fd, domain_generation,
-					executor_generation);
+	kick_dispatch(executor_fd, domain_generation, executor_generation, 101);
 	completion = consume_dispatch_completion(&mapping);
 	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_RETURNED);
+	TEST_ASSERT_EQ(completion.executor_return_count, 0);
+	TEST_ASSERT(!__atomic_load_n(&run_arg.finished, __ATOMIC_ACQUIRE),
+		    "retained halt release returned the executor");
+
+	kick_dispatch_flags(executor_fd, domain_generation, executor_generation,
+			    102, KVM_EXEC_KICK_F_RETURN_TO_VMM);
+	pthread_join(thread, NULL);
+	TEST_ASSERT(!run_arg.ret,
+		    "exact-interrupt dispatch returned %d errno %d",
+		    run_arg.ret, run_arg.error);
+	TEST_ASSERT_EQ(run_arg.run.return_reason, KVM_EXEC_RETURN_SIGNAL);
+	TEST_ASSERT_EQ(mapping.header->executor_return_count, 1);
 
 	munmap(mapping.header, KVM_EXEC_DISPATCH_MMAP_SIZE);
 	close(executor_fd);

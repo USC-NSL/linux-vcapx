@@ -1216,6 +1216,8 @@ struct kvm_exec_interrupt {
 	__u64 reserved[2];
 };
 
+#define KVM_EXEC_INTERRUPT_F_RETAIN_HLT	(1U << 0)
+
 struct kvm_exec_cancel {
 	__u32 size;
 	__u32 flags;

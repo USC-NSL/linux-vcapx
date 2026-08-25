@@ -27,6 +27,7 @@ struct kvm_exec_pending_interrupt {
 	u64 capsule_id;
 	u64 lifecycle_generation;
 	u32 vector;
+	u32 flags;
 };
 
 struct kvm_exec_exit_state {
@@ -110,6 +111,9 @@ struct kvm_exec_executor {
 	u64 interrupt_queued_count;
 	u64 interrupt_applied_count;
 	u32 pending_interrupt_vector;
+	u32 pending_interrupt_flags;
+	u64 retained_halt_capsule_id;
+	u64 retained_halt_lifecycle_generation;
 	u64 generation;
 	u64 cookie;
 	u64 last_request_sequence;
@@ -144,6 +148,9 @@ static atomic64_t kvm_exec_executor_generation = ATOMIC64_INIT(0);
 
 static const struct file_operations kvm_exec_domain_fops;
 static const struct file_operations kvm_exec_executor_fops;
+
+static void kvm_exec_interrupt_clear_retained_halt(
+	struct kvm_exec_executor *executor);
 
 static struct kvm_exec_dispatch_header *
 kvm_exec_dispatch_header(struct kvm_exec_executor *executor)
@@ -1817,6 +1824,7 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 					command.request_sequence)) {
 		status = KVM_EXEC_COMPLETE_CANCELLED_BEFORE_APPLY;
 	} else if (command.opcode == KVM_EXEC_CMD_RELEASE) {
+		kvm_exec_interrupt_clear_retained_halt(executor);
 		if (current_capsule) {
 			current_capsule->exit.async_entry_authorized = false;
 			current_capsule->exit.async_reentry_required = false;
@@ -1829,6 +1837,7 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 		atomic64_inc(&executor->release_count);
 		status = KVM_EXEC_COMPLETE_RETURNED;
 	} else {
+		kvm_exec_interrupt_clear_retained_halt(executor);
 		if (current_capsule != target) {
 			if (current_capsule) {
 				current_capsule->exit.async_entry_authorized = false;
@@ -1938,6 +1947,7 @@ kvm_exec_interrupt_snapshot(struct kvm_exec_executor *executor,
 		interrupt->lifecycle_generation =
 			executor->pending_interrupt_lifecycle_generation;
 		interrupt->vector = executor->pending_interrupt_vector;
+		interrupt->flags = executor->pending_interrupt_flags;
 	}
 	spin_unlock_irqrestore(&executor->interrupt_lock, flags);
 	return pending;
@@ -1955,10 +1965,55 @@ kvm_exec_interrupt_finish(struct kvm_exec_executor *executor, u64 sequence,
 		executor->pending_interrupt_capsule_id = 0;
 		executor->pending_interrupt_lifecycle_generation = 0;
 		executor->pending_interrupt_vector = 0;
+		executor->pending_interrupt_flags = 0;
 		if (applied)
 			executor->interrupt_applied_count++;
 	}
 	spin_unlock_irqrestore(&executor->interrupt_lock, flags);
+}
+
+static void
+kvm_exec_interrupt_retain_halt(struct kvm_exec_executor *executor,
+			       const struct kvm_exec_pending_interrupt *interrupt)
+{
+	unsigned long flags;
+
+	if (!(interrupt->flags & KVM_EXEC_INTERRUPT_F_RETAIN_HLT))
+		return;
+	spin_lock_irqsave(&executor->interrupt_lock, flags);
+	executor->retained_halt_capsule_id = interrupt->capsule_id;
+	executor->retained_halt_lifecycle_generation =
+		interrupt->lifecycle_generation;
+	spin_unlock_irqrestore(&executor->interrupt_lock, flags);
+}
+
+static void kvm_exec_interrupt_clear_retained_halt(
+	struct kvm_exec_executor *executor)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&executor->interrupt_lock, flags);
+	executor->retained_halt_capsule_id = 0;
+	executor->retained_halt_lifecycle_generation = 0;
+	spin_unlock_irqrestore(&executor->interrupt_lock, flags);
+}
+
+static bool kvm_exec_interrupt_consume_retained_halt(
+	struct kvm_exec_executor *executor, struct kvm_exec_capsule *capsule)
+{
+	unsigned long flags;
+	bool retain;
+
+	spin_lock_irqsave(&executor->interrupt_lock, flags);
+	retain = executor->retained_halt_capsule_id == capsule->capsule_id &&
+		executor->retained_halt_lifecycle_generation ==
+			capsule->lifecycle_generation;
+	if (retain) {
+		executor->retained_halt_capsule_id = 0;
+		executor->retained_halt_lifecycle_generation = 0;
+	}
+	spin_unlock_irqrestore(&executor->interrupt_lock, flags);
+	return retain;
 }
 
 static void kvm_exec_interrupt_abort(struct kvm_exec_executor *executor)
@@ -1967,6 +2022,7 @@ static void kvm_exec_interrupt_abort(struct kvm_exec_executor *executor)
 
 	if (kvm_exec_interrupt_snapshot(executor, &interrupt))
 		kvm_exec_interrupt_finish(executor, interrupt.sequence, false);
+	kvm_exec_interrupt_clear_retained_halt(executor);
 }
 
 static bool kvm_exec_dispatch_failed(const struct kvm_exec_run_dispatch *run)
@@ -2090,6 +2146,7 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 		bool interrupt_failed = false;
 		bool interrupt_window_exit = false;
 		bool kick_pending;
+		bool retained_halt_exit = false;
 		bool return_to_vmm;
 		bool strict_migrated;
 		u32 reported_exit_reason;
@@ -2332,6 +2389,8 @@ command_done:
 			if (!interrupt_ret) {
 				kvm_exec_interrupt_finish(
 					executor, pending_interrupt.sequence, true);
+				kvm_exec_interrupt_retain_halt(
+					executor, &pending_interrupt);
 				if (atomic_cmpxchg(&capsule->block_reason,
 						   KVM_EXEC_BLOCK_HLT,
 						   KVM_EXEC_BLOCK_NONE) ==
@@ -2417,6 +2476,14 @@ command_done:
 			    kvm_exec_async_pio_write(domain, &capsule->exit))
 				async_published =
 					kvm_exec_async_publish(executor, capsule);
+			if (observed_exit.reason == KVM_EXIT_HLT)
+				retained_halt_exit =
+					kvm_exec_interrupt_consume_retained_halt(
+						executor, capsule);
+			else if (!async_published &&
+				 observed_exit.reason != KVM_EXIT_DEBUG)
+				kvm_exec_interrupt_clear_retained_halt(
+					executor);
 		} else if (attempted_kvm_run &&
 			   capsule->exit.completion_pending &&
 			   !pending_after_run) {
@@ -2444,6 +2511,8 @@ command_done:
 			run.return_reason = KVM_EXEC_RETURN_CPU_MIGRATED;
 			break;
 		}
+		if (retained_halt_exit)
+			continue;
 		if (interrupt_window_exit)
 			continue;
 		if (async_published)
@@ -2462,6 +2531,7 @@ command_done:
 	}
 
 	mutex_lock(&domain->lock);
+	kvm_exec_interrupt_clear_retained_halt(executor);
 	kvm_exec_dispatch_run_owner(executor, &run);
 	if (active)
 		atomic_dec(&domain->active_runs);
@@ -2565,7 +2635,8 @@ static long kvm_exec_interrupt(struct kvm_exec_executor *executor,
 
 	if (copy_from_user(&interrupt, argp, sizeof(interrupt)))
 		return -EFAULT;
-	if (interrupt.size != sizeof(interrupt) || interrupt.flags ||
+	if (interrupt.size != sizeof(interrupt) ||
+	    interrupt.flags & ~KVM_EXEC_INTERRUPT_F_RETAIN_HLT ||
 	    !interrupt.request_sequence || interrupt.vector > U8_MAX ||
 	    interrupt.reserved0 ||
 	    memchr_inv(interrupt.reserved, 0, sizeof(interrupt.reserved)))
@@ -2613,6 +2684,7 @@ static long kvm_exec_interrupt(struct kvm_exec_executor *executor,
 		executor->pending_interrupt_lifecycle_generation =
 			interrupt.lifecycle_generation;
 		executor->pending_interrupt_vector = interrupt.vector;
+		executor->pending_interrupt_flags = interrupt.flags;
 		executor->interrupt_queued_count++;
 		ret = 0;
 	}
