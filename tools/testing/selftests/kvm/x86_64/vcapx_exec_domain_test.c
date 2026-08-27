@@ -4365,6 +4365,10 @@ static void test_exact_interrupt_avoids_executor_return(int kvm_fd)
 		    "exact interrupt acceptance timestamp is zero");
 	TEST_ASSERT(publication.delivered_ns >= publication.accepted_ns,
 		    "exact interrupt delivery predates acceptance");
+	TEST_ASSERT(publication.accepted_tsc,
+		    "exact interrupt acceptance TSC is zero");
+	TEST_ASSERT(publication.delivered_tsc >= publication.accepted_tsc,
+		    "exact interrupt delivery TSC predates acceptance");
 	TEST_ASSERT_EQ(publication.actual_delivery,
 		       KVM_EXEC_INTERRUPT_DELIVERY_DIRECT_KICK);
 	assert_ioctl_errno(executor_fd, KVM_EXEC_INTERRUPT, &interrupt,

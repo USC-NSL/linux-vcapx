@@ -11328,6 +11328,11 @@ bool kvm_arch_vcpu_exec_domain_supported(struct kvm_vcpu *vcpu)
 	       !guest_cpuid_has(vcpu, X86_FEATURE_SVM);
 }
 
+u64 kvm_arch_exec_host_tsc(void)
+{
+	return rdtsc_ordered();
+}
+
 bool kvm_arch_vcpu_exec_completion_pending(struct kvm_vcpu *vcpu)
 {
 	return vcpu->arch.complete_userspace_io;

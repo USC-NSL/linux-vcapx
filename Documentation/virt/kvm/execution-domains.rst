@@ -171,7 +171,10 @@ domain to be paused, the capsule not running and no completion pending.
 When ``KVM_EXEC_FEATURE_INTERRUPT_PUBLICATION`` is negotiated,
 ``KVM_EXEC_QUERY_INTERRUPT_PUBLICATION`` returns accepted and delivered
 counts, the last accepted request sequence, acceptance and delivery
-``ktime_get_ns()`` timestamps, and the actual delivery action.  A successful
+``ktime_get_ns()`` timestamps, capture-time host-TSC values on x86, and the
+actual delivery action.  The nanosecond values support kernel tracing; ordered
+end-to-end comparisons use the host-TSC values without reconstructing them
+from a later userspace clock anchor.  A successful
 exact-interrupt ioctl updates both counts exactly once.  The query is
 observability only; it neither submits nor retries an interrupt.
 

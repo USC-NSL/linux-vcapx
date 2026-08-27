@@ -128,6 +128,8 @@ struct kvm_exec_executor {
 	u64 interrupt_delivery_count;
 	u64 last_interrupt_accepted_ns;
 	u64 last_interrupt_delivered_ns;
+	u64 last_interrupt_accepted_tsc;
+	u64 last_interrupt_delivered_tsc;
 	u32 last_interrupt_delivery;
 	u32 pending_interrupt_vector;
 	u32 pending_interrupt_flags;
@@ -205,6 +207,11 @@ static void kvm_exec_dispatch_init(struct kvm_exec_executor *executor)
 bool __weak kvm_arch_vcpu_exec_domain_supported(struct kvm_vcpu *vcpu)
 {
 	return false;
+}
+
+u64 __weak kvm_arch_exec_host_tsc(void)
+{
+	return 0;
 }
 
 bool __weak kvm_arch_vcpu_exec_completion_pending(struct kvm_vcpu *vcpu)
@@ -2680,7 +2687,7 @@ kvm_exec_validate_interrupt_locked(struct kvm_exec_executor *executor,
 static int
 kvm_exec_accept_interrupt_locked(struct kvm_exec_executor *executor,
 				 const struct kvm_exec_interrupt_request *request,
-				 u64 *accepted_ns)
+				 u64 *accepted_ns, u64 *accepted_tsc)
 {
 	unsigned long flags;
 	int ret;
@@ -2692,6 +2699,7 @@ kvm_exec_accept_interrupt_locked(struct kvm_exec_executor *executor,
 		ret = -EBUSY;
 	} else {
 		*accepted_ns = ktime_get_ns();
+		*accepted_tsc = kvm_arch_exec_host_tsc();
 		executor->last_interrupt_sequence = request->request_sequence;
 		executor->pending_interrupt_sequence = request->request_sequence;
 		executor->pending_interrupt_capsule_id = request->capsule_id;
@@ -2701,6 +2709,7 @@ kvm_exec_accept_interrupt_locked(struct kvm_exec_executor *executor,
 		executor->pending_interrupt_flags = request->flags;
 		executor->interrupt_queued_count++;
 		executor->last_interrupt_accepted_ns = *accepted_ns;
+		executor->last_interrupt_accepted_tsc = *accepted_tsc;
 		ret = 0;
 	}
 	spin_unlock_irqrestore(&executor->interrupt_lock, flags);
@@ -2716,10 +2725,12 @@ kvm_exec_deliver_interrupt_direct_kick_locked(
 	struct kvm_exec_dispatch_header *header;
 	unsigned long flags;
 	u64 delivered_ns;
+	u64 delivered_tsc;
 	u64 epoch;
 
 	lockdep_assert_held(&executor->domain->lock);
 	delivered_ns = ktime_get_ns();
+	delivered_tsc = kvm_arch_exec_host_tsc();
 	epoch = atomic64_inc_return(&executor->kick_epoch);
 	header = kvm_exec_dispatch_header(executor);
 	WRITE_ONCE(header->kernel_kick_count, epoch);
@@ -2732,6 +2743,7 @@ kvm_exec_deliver_interrupt_direct_kick_locked(
 	spin_lock_irqsave(&executor->interrupt_lock, flags);
 	executor->interrupt_delivery_count++;
 	executor->last_interrupt_delivered_ns = delivered_ns;
+	executor->last_interrupt_delivered_tsc = delivered_tsc;
 	executor->last_interrupt_delivery =
 		KVM_EXEC_INTERRUPT_DELIVERY_DIRECT_KICK;
 	spin_unlock_irqrestore(&executor->interrupt_lock, flags);
@@ -2751,6 +2763,7 @@ kvm_exec_submit_interrupt(struct kvm_exec_executor *executor,
 	struct kvm_exec_domain *domain = executor->domain;
 	struct kvm_exec_capsule *capsule;
 	u64 accepted_ns = 0;
+	u64 accepted_tsc = 0;
 	int ret;
 
 	ret = kvm_exec_domain_access(domain);
@@ -2769,7 +2782,8 @@ kvm_exec_submit_interrupt(struct kvm_exec_executor *executor,
 	ret = kvm_exec_validate_interrupt_locked(executor, request, &capsule);
 	if (ret)
 		goto out;
-	ret = kvm_exec_accept_interrupt_locked(executor, request, &accepted_ns);
+	ret = kvm_exec_accept_interrupt_locked(executor, request, &accepted_ns,
+					       &accepted_tsc);
 	if (ret)
 		goto out;
 
@@ -2966,6 +2980,7 @@ kvm_exec_query_interrupt_publication(struct kvm_exec_executor *executor,
 	    query.accepted_count || query.delivered_count ||
 	    query.last_request_sequence || query.accepted_ns ||
 	    query.delivered_ns || query.actual_delivery || query.reserved0 ||
+	    query.accepted_tsc || query.delivered_tsc ||
 	    memchr_inv(query.reserved, 0, sizeof(query.reserved)))
 		return -EINVAL;
 	if (query.domain_generation != domain->generation ||
@@ -2978,6 +2993,8 @@ kvm_exec_query_interrupt_publication(struct kvm_exec_executor *executor,
 	query.last_request_sequence = executor->last_interrupt_sequence;
 	query.accepted_ns = executor->last_interrupt_accepted_ns;
 	query.delivered_ns = executor->last_interrupt_delivered_ns;
+	query.accepted_tsc = executor->last_interrupt_accepted_tsc;
+	query.delivered_tsc = executor->last_interrupt_delivered_tsc;
 	query.actual_delivery = executor->last_interrupt_delivery;
 	spin_unlock_irqrestore(&executor->interrupt_lock, flags);
 

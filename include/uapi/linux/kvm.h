@@ -1289,7 +1289,9 @@ struct kvm_exec_query_interrupt_publication {
 	__u64 delivered_ns;
 	__u32 actual_delivery;
 	__u32 reserved0;
-	__u64 reserved[3];
+	__u64 accepted_tsc;
+	__u64 delivered_tsc;
+	__u64 reserved[1];
 };
 
 /*
