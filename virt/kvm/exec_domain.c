@@ -159,6 +159,7 @@ struct kvm_exec_executor {
 	u32 pending_interrupt_vector;
 	u32 pending_interrupt_flags;
 	u32 pending_interrupt_delivery;
+	bool pending_interrupt_arch_queued;
 	u64 retained_halt_capsule_id;
 	u64 retained_halt_lifecycle_generation;
 	u64 generation;
@@ -301,6 +302,16 @@ int __weak kvm_arch_vcpu_exec_inject_interrupt(struct kvm_vcpu *vcpu,
 					       u32 vector)
 {
 	return -EOPNOTSUPP;
+}
+
+bool __weak kvm_arch_vcpu_exec_direct_pending(struct kvm_vcpu *vcpu,
+					      u32 vector)
+{
+	return false;
+}
+
+void __weak kvm_arch_vcpu_exec_cancel_direct(struct kvm_vcpu *vcpu, u32 vector)
+{
 }
 
 int __weak
@@ -2158,11 +2169,36 @@ kvm_exec_interrupt_finish(struct kvm_exec_executor *executor, u64 sequence,
 		executor->pending_interrupt_vector = 0;
 		executor->pending_interrupt_flags = 0;
 		executor->pending_interrupt_delivery = 0;
+		executor->pending_interrupt_arch_queued = false;
 		executor->pending_interrupt_handler_observed = false;
 		if (applied)
 			executor->interrupt_applied_count++;
 	}
 	spin_unlock_irqrestore(&executor->interrupt_lock, flags);
+}
+
+static void kvm_exec_interrupt_set_queued(struct kvm_exec_executor *executor,
+					  u64 sequence)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&executor->interrupt_lock, flags);
+	if (executor->pending_interrupt_sequence == sequence)
+		executor->pending_interrupt_arch_queued = true;
+	spin_unlock_irqrestore(&executor->interrupt_lock, flags);
+}
+
+static bool
+kvm_exec_interrupt_arch_queued(struct kvm_exec_executor *executor, u64 sequence)
+{
+	unsigned long flags;
+	bool queued;
+
+	spin_lock_irqsave(&executor->interrupt_lock, flags);
+	queued = executor->pending_interrupt_sequence == sequence &&
+		 executor->pending_interrupt_arch_queued;
+	spin_unlock_irqrestore(&executor->interrupt_lock, flags);
+	return queued;
 }
 
 static void
@@ -2213,10 +2249,23 @@ static void kvm_exec_interrupt_abort(struct kvm_exec_executor *executor)
 {
 	struct kvm_exec_pending_interrupt interrupt = { };
 	struct kvm_exec_capsule *capsule;
+	struct kvm_vcpu *vcpu;
 
 	lockdep_assert_held(&executor->domain->lock);
 	if (kvm_exec_interrupt_snapshot(executor, &interrupt)) {
 		if (interrupt.delivery ==
+		    KVM_EXEC_INTERRUPT_DELIVERY_DIRECT_KICK) {
+			capsule = executor->current_capsule;
+			if (capsule && capsule->vcpu &&
+			    capsule->capsule_id == interrupt.capsule_id &&
+			    capsule->lifecycle_generation ==
+				interrupt.lifecycle_generation) {
+				vcpu = capsule->vcpu;
+				mutex_lock(&vcpu->mutex);
+				kvm_arch_vcpu_exec_cancel_direct(vcpu, interrupt.vector);
+				mutex_unlock(&vcpu->mutex);
+			}
+		} else if (interrupt.delivery ==
 		    KVM_EXEC_INTERRUPT_DELIVERY_LOCAL_APIC_KICK) {
 			capsule = executor->current_capsule;
 			if (capsule && capsule->vcpu &&
@@ -2321,6 +2370,28 @@ void kvm_exec_domain_apic_eoi(struct kvm_vcpu *vcpu, u32 vector)
 	spin_unlock_irqrestore(&executor->interrupt_lock, flags);
 	if (retired)
 		wake_up_interruptible(&executor->dispatch_wait);
+}
+
+static void
+kvm_exec_refresh_direct_interrupt(struct kvm_exec_executor *executor,
+				  struct kvm_vcpu *vcpu)
+{
+	struct kvm_exec_pending_interrupt interrupt = { };
+
+	if (!kvm_exec_interrupt_snapshot(executor, &interrupt) ||
+	    interrupt.delivery != KVM_EXEC_INTERRUPT_DELIVERY_DIRECT_KICK ||
+	    !kvm_exec_interrupt_arch_queued(executor, interrupt.sequence) ||
+	    kvm_arch_vcpu_exec_direct_pending(vcpu, interrupt.vector))
+		return;
+
+	/*
+	 * Direct delivery first queues the exact vector in KVM's ordinary
+	 * interrupt state.  Keep ownership of that vector until a run boundary
+	 * proves that KVM no longer needs to inject or reinject it.  An ownership
+	 * command that wins before then can cancel the still-queued vector instead
+	 * of leaking it into a later re-entry of the old capsule.
+	 */
+	kvm_exec_interrupt_finish(executor, interrupt.sequence, true);
 }
 
 static void
@@ -2724,8 +2795,7 @@ command_done:
 						pending_interrupt.vector);
 			}
 			if (!interrupt_ret) {
-				kvm_exec_interrupt_finish(
-					executor, pending_interrupt.sequence, true);
+				kvm_exec_interrupt_set_queued(executor, pending_interrupt.sequence);
 				kvm_exec_interrupt_retain_halt(
 					executor, &pending_interrupt);
 				if (atomic_cmpxchg(&capsule->block_reason,
@@ -2770,6 +2840,7 @@ command_done:
 		} else {
 			attempted_kvm_run = true;
 			run_ret = kvm_exec_vcpu_run(executor, capsule);
+			kvm_exec_refresh_direct_interrupt(executor, capsule->vcpu);
 			kvm_exec_refresh_posted_interrupt(executor,
 							  capsule->vcpu);
 			reported_exit_reason = capsule->vcpu->run->exit_reason;
@@ -3022,6 +3093,7 @@ kvm_exec_accept_interrupt_locked(struct kvm_exec_executor *executor,
 		executor->pending_interrupt_vector = request->vector;
 		executor->pending_interrupt_flags = request->flags;
 		executor->pending_interrupt_delivery = request->requested_delivery;
+		executor->pending_interrupt_arch_queued = false;
 		executor->pending_interrupt_handler_observed = false;
 		executor->interrupt_queued_count++;
 		executor->last_interrupt_accepted_ns = *accepted_ns;

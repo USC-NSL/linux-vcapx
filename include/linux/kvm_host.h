@@ -1488,6 +1488,8 @@ bool kvm_arch_vcpu_exec_copy_pio_data(struct kvm_vcpu *vcpu, void *data,
 				      size_t len);
 u64 kvm_arch_exec_supported_features(void);
 int kvm_arch_vcpu_exec_inject_interrupt(struct kvm_vcpu *vcpu, u32 vector);
+bool kvm_arch_vcpu_exec_direct_pending(struct kvm_vcpu *vcpu, u32 vector);
+void kvm_arch_vcpu_exec_cancel_direct(struct kvm_vcpu *vcpu, u32 vector);
 int kvm_arch_vcpu_exec_configure_interrupt_delivery(struct kvm_vcpu *vcpu,
 						     u32 delivery,
 						     bool enable);

@@ -11373,6 +11373,26 @@ int kvm_arch_vcpu_exec_inject_interrupt(struct kvm_vcpu *vcpu, u32 vector)
 	return kvm_vcpu_ioctl_interrupt(vcpu, &irq);
 }
 
+bool kvm_arch_vcpu_exec_direct_pending(struct kvm_vcpu *vcpu, u32 vector)
+{
+	if (vcpu->arch.pending_external_vector == vector)
+		return true;
+
+	return vcpu->arch.interrupt.injected &&
+	       !vcpu->arch.interrupt.soft &&
+	       vcpu->arch.interrupt.nr == vector;
+}
+
+void kvm_arch_vcpu_exec_cancel_direct(struct kvm_vcpu *vcpu, u32 vector)
+{
+	if (vcpu->arch.pending_external_vector == vector)
+		vcpu->arch.pending_external_vector = -1;
+	if (vcpu->arch.interrupt.injected &&
+	    !vcpu->arch.interrupt.soft &&
+	    vcpu->arch.interrupt.nr == vector)
+		kvm_clear_interrupt_queue(vcpu);
+}
+
 int kvm_arch_vcpu_exec_configure_interrupt_delivery(struct kvm_vcpu *vcpu,
 						     u32 delivery,
 						     bool enable)
