@@ -237,7 +237,8 @@ static const struct file_operations kvm_exec_notification_fops;
 
 static void kvm_exec_interrupt_clear_retained_halt(
 	struct kvm_exec_executor *executor);
-static void kvm_exec_interrupt_abort(struct kvm_exec_executor *executor);
+static void kvm_exec_interrupt_abort(struct kvm_exec_executor *executor,
+				     bool superseded);
 static bool
 kvm_exec_interrupt_snapshot(struct kvm_exec_executor *executor,
 			    struct kvm_exec_pending_interrupt *interrupt);
@@ -490,7 +491,7 @@ static void kvm_exec_release_ownership_locked(struct kvm_exec_domain *domain)
 	unsigned long index;
 
 	list_for_each_entry(executor, &domain->executors, node) {
-		kvm_exec_interrupt_abort(executor);
+		kvm_exec_interrupt_abort(executor, false);
 		executor->current_capsule = NULL;
 	}
 	xa_for_each(&domain->capsules, index, capsule) {
@@ -857,7 +858,7 @@ static int kvm_exec_executor_release(struct inode *inode, struct file *file)
 		if (kvm_exec_interrupt_snapshot(executor, &interrupt) &&
 		    interrupt.delivery == KVM_EXEC_INTERRUPT_DELIVERY_POSTED)
 			domain->stopping = true;
-		kvm_exec_interrupt_abort(executor);
+		kvm_exec_interrupt_abort(executor, false);
 		executor->current_capsule->owner = NULL;
 		executor->current_capsule = NULL;
 	}
@@ -1824,6 +1825,30 @@ static bool kvm_exec_exit_blocks_handoff(struct kvm_exec_capsule *capsule)
 	       !capsule->exit.async_completion_ready;
 }
 
+static bool
+kvm_exec_interrupt_in_service(struct kvm_exec_executor *executor,
+			      struct kvm_exec_capsule *capsule)
+{
+	struct kvm_exec_pending_interrupt interrupt = { };
+	struct kvm_vcpu *vcpu;
+	bool in_service;
+
+	lockdep_assert_held(&executor->domain->lock);
+	if (!kvm_exec_interrupt_snapshot(executor, &interrupt) ||
+	    !kvm_exec_delivery_uses_local_apic(interrupt.delivery))
+		return false;
+	if (!capsule || !capsule->vcpu ||
+	    capsule->capsule_id != interrupt.capsule_id ||
+	    capsule->lifecycle_generation != interrupt.lifecycle_generation)
+		return true;
+
+	vcpu = capsule->vcpu;
+	mutex_lock(&vcpu->mutex);
+	in_service = kvm_arch_vcpu_exec_apic_in_service(vcpu, interrupt.vector);
+	mutex_unlock(&vcpu->mutex);
+	return in_service;
+}
+
 static void
 kvm_exec_dispatch_finish(struct kvm_exec_executor *executor, u64 sequence,
 			 u16 status)
@@ -1972,8 +1997,7 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 		goto terminal_locked;
 	}
 	if (current_capsule &&
-	    kvm_exec_interrupt_snapshot(executor, NULL) &&
-	    kvm_exec_delivery_uses_local_apic(domain->interrupt_delivery) &&
+	    kvm_exec_interrupt_in_service(executor, current_capsule) &&
 	    (command.opcode != KVM_EXEC_CMD_SWITCH ||
 	     command.target_capsule_id != current_capsule->capsule_id ||
 	     command.target_lifecycle_generation !=
@@ -2025,7 +2049,7 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 					command.request_sequence)) {
 		status = KVM_EXEC_COMPLETE_CANCELLED_BEFORE_APPLY;
 	} else if (command.opcode == KVM_EXEC_CMD_RELEASE) {
-		kvm_exec_interrupt_abort(executor);
+		kvm_exec_interrupt_abort(executor, true);
 		if (current_capsule) {
 			current_capsule->exit.async_entry_authorized = false;
 			current_capsule->exit.async_reentry_required = false;
@@ -2039,7 +2063,7 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 		status = KVM_EXEC_COMPLETE_RETURNED;
 	} else {
 		if (current_capsule != target) {
-			kvm_exec_interrupt_abort(executor);
+			kvm_exec_interrupt_abort(executor, true);
 			if (current_capsule) {
 				current_capsule->exit.async_entry_authorized = false;
 				current_capsule->exit.async_reentry_required = false;
@@ -2245,7 +2269,8 @@ static bool kvm_exec_interrupt_consume_retained_halt(
 	return retain;
 }
 
-static void kvm_exec_interrupt_abort(struct kvm_exec_executor *executor)
+static void kvm_exec_interrupt_abort(struct kvm_exec_executor *executor,
+				     bool superseded)
 {
 	struct kvm_exec_pending_interrupt interrupt = { };
 	struct kvm_exec_capsule *capsule;
@@ -2265,8 +2290,7 @@ static void kvm_exec_interrupt_abort(struct kvm_exec_executor *executor)
 				kvm_arch_vcpu_exec_cancel_direct(vcpu, interrupt.vector);
 				mutex_unlock(&vcpu->mutex);
 			}
-		} else if (interrupt.delivery ==
-		    KVM_EXEC_INTERRUPT_DELIVERY_LOCAL_APIC_KICK) {
+		} else if (kvm_exec_delivery_uses_local_apic(interrupt.delivery)) {
 			capsule = executor->current_capsule;
 			if (capsule && capsule->vcpu &&
 			    capsule->capsule_id == interrupt.capsule_id &&
@@ -2277,19 +2301,17 @@ static void kvm_exec_interrupt_abort(struct kvm_exec_executor *executor)
 					capsule->vcpu, interrupt.vector);
 				mutex_unlock(&capsule->vcpu->mutex);
 			}
-		} else if (interrupt.delivery ==
-			   KVM_EXEC_INTERRUPT_DELIVERY_POSTED) {
-			unsigned long flags;
+			if (interrupt.delivery ==
+			    KVM_EXEC_INTERRUPT_DELIVERY_POSTED) {
+				unsigned long flags;
 
-			/*
-			 * A posted vector cannot be withdrawn from the PI descriptor.
-			 * Callers must stop the domain before abandoning it so that no
-			 * later capsule can inherit the executor's delivery state.
-			 */
-			WARN_ON_ONCE(!executor->domain->stopping);
-			spin_lock_irqsave(&executor->interrupt_lock, flags);
-			executor->interrupt_posted_disarmed_count++;
-			spin_unlock_irqrestore(&executor->interrupt_lock, flags);
+				spin_lock_irqsave(&executor->interrupt_lock, flags);
+				if (superseded)
+					executor->interrupt_posted_superseded_count++;
+				else
+					executor->interrupt_posted_disarmed_count++;
+				spin_unlock_irqrestore(&executor->interrupt_lock, flags);
+			}
 		}
 		kvm_exec_interrupt_finish(executor, interrupt.sequence, false);
 	}
@@ -2544,7 +2566,7 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 
 		mutex_lock(&domain->lock);
 		if (domain->stopping || domain->paused) {
-			kvm_exec_interrupt_abort(executor);
+			kvm_exec_interrupt_abort(executor, false);
 			if (completion_pending) {
 				kvm_exec_dispatch_publish(executor, &completion);
 				completion_pending = false;
@@ -2649,7 +2671,7 @@ command_done:
 						    &pending_interrupt);
 		mutex_lock(&domain->lock);
 		if (domain->stopping) {
-			kvm_exec_interrupt_abort(executor);
+			kvm_exec_interrupt_abort(executor, false);
 			if (completion_pending) {
 				kvm_exec_dispatch_publish(executor, &completion);
 				completion_pending = false;
@@ -2660,7 +2682,7 @@ command_done:
 			break;
 		}
 		if (domain->paused) {
-			kvm_exec_interrupt_abort(executor);
+			kvm_exec_interrupt_abort(executor, false);
 			if (completion_pending) {
 				kvm_exec_dispatch_publish(executor, &completion);
 				completion_pending = false;
@@ -2903,13 +2925,13 @@ command_done:
 			capsule->exit.async_entry_authorized = false;
 		}
 		if (domain->stopping) {
-			kvm_exec_interrupt_abort(executor);
+			kvm_exec_interrupt_abort(executor, false);
 			run.return_reason = KVM_EXEC_RETURN_DOMAIN_STOPPING;
 			mutex_unlock(&domain->lock);
 			break;
 		}
 		if (domain->paused) {
-			kvm_exec_interrupt_abort(executor);
+			kvm_exec_interrupt_abort(executor, false);
 			run.return_reason = KVM_EXEC_RETURN_DOMAIN_PAUSED;
 			mutex_unlock(&domain->lock);
 			break;
@@ -2923,7 +2945,7 @@ command_done:
 			if (kvm_exec_interrupt_snapshot(executor, &interrupt) &&
 			    interrupt.delivery == KVM_EXEC_INTERRUPT_DELIVERY_POSTED)
 				domain->stopping = true;
-			kvm_exec_interrupt_abort(executor);
+			kvm_exec_interrupt_abort(executor, false);
 			mutex_unlock(&domain->lock);
 			run.return_reason = KVM_EXEC_RETURN_CPU_MIGRATED;
 			break;

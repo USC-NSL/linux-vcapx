@@ -252,6 +252,7 @@ static inline int kvm_lapic_latched_init(struct kvm_vcpu *vcpu)
 }
 
 bool kvm_apic_pending_eoi(struct kvm_vcpu *vcpu, int vector);
+bool kvm_apic_interrupt_in_service(struct kvm_vcpu *vcpu, int vector);
 
 void kvm_wait_lapic_expire(struct kvm_vcpu *vcpu);
 

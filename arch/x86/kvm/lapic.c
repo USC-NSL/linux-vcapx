@@ -114,6 +114,13 @@ bool kvm_apic_pending_eoi(struct kvm_vcpu *vcpu, int vector)
 		apic_test_vector(vector, apic->regs + APIC_IRR);
 }
 
+bool kvm_apic_interrupt_in_service(struct kvm_vcpu *vcpu, int vector)
+{
+	struct kvm_lapic *apic = vcpu->arch.apic;
+
+	return apic_test_vector(vector, apic->regs + APIC_ISR);
+}
+
 static inline int __apic_test_and_set_vector(int vec, void *bitmap)
 {
 	return __test_and_set_bit(VEC_POS(vec), (bitmap) + REG_POS(vec));
