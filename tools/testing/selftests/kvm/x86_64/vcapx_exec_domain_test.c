@@ -126,6 +126,10 @@ static void test_cross_vm_feature_dependencies(int kvm_fd)
 				    KVM_EXEC_FEATURE_INTERRUPT_PUBLICATION |
 				    KVM_EXEC_FEATURE_POSTED_INTERRUPT_DELIVERY;
 	assert_ioctl_errno(kvm_fd, KVM_CREATE_EXEC_DOMAIN, &create, EINVAL);
+	create.requested_features = KVM_EXEC_FEATURE_BASE_OBJECTS |
+				    KVM_EXEC_FEATURE_DYNAMIC_DISPATCH |
+				    KVM_EXEC_FEATURE_NOTIFICATION_RING;
+	assert_ioctl_errno(kvm_fd, KVM_CREATE_EXEC_DOMAIN, &create, EINVAL);
 
 	create.requested_features = complete_features;
 	domain_fd = ioctl(kvm_fd, KVM_CREATE_EXEC_DOMAIN, &create);
@@ -148,6 +152,13 @@ static void test_dynamic_dispatch_uapi_layout(void)
 	TEST_ASSERT_EQ(sizeof(struct kvm_exec_interrupt_delivery_config), 64);
 	TEST_ASSERT_EQ(sizeof(struct kvm_exec_query_interrupt_delivery), 128);
 	TEST_ASSERT_EQ(sizeof(struct kvm_exec_query_posted_interrupt), 160);
+	TEST_ASSERT_EQ(sizeof(struct kvm_exec_notification_header), 256);
+	TEST_ASSERT_EQ(sizeof(struct kvm_exec_notification_command), 96);
+	TEST_ASSERT_EQ(sizeof(struct kvm_exec_notification_completion), 112);
+	TEST_ASSERT_EQ(sizeof(struct kvm_exec_create_notification_runner), 56);
+	TEST_ASSERT_EQ(sizeof(struct kvm_exec_run_notification), 72);
+	TEST_ASSERT_EQ(sizeof(struct kvm_exec_notification_control), 48);
+	TEST_ASSERT_EQ(sizeof(struct kvm_exec_query_notification_runner), 160);
 	TEST_ASSERT_EQ(sizeof(struct kvm_exec_cancel), 56);
 	TEST_ASSERT_EQ(sizeof(struct kvm_exec_query_capsule), 144);
 	TEST_ASSERT_EQ(sizeof(struct kvm_exec_query_executor), 152);
@@ -6099,7 +6110,8 @@ int main(int argc, char **argv)
 				    KVM_EXEC_FEATURE_LIFECYCLE_STATE |
 				    KVM_EXEC_FEATURE_EXACT_INTERRUPT |
 				    KVM_EXEC_FEATURE_INTERRUPT_PUBLICATION |
-				    KVM_EXEC_FEATURE_LOCAL_APIC_DELIVERY)) ==
+				    KVM_EXEC_FEATURE_LOCAL_APIC_DELIVERY |
+				    KVM_EXEC_FEATURE_NOTIFICATION_RING)) ==
 		     (KVM_EXEC_FEATURE_BASE_OBJECTS |
 		      KVM_EXEC_FEATURE_INTRA_VM_CHAIN |
 		      KVM_EXEC_FEATURE_CROSS_VM_CHAIN |
@@ -6110,7 +6122,8 @@ int main(int argc, char **argv)
 		      KVM_EXEC_FEATURE_LIFECYCLE_STATE |
 		      KVM_EXEC_FEATURE_EXACT_INTERRUPT |
 		      KVM_EXEC_FEATURE_INTERRUPT_PUBLICATION |
-		      KVM_EXEC_FEATURE_LOCAL_APIC_DELIVERY));
+		      KVM_EXEC_FEATURE_LOCAL_APIC_DELIVERY |
+		      KVM_EXEC_FEATURE_NOTIFICATION_RING));
 	if (argc == 2 && !strcmp(argv[1], "--dynamic-kick-cancel-only")) {
 		test_dynamic_return_kick(kvm_fd);
 		test_dynamic_kick_and_cancel(kvm_fd);

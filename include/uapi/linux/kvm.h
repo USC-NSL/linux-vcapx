@@ -892,6 +892,7 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_FEATURE_INTERRUPT_PUBLICATION (1ULL << 9)
 #define KVM_EXEC_FEATURE_LOCAL_APIC_DELIVERY (1ULL << 10)
 #define KVM_EXEC_FEATURE_POSTED_INTERRUPT_DELIVERY (1ULL << 11)
+#define KVM_EXEC_FEATURE_NOTIFICATION_RING	(1ULL << 12)
 
 #define KVM_EXEC_INTERRUPT_DELIVERY_DIRECT_KICK	1U
 #define KVM_EXEC_INTERRUPT_DELIVERY_LOCAL_APIC_KICK 2U
@@ -928,6 +929,35 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_DISPATCH_MMAP_SIZE	16384U
 
 #define KVM_EXEC_DISPATCH_F_RETURN_IF_EMPTY (1U << 0)
+
+#define KVM_EXEC_NOTIFICATION_ABI_VERSION	1U
+#define KVM_EXEC_NOTIFICATION_RING_ENTRIES	32U
+#define KVM_EXEC_NOTIFICATION_COMMAND_OFFSET	4096U
+#define KVM_EXEC_NOTIFICATION_COMPLETION_OFFSET	8192U
+#define KVM_EXEC_NOTIFICATION_MMAP_SIZE		12288U
+
+#define KVM_EXEC_NOTIFICATION_F_STRICT_CPU	(1U << 0)
+
+#define KVM_EXEC_NOTIFICATION_STATE_CREATED	1U
+#define KVM_EXEC_NOTIFICATION_STATE_RUNNING	2U
+#define KVM_EXEC_NOTIFICATION_STATE_DRAINING	3U
+#define KVM_EXEC_NOTIFICATION_STATE_STOPPED	4U
+#define KVM_EXEC_NOTIFICATION_STATE_FATAL	5U
+
+#define KVM_EXEC_NOTIFICATION_RETURN_DRAINED	1U
+#define KVM_EXEC_NOTIFICATION_RETURN_STOPPED	2U
+#define KVM_EXEC_NOTIFICATION_RETURN_SIGNAL	3U
+#define KVM_EXEC_NOTIFICATION_RETURN_CPU_MIGRATED 4U
+#define KVM_EXEC_NOTIFICATION_RETURN_CORRUPT	5U
+#define KVM_EXEC_NOTIFICATION_RETURN_DOMAIN_STOPPING 6U
+
+#define KVM_EXEC_NOTIFICATION_COMPLETE_DELIVERED	1U
+#define KVM_EXEC_NOTIFICATION_COMPLETE_RETRY	2U
+#define KVM_EXEC_NOTIFICATION_COMPLETE_STALE	3U
+#define KVM_EXEC_NOTIFICATION_COMPLETE_BUSY	4U
+#define KVM_EXEC_NOTIFICATION_COMPLETE_UNSUPPORTED 5U
+#define KVM_EXEC_NOTIFICATION_COMPLETE_MALFORMED	6U
+#define KVM_EXEC_NOTIFICATION_COMPLETE_STOPPED	7U
 
 #define KVM_EXEC_CMD_SWITCH		1U
 #define KVM_EXEC_CMD_RELEASE		2U
@@ -1276,6 +1306,117 @@ struct kvm_exec_query_posted_interrupt {
 	__u64 reserved[5];
 };
 
+struct kvm_exec_notification_header {
+	__u32 abi_version;
+	__u32 region_size;
+	__u32 command_offset;
+	__u32 completion_offset;
+	__u32 command_entries;
+	__u32 completion_entries;
+	__u32 command_entry_size;
+	__u32 completion_entry_size;
+	__u64 command_head;
+	__u64 command_tail;
+	__u64 completion_head;
+	__u64 completion_tail;
+	__u64 heartbeat;
+	__u64 kernel_return_count;
+	__u64 last_consumed_ns;
+	__u64 last_completed_ns;
+	__u64 reserved[20];
+};
+
+struct kvm_exec_notification_command {
+	__u32 size;
+	__u32 flags;
+	__u64 domain_generation;
+	__u64 runner_generation;
+	__u64 executor_generation;
+	__u64 executor_cookie;
+	__u64 request_sequence;
+	__u64 capsule_id;
+	__u64 lifecycle_generation;
+	__u64 correlation_cookie;
+	__u32 vector;
+	__u32 requested_delivery;
+	__u64 reserved[2];
+};
+
+struct kvm_exec_notification_completion {
+	__u32 size;
+	__u32 status;
+	__u32 actual_delivery;
+	__u32 flags;
+	__s32 result;
+	__u32 reserved0;
+	__u64 domain_generation;
+	__u64 runner_generation;
+	__u64 executor_generation;
+	__u64 request_sequence;
+	__u64 correlation_cookie;
+	__u64 consumed_ns;
+	__u64 accepted_tsc;
+	__u64 delivered_tsc;
+	__u64 reserved[3];
+};
+
+struct kvm_exec_create_notification_runner {
+	__u32 size;
+	__u32 flags;
+	__u64 domain_generation;
+	__u32 requested_cpu;
+	__u32 reserved0;
+	__u64 runner_cookie;
+	__u64 runner_generation;
+	__u64 reserved[2];
+};
+
+struct kvm_exec_run_notification {
+	__u32 size;
+	__u32 flags;
+	__u64 domain_generation;
+	__u64 runner_generation;
+	__u32 return_reason;
+	__s32 run_result;
+	__u32 current_cpu;
+	__u32 reserved0;
+	__u64 consumed_count;
+	__u64 completed_count;
+	__u64 reserved[2];
+};
+
+struct kvm_exec_notification_control {
+	__u32 size;
+	__u32 flags;
+	__u64 domain_generation;
+	__u64 runner_generation;
+	__u64 reserved[3];
+};
+
+struct kvm_exec_query_notification_runner {
+	__u32 size;
+	__u32 flags;
+	__u64 domain_generation;
+	__u64 runner_generation;
+	__u64 runner_cookie;
+	__u32 requested_cpu;
+	__u32 observed_cpu;
+	__u32 state;
+	__s32 last_error;
+	__u64 runner_tid;
+	__u64 heartbeat;
+	__u64 consumed_count;
+	__u64 completed_count;
+	__u64 full_count;
+	__u64 malformed_count;
+	__u64 stale_count;
+	__u64 high_watermark;
+	__u64 command_occupancy;
+	__u64 completion_occupancy;
+	__u64 kernel_return_count;
+	__u64 reserved[3];
+};
+
 struct kvm_exec_cancel {
 	__u32 size;
 	__u32 flags;
@@ -1411,6 +1552,21 @@ struct kvm_exec_query_interrupt_publication {
 #define KVM_EXEC_QUERY_POSTED_INTERRUPT \
 				_IOWR(KVMIO, 0xff, \
 				      struct kvm_exec_query_posted_interrupt)
+#define KVM_EXEC_CREATE_NOTIFICATION_RUNNER \
+				_IOWR(KVMIO, 0xe8, \
+				      struct kvm_exec_create_notification_runner)
+#define KVM_EXEC_RUN_NOTIFICATION \
+				_IOWR(KVMIO, 0xe9, \
+				      struct kvm_exec_run_notification)
+#define KVM_EXEC_DRAIN_NOTIFICATION \
+				_IOW(KVMIO, 0xea, \
+				     struct kvm_exec_notification_control)
+#define KVM_EXEC_STOP_NOTIFICATION \
+				_IOW(KVMIO, 0xeb, \
+				     struct kvm_exec_notification_control)
+#define KVM_EXEC_QUERY_NOTIFICATION_RUNNER \
+				_IOWR(KVMIO, 0xec, \
+				      struct kvm_exec_query_notification_runner)
 
 /*
  * Extension capability list.

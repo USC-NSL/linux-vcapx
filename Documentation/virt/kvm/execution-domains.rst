@@ -62,7 +62,9 @@ feature mask on x86-64 and zero elsewhere.  The current dependencies are:
 * ``SYNC_EXITS`` requires ``DYNAMIC_DISPATCH``;
 * ``ASYNC_PIO_WRITE`` requires ``DYNAMIC_DISPATCH`` and ``SYNC_EXITS``;
 * ``RETURN_KICK`` and ``EXACT_INTERRUPT`` require ``DYNAMIC_DISPATCH``;
-* ``INTERRUPT_PUBLICATION`` requires ``EXACT_INTERRUPT``; and
+* ``INTERRUPT_PUBLICATION`` requires ``EXACT_INTERRUPT``;
+* ``NOTIFICATION_RING`` requires ``EXACT_INTERRUPT`` and
+  ``INTERRUPT_PUBLICATION``; and
 * ``LIFECYCLE_STATE`` requires ``DYNAMIC_DISPATCH`` and ``SYNC_EXITS``.
 
 Negotiation is exact: the kernel rejects unsupported requested bits and
@@ -177,6 +179,63 @@ end-to-end comparisons use the host-TSC values without reconstructing them
 from a later userspace clock anchor.  A successful
 exact-interrupt ioctl updates both counts exactly once.  The query is
 observability only; it neither submits nor retries an interrupt.
+
+Polling notification channel
+============================
+
+``KVM_EXEC_FEATURE_NOTIFICATION_RING`` provides an optional, scheduler-neutral
+submission path for exact interrupts.  It changes only how userspace submits a
+request: the command is validated and delivered by the same exact-interrupt
+implementation used by ``KVM_EXEC_INTERRUPT``.  It does not select an executor,
+capsule, vector or delivery mechanism, and it has no implicit retry or fallback.
+
+``KVM_EXEC_CREATE_NOTIFICATION_RUNNER`` creates at most one runner per
+execution domain.  The runner is bound to an explicit possible CPU and requires
+``KVM_EXEC_NOTIFICATION_F_STRICT_CPU``.  Userspace maps exactly
+``KVM_EXEC_NOTIFICATION_MMAP_SIZE`` bytes at offset zero.  The mapping has a
+fixed ABI-v1 header followed by independent 32-entry command and completion
+rings.  It is ``VM_DONTCOPY`` and remains restricted to the domain's creating
+``mm`` and credentials.
+
+The rings are single-producer/single-consumer:
+
+* userspace produces exact-interrupt commands and consumes completions; and
+* the kernel runner consumes commands and produces completions.
+
+For each ring, a producer writes the complete entry before release-storing its
+tail.  The consumer acquire-loads the tail before reading the entry, then
+release-stores its head after consuming it.  Indices are monotonically
+increasing ``u64`` counters and slots are selected modulo
+``KVM_EXEC_NOTIFICATION_RING_ENTRIES``.  Userspace must validate the complete
+header geometry before publishing.  A malformed header, impossible index
+distance or nonzero reserved field makes the runner return
+``KVM_EXEC_NOTIFICATION_RETURN_CORRUPT`` and enter ``FATAL`` state.
+
+One pinned userspace task enters ``KVM_EXEC_RUN_NOTIFICATION`` and remains in
+that ioctl while the kernel continuously checks the command ring.  This is an
+explicit busy-polling interface: it reserves the requested CPU for lowest
+submission latency and intentionally has no polling interval.  Migration from
+the requested CPU returns ``CPU_MIGRATED`` and enters ``FATAL`` state.  A
+different userspace task may publish commands and consume completions without
+another syscall.
+
+Every command carries the exact domain, runner, executor, capsule and lifecycle
+generations, executor cookie, request sequence, vector and requested delivery
+mode.  Every consumed command produces one terminal completion containing the
+same correlation identity, result, actual delivery action, and capture-time
+timestamps when delivery succeeded.  ``RETRY``, ``STALE``, ``BUSY``,
+``UNSUPPORTED``, ``MALFORMED`` and ``STOPPED`` are explicit terminal outcomes;
+the kernel never substitutes another target or delivery mode.
+
+``KVM_EXEC_DRAIN_NOTIFICATION`` consumes all commands already published and
+then returns the runner.  ``KVM_EXEC_STOP_NOTIFICATION`` also rejects remaining
+commands with ``STOPPED`` completions.  If userspace abandons a full completion
+ring during shutdown, the runner returns ``-ENOSPC`` in ``FATAL`` state instead
+of blocking domain teardown indefinitely.  Closing the runner or stopping the
+domain requests the same bounded stop and waits until its kernel task has left
+the run ioctl.  ``KVM_EXEC_QUERY_NOTIFICATION_RUNNER`` reports CPU identity,
+state, errors, heartbeat, occupancy, high-watermark and exact consumed and
+completed counts for reconciliation and resource-cost measurement.
 
 Lifecycle and queries
 =====================

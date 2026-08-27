@@ -21,10 +21,12 @@
 	 KVM_EXEC_FEATURE_RETURN_KICK | KVM_EXEC_FEATURE_LIFECYCLE_STATE | \
 	 KVM_EXEC_FEATURE_EXACT_INTERRUPT | \
 	 KVM_EXEC_FEATURE_INTERRUPT_PUBLICATION | \
-	 KVM_EXEC_FEATURE_LOCAL_APIC_DELIVERY)
+	 KVM_EXEC_FEATURE_LOCAL_APIC_DELIVERY | \
+	 KVM_EXEC_FEATURE_NOTIFICATION_RING)
 
 struct kvm_exec_domain;
 struct kvm_exec_executor;
+struct kvm_exec_notification_runner;
 
 struct kvm_exec_pending_interrupt {
 	u64 sequence;
@@ -169,6 +171,37 @@ struct kvm_exec_executor {
 	bool listed;
 };
 
+struct kvm_exec_notification_runner {
+	struct kref kref;
+	struct kvm_exec_domain *domain;
+	void *region;
+	/* Serializes entry to the long-running runner ioctl. */
+	struct mutex run_lock;
+	/* Protects runner lifecycle flags and state. */
+	spinlock_t state_lock;
+	wait_queue_head_t wait;
+	u64 generation;
+	u64 cookie;
+	atomic64_t heartbeat;
+	atomic64_t consumed_count;
+	atomic64_t completed_count;
+	atomic64_t full_count;
+	atomic64_t malformed_count;
+	atomic64_t stale_count;
+	atomic64_t high_watermark;
+	atomic64_t return_count;
+	u64 runner_tid;
+	u32 requested_cpu;
+	atomic_t observed_cpu;
+	u32 state;
+	int last_error;
+	bool listed;
+	bool running;
+	bool drain_requested;
+	bool stop_requested;
+	bool full_observed;
+};
+
 struct kvm_exec_domain {
 	struct kref kref;
 	struct mm_struct *mm;
@@ -187,6 +220,7 @@ struct kvm_exec_domain {
 	u32 nr_capsule_slots;
 	u32 nr_attached;
 	u32 nr_executors;
+	struct kvm_exec_notification_runner *notification_runner;
 	bool interrupt_delivery_configured;
 	bool paused;
 	bool stopping;
@@ -194,9 +228,11 @@ struct kvm_exec_domain {
 
 static atomic64_t kvm_exec_domain_generation = ATOMIC64_INIT(0);
 static atomic64_t kvm_exec_executor_generation = ATOMIC64_INIT(0);
+static atomic64_t kvm_exec_notification_generation = ATOMIC64_INIT(0);
 
 static const struct file_operations kvm_exec_domain_fops;
 static const struct file_operations kvm_exec_executor_fops;
+static const struct file_operations kvm_exec_notification_fops;
 
 static void kvm_exec_interrupt_clear_retained_halt(
 	struct kvm_exec_executor *executor);
@@ -3226,6 +3262,743 @@ out:
 	return ret;
 }
 
+static struct kvm_exec_notification_header *
+kvm_exec_notification_header(struct kvm_exec_notification_runner *runner)
+{
+	return runner->region;
+}
+
+static struct kvm_exec_notification_command *
+kvm_exec_notification_commands(struct kvm_exec_notification_runner *runner)
+{
+	return runner->region + KVM_EXEC_NOTIFICATION_COMMAND_OFFSET;
+}
+
+static struct kvm_exec_notification_completion *
+kvm_exec_notification_completions(struct kvm_exec_notification_runner *runner)
+{
+	return runner->region + KVM_EXEC_NOTIFICATION_COMPLETION_OFFSET;
+}
+
+static void
+kvm_exec_notification_region_init(struct kvm_exec_notification_runner *runner)
+{
+	struct kvm_exec_notification_header *header =
+		kvm_exec_notification_header(runner);
+
+	header->abi_version = KVM_EXEC_NOTIFICATION_ABI_VERSION;
+	header->region_size = KVM_EXEC_NOTIFICATION_MMAP_SIZE;
+	header->command_offset = KVM_EXEC_NOTIFICATION_COMMAND_OFFSET;
+	header->completion_offset = KVM_EXEC_NOTIFICATION_COMPLETION_OFFSET;
+	header->command_entries = KVM_EXEC_NOTIFICATION_RING_ENTRIES;
+	header->completion_entries = KVM_EXEC_NOTIFICATION_RING_ENTRIES;
+	header->command_entry_size =
+		sizeof(struct kvm_exec_notification_command);
+	header->completion_entry_size =
+		sizeof(struct kvm_exec_notification_completion);
+}
+
+static bool
+kvm_exec_notification_header_valid(struct kvm_exec_notification_runner *runner)
+{
+	struct kvm_exec_notification_header *header =
+		kvm_exec_notification_header(runner);
+
+	return READ_ONCE(header->abi_version) ==
+			KVM_EXEC_NOTIFICATION_ABI_VERSION &&
+	       READ_ONCE(header->region_size) ==
+			KVM_EXEC_NOTIFICATION_MMAP_SIZE &&
+	       READ_ONCE(header->command_offset) ==
+			KVM_EXEC_NOTIFICATION_COMMAND_OFFSET &&
+	       READ_ONCE(header->completion_offset) ==
+			KVM_EXEC_NOTIFICATION_COMPLETION_OFFSET &&
+	       READ_ONCE(header->command_entries) ==
+			KVM_EXEC_NOTIFICATION_RING_ENTRIES &&
+	       READ_ONCE(header->completion_entries) ==
+			KVM_EXEC_NOTIFICATION_RING_ENTRIES &&
+	       READ_ONCE(header->command_entry_size) ==
+			sizeof(struct kvm_exec_notification_command) &&
+	       READ_ONCE(header->completion_entry_size) ==
+			sizeof(struct kvm_exec_notification_completion) &&
+	       !memchr_inv(header->reserved, 0, sizeof(header->reserved));
+}
+
+static u32 kvm_exec_notification_current_cpu(void)
+{
+	u32 cpu = get_cpu();
+
+	put_cpu();
+	return cpu;
+}
+
+static void kvm_exec_notification_update_hwm(struct kvm_exec_notification_runner *runner,
+					     u64 occupancy)
+{
+	s64 desired = occupancy;
+	s64 observed = atomic64_read(&runner->high_watermark);
+
+	while (desired > observed &&
+	       !atomic64_try_cmpxchg(&runner->high_watermark, &observed,
+				     desired))
+		cpu_relax();
+}
+
+static struct kvm_exec_executor *
+kvm_exec_find_executor(struct kvm_exec_domain *domain, u64 generation,
+		       u64 cookie)
+{
+	struct kvm_exec_executor *executor;
+
+	mutex_lock(&domain->lock);
+	list_for_each_entry(executor, &domain->executors, node) {
+		if (executor->generation == generation &&
+		    executor->cookie == cookie && executor->listed) {
+			kref_get(&executor->kref);
+			mutex_unlock(&domain->lock);
+			return executor;
+		}
+	}
+	mutex_unlock(&domain->lock);
+	return NULL;
+}
+
+static u32 kvm_exec_notification_status(int ret)
+{
+	switch (ret) {
+	case 0:
+		return KVM_EXEC_NOTIFICATION_COMPLETE_DELIVERED;
+	case -EAGAIN:
+		return KVM_EXEC_NOTIFICATION_COMPLETE_RETRY;
+	case -ESTALE:
+	case -ENOENT:
+		return KVM_EXEC_NOTIFICATION_COMPLETE_STALE;
+	case -EBUSY:
+		return KVM_EXEC_NOTIFICATION_COMPLETE_BUSY;
+	case -EOPNOTSUPP:
+		return KVM_EXEC_NOTIFICATION_COMPLETE_UNSUPPORTED;
+	case -ESHUTDOWN:
+		return KVM_EXEC_NOTIFICATION_COMPLETE_STOPPED;
+	default:
+		return KVM_EXEC_NOTIFICATION_COMPLETE_MALFORMED;
+	}
+}
+
+static bool kvm_exec_notification_command_valid(struct kvm_exec_notification_runner *runner,
+						const struct kvm_exec_notification_command *command)
+{
+	return command->size == sizeof(*command) &&
+	       !(command->flags & ~KVM_EXEC_INTERRUPT_F_RETAIN_HLT) &&
+	       command->domain_generation == runner->domain->generation &&
+	       command->runner_generation == runner->generation &&
+	       command->executor_generation && command->request_sequence &&
+	       command->capsule_id && command->lifecycle_generation &&
+	       command->vector <= U8_MAX &&
+	       command->requested_delivery ==
+			READ_ONCE(runner->domain->interrupt_delivery) &&
+	       !memchr_inv(command->reserved, 0, sizeof(command->reserved));
+}
+
+static int
+kvm_exec_notification_process(struct kvm_exec_notification_runner *runner,
+			      const struct kvm_exec_notification_command *command,
+			      struct kvm_exec_notification_completion *completion,
+			      bool stopped)
+{
+	struct kvm_exec_interrupt_request request;
+	struct kvm_exec_executor *executor;
+	unsigned long flags;
+	u64 executor_generation;
+	u64 executor_cookie;
+	int ret;
+
+	completion->size = sizeof(*completion);
+	completion->domain_generation = runner->domain->generation;
+	completion->runner_generation = runner->generation;
+	completion->executor_generation = command->executor_generation;
+	completion->request_sequence = command->request_sequence;
+	completion->correlation_cookie = command->correlation_cookie;
+	completion->consumed_ns = ktime_get_ns();
+
+	if (stopped) {
+		ret = -ESHUTDOWN;
+		goto complete;
+	}
+	if (!kvm_exec_notification_command_valid(runner, command)) {
+		ret = -EINVAL;
+		goto complete;
+	}
+
+	executor_generation = command->executor_generation;
+	executor_cookie = command->executor_cookie;
+	executor = kvm_exec_find_executor(runner->domain, executor_generation,
+					  executor_cookie);
+	if (!executor) {
+		ret = -ESTALE;
+		goto complete;
+	}
+
+	request = (struct kvm_exec_interrupt_request) {
+		.domain_generation = command->domain_generation,
+		.executor_generation = command->executor_generation,
+		.request_sequence = command->request_sequence,
+		.capsule_id = command->capsule_id,
+		.lifecycle_generation = command->lifecycle_generation,
+		.correlation_cookie = command->correlation_cookie,
+		.vector = command->vector,
+		.flags = command->flags,
+		.requested_delivery = command->requested_delivery,
+	};
+	ret = kvm_exec_submit_interrupt(executor, &request);
+	if (!ret) {
+		spin_lock_irqsave(&executor->interrupt_lock, flags);
+		completion->actual_delivery = executor->last_interrupt_delivery;
+		completion->accepted_tsc =
+			executor->last_interrupt_accepted_tsc;
+		completion->delivered_tsc =
+			executor->last_interrupt_delivered_tsc;
+		spin_unlock_irqrestore(&executor->interrupt_lock, flags);
+	}
+	kref_put(&executor->kref, kvm_exec_executor_free);
+
+complete:
+	completion->result = ret;
+	completion->status = kvm_exec_notification_status(ret);
+	return ret;
+}
+
+static void kvm_exec_notification_publish(struct kvm_exec_notification_runner *runner,
+					  const struct kvm_exec_notification_completion *completion,
+					  u64 completion_tail)
+{
+	struct kvm_exec_notification_header *header =
+		kvm_exec_notification_header(runner);
+	struct kvm_exec_notification_completion *entries =
+		kvm_exec_notification_completions(runner);
+
+	entries[completion_tail &
+		(KVM_EXEC_NOTIFICATION_RING_ENTRIES - 1)] = *completion;
+	/* Publish the complete payload before userspace observes the new tail. */
+	smp_store_release(&header->completion_tail, completion_tail + 1);
+	WRITE_ONCE(header->last_completed_ns, ktime_get_ns());
+}
+
+static long
+kvm_exec_run_notification(struct kvm_exec_notification_runner *runner,
+			  void __user *argp)
+{
+	struct kvm_exec_notification_header *header =
+		kvm_exec_notification_header(runner);
+	struct kvm_exec_notification_command *commands =
+		kvm_exec_notification_commands(runner);
+	const struct kvm_exec_notification_command *command;
+	struct kvm_exec_notification_completion completion;
+	struct kvm_exec_run_notification run;
+	unsigned long flags;
+	u64 command_head, command_tail, completion_head, completion_tail;
+	u64 command_occupancy, completion_occupancy;
+	u64 iterations = 0;
+	u64 heartbeat, return_count;
+	u32 return_reason = 0;
+	bool force_stop = false;
+	int fatal_error = 0;
+	int ret;
+
+	ret = kvm_exec_domain_access(runner->domain);
+	if (ret)
+		return ret;
+	if (copy_from_user(&run, argp, sizeof(run)))
+		return -EFAULT;
+	if (run.size != sizeof(run) || run.flags ||
+	    run.domain_generation != runner->domain->generation ||
+	    run.runner_generation != runner->generation || run.return_reason ||
+	    run.run_result || run.current_cpu || run.reserved0 ||
+	    run.consumed_count || run.completed_count ||
+	    memchr_inv(run.reserved, 0, sizeof(run.reserved)))
+		return -EINVAL;
+	if (mutex_lock_killable(&runner->run_lock))
+		return -EINTR;
+
+	spin_lock_irqsave(&runner->state_lock, flags);
+	if (runner->state != KVM_EXEC_NOTIFICATION_STATE_CREATED ||
+	    runner->running) {
+		spin_unlock_irqrestore(&runner->state_lock, flags);
+		ret = -EBUSY;
+		goto out_unlock;
+	}
+	atomic_set(&runner->observed_cpu,
+		   kvm_exec_notification_current_cpu());
+	if (atomic_read(&runner->observed_cpu) != runner->requested_cpu) {
+		runner->state = KVM_EXEC_NOTIFICATION_STATE_FATAL;
+		runner->last_error = -EXDEV;
+		spin_unlock_irqrestore(&runner->state_lock, flags);
+		ret = -EXDEV;
+		goto out_unlock;
+	}
+	runner->state = KVM_EXEC_NOTIFICATION_STATE_RUNNING;
+	runner->runner_tid = task_pid_nr(current);
+	runner->running = true;
+	spin_unlock_irqrestore(&runner->state_lock, flags);
+
+	for (;;) {
+		bool drain_requested, stop_requested;
+		u32 cpu;
+
+		if (unlikely(READ_ONCE(runner->domain->stopping))) {
+			force_stop = true;
+			return_reason =
+				KVM_EXEC_NOTIFICATION_RETURN_DOMAIN_STOPPING;
+		}
+		if (unlikely(signal_pending(current))) {
+			force_stop = true;
+			return_reason = KVM_EXEC_NOTIFICATION_RETURN_SIGNAL;
+		}
+		cpu = kvm_exec_notification_current_cpu();
+		if (unlikely(cpu != runner->requested_cpu)) {
+			force_stop = true;
+			return_reason =
+				KVM_EXEC_NOTIFICATION_RETURN_CPU_MIGRATED;
+			fatal_error = -EXDEV;
+		}
+		atomic_set(&runner->observed_cpu, cpu);
+
+		spin_lock_irqsave(&runner->state_lock, flags);
+		drain_requested = runner->drain_requested;
+		stop_requested = runner->stop_requested;
+		if (stop_requested)
+			force_stop = true;
+		spin_unlock_irqrestore(&runner->state_lock, flags);
+		if (stop_requested && !return_reason)
+			return_reason = KVM_EXEC_NOTIFICATION_RETURN_STOPPED;
+
+		if (unlikely(!kvm_exec_notification_header_valid(runner))) {
+			return_reason = KVM_EXEC_NOTIFICATION_RETURN_CORRUPT;
+			fatal_error = -EPROTO;
+			break;
+		}
+
+		command_head = READ_ONCE(header->command_head);
+		/* Acquire the producer tail before reading its command payload. */
+		command_tail = smp_load_acquire(&header->command_tail);
+		/* Acquire userspace's release before reusing a completion slot. */
+		completion_head = smp_load_acquire(&header->completion_head);
+		completion_tail = READ_ONCE(header->completion_tail);
+		command_occupancy = command_tail - command_head;
+		completion_occupancy = completion_tail - completion_head;
+		if (unlikely(command_occupancy >
+			     KVM_EXEC_NOTIFICATION_RING_ENTRIES ||
+		     completion_occupancy >
+			     KVM_EXEC_NOTIFICATION_RING_ENTRIES)) {
+			return_reason = KVM_EXEC_NOTIFICATION_RETURN_CORRUPT;
+			fatal_error = -EPROTO;
+			break;
+		}
+		kvm_exec_notification_update_hwm(runner, command_occupancy);
+
+		if (!command_occupancy) {
+			if (force_stop || drain_requested) {
+				if (!return_reason)
+					return_reason =
+						KVM_EXEC_NOTIFICATION_RETURN_DRAINED;
+				break;
+			}
+			cpu_relax();
+			goto heartbeat;
+		}
+		if (completion_occupancy ==
+		    KVM_EXEC_NOTIFICATION_RING_ENTRIES) {
+			if (!runner->full_observed) {
+				atomic64_inc(&runner->full_count);
+				runner->full_observed = true;
+			}
+			/*
+			 * A producer that stops consuming completions must not be
+			 * able to pin domain teardown indefinitely.  Commands still
+			 * in the ring were never accepted, so fail the runner instead
+			 * of waiting for completion space that cannot be guaranteed.
+			 */
+			if (force_stop) {
+				fatal_error = -ENOSPC;
+				break;
+			}
+			cpu_relax();
+			goto heartbeat;
+		}
+		runner->full_observed = false;
+
+		memset(&completion, 0, sizeof(completion));
+		command = &commands[command_head &
+			(KVM_EXEC_NOTIFICATION_RING_ENTRIES - 1)];
+		kvm_exec_notification_process(runner, command, &completion,
+					      force_stop);
+		/* Release the command slot only after its payload is consumed. */
+		smp_store_release(&header->command_head, command_head + 1);
+		WRITE_ONCE(header->last_consumed_ns, completion.consumed_ns);
+		atomic64_inc(&runner->consumed_count);
+		if (completion.status ==
+		    KVM_EXEC_NOTIFICATION_COMPLETE_MALFORMED)
+			atomic64_inc(&runner->malformed_count);
+		if (completion.status == KVM_EXEC_NOTIFICATION_COMPLETE_STALE)
+			atomic64_inc(&runner->stale_count);
+		kvm_exec_notification_publish(runner, &completion,
+					      completion_tail);
+		atomic64_inc(&runner->completed_count);
+
+heartbeat:
+		heartbeat = atomic64_inc_return(&runner->heartbeat);
+		if (!(heartbeat & 0xff))
+			WRITE_ONCE(header->heartbeat, heartbeat);
+		if (!(++iterations & 0xfff))
+			cond_resched();
+	}
+
+	spin_lock_irqsave(&runner->state_lock, flags);
+	runner->running = false;
+	runner->last_error = fatal_error;
+	runner->state = runner->last_error ?
+		KVM_EXEC_NOTIFICATION_STATE_FATAL :
+		KVM_EXEC_NOTIFICATION_STATE_STOPPED;
+	run.current_cpu = atomic_read(&runner->observed_cpu);
+	run.consumed_count = atomic64_read(&runner->consumed_count);
+	run.completed_count = atomic64_read(&runner->completed_count);
+	spin_unlock_irqrestore(&runner->state_lock, flags);
+	return_count = atomic64_inc_return(&runner->return_count);
+	run.return_reason = return_reason;
+	run.run_result = fatal_error;
+	WRITE_ONCE(header->heartbeat, atomic64_read(&runner->heartbeat));
+	WRITE_ONCE(header->kernel_return_count, return_count);
+	wake_up_all(&runner->wait);
+	ret = copy_to_user(argp, &run, sizeof(run)) ? -EFAULT : 0;
+
+out_unlock:
+	mutex_unlock(&runner->run_lock);
+	return ret;
+}
+
+static bool kvm_exec_notification_control_valid(struct kvm_exec_notification_runner *runner,
+						const struct kvm_exec_notification_control *control)
+{
+	return control->size == sizeof(*control) && !control->flags &&
+	       control->domain_generation == runner->domain->generation &&
+	       control->runner_generation == runner->generation &&
+	       !memchr_inv(control->reserved, 0, sizeof(control->reserved));
+}
+
+static long
+kvm_exec_notification_control(struct kvm_exec_notification_runner *runner,
+			      void __user *argp, bool stop)
+{
+	struct kvm_exec_notification_control control;
+	unsigned long flags;
+	int ret;
+
+	ret = kvm_exec_domain_access(runner->domain);
+	if (ret)
+		return ret;
+	if (copy_from_user(&control, argp, sizeof(control)))
+		return -EFAULT;
+	if (!kvm_exec_notification_control_valid(runner, &control))
+		return -EINVAL;
+
+	spin_lock_irqsave(&runner->state_lock, flags);
+	if (!runner->running) {
+		ret = -EALREADY;
+	} else {
+		runner->drain_requested = true;
+		runner->stop_requested |= stop;
+		runner->state = KVM_EXEC_NOTIFICATION_STATE_DRAINING;
+		ret = 0;
+	}
+	spin_unlock_irqrestore(&runner->state_lock, flags);
+	return ret;
+}
+
+static long
+kvm_exec_query_notification(struct kvm_exec_notification_runner *runner,
+			    void __user *argp)
+{
+	struct kvm_exec_notification_header *header =
+		kvm_exec_notification_header(runner);
+	struct kvm_exec_query_notification_runner query;
+	unsigned long flags;
+	u64 command_head, command_tail, completion_head, completion_tail;
+	int ret;
+
+	ret = kvm_exec_domain_access(runner->domain);
+	if (ret)
+		return ret;
+	if (copy_from_user(&query, argp, sizeof(query)))
+		return -EFAULT;
+	if (query.size != sizeof(query) || query.flags ||
+	    query.domain_generation != runner->domain->generation ||
+	    query.runner_generation != runner->generation ||
+	    query.runner_cookie || query.requested_cpu || query.observed_cpu ||
+	    query.state || query.last_error || query.runner_tid ||
+	    query.heartbeat || query.consumed_count || query.completed_count ||
+	    query.full_count || query.malformed_count || query.stale_count ||
+	    query.high_watermark || query.command_occupancy ||
+	    query.completion_occupancy || query.kernel_return_count ||
+	    memchr_inv(query.reserved, 0, sizeof(query.reserved)))
+		return -EINVAL;
+
+	/* Pair with both producers before reporting a coherent occupancy. */
+	command_head = smp_load_acquire(&header->command_head);
+	/* Acquire the userspace command publication point. */
+	command_tail = smp_load_acquire(&header->command_tail);
+	/* Acquire the userspace completion-consumption point. */
+	completion_head = smp_load_acquire(&header->completion_head);
+	/* Acquire the kernel completion publication point. */
+	completion_tail = smp_load_acquire(&header->completion_tail);
+	spin_lock_irqsave(&runner->state_lock, flags);
+	query.runner_cookie = runner->cookie;
+	query.requested_cpu = runner->requested_cpu;
+	query.observed_cpu = atomic_read(&runner->observed_cpu);
+	query.state = runner->state;
+	query.last_error = runner->last_error;
+	query.runner_tid = runner->runner_tid;
+	query.heartbeat = atomic64_read(&runner->heartbeat);
+	query.consumed_count = atomic64_read(&runner->consumed_count);
+	query.completed_count = atomic64_read(&runner->completed_count);
+	query.full_count = atomic64_read(&runner->full_count);
+	query.malformed_count = atomic64_read(&runner->malformed_count);
+	query.stale_count = atomic64_read(&runner->stale_count);
+	query.high_watermark = atomic64_read(&runner->high_watermark);
+	query.kernel_return_count = atomic64_read(&runner->return_count);
+	spin_unlock_irqrestore(&runner->state_lock, flags);
+	query.command_occupancy = command_tail - command_head;
+	query.completion_occupancy = completion_tail - completion_head;
+	memset(query.reserved, 0, sizeof(query.reserved));
+
+	return copy_to_user(argp, &query, sizeof(query)) ? -EFAULT : 0;
+}
+
+static void
+kvm_exec_notification_request_stop(struct kvm_exec_notification_runner *runner)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&runner->state_lock, flags);
+	runner->drain_requested = true;
+	runner->stop_requested = true;
+	if (runner->running)
+		runner->state = KVM_EXEC_NOTIFICATION_STATE_DRAINING;
+	spin_unlock_irqrestore(&runner->state_lock, flags);
+}
+
+static void kvm_exec_notification_free(struct kref *kref)
+{
+	struct kvm_exec_notification_runner *runner =
+		container_of(kref, struct kvm_exec_notification_runner, kref);
+
+	if (runner->region)
+		free_pages_exact(runner->region,
+				 KVM_EXEC_NOTIFICATION_MMAP_SIZE);
+	kref_put(&runner->domain->kref, kvm_exec_domain_free);
+	kfree(runner);
+}
+
+static int kvm_exec_notification_flush(struct file *file, fl_owner_t id)
+{
+	struct kvm_exec_notification_runner *runner = file->private_data;
+
+	kvm_exec_notification_request_stop(runner);
+	return 0;
+}
+
+static int kvm_exec_notification_release(struct inode *inode, struct file *file)
+{
+	struct kvm_exec_notification_runner *runner = file->private_data;
+	struct kvm_exec_domain *domain = runner->domain;
+
+	kvm_exec_notification_request_stop(runner);
+	wait_event(runner->wait, !READ_ONCE(runner->running));
+	mutex_lock(&domain->lock);
+	if (runner->listed) {
+		WARN_ON_ONCE(domain->notification_runner != runner);
+		domain->notification_runner = NULL;
+		runner->listed = false;
+	}
+	mutex_unlock(&domain->lock);
+	kref_put(&runner->kref, kvm_exec_notification_free);
+	return 0;
+}
+
+static long kvm_exec_notification_ioctl(struct file *file,
+					unsigned int ioctl, unsigned long arg)
+{
+	struct kvm_exec_notification_runner *runner = file->private_data;
+	void __user *argp = (void __user *)arg;
+
+	if (_IOC_TYPE(ioctl) != KVMIO)
+		return -EINVAL;
+	switch (ioctl) {
+	case KVM_EXEC_RUN_NOTIFICATION:
+		return kvm_exec_run_notification(runner, argp);
+	case KVM_EXEC_DRAIN_NOTIFICATION:
+		return kvm_exec_notification_control(runner, argp, false);
+	case KVM_EXEC_STOP_NOTIFICATION:
+		return kvm_exec_notification_control(runner, argp, true);
+	case KVM_EXEC_QUERY_NOTIFICATION_RUNNER:
+		return kvm_exec_query_notification(runner, argp);
+	default:
+		return -ENOTTY;
+	}
+}
+
+static void kvm_exec_notification_vma_open(struct vm_area_struct *vma)
+{
+	struct kvm_exec_notification_runner *runner = vma->vm_private_data;
+
+	kref_get(&runner->kref);
+}
+
+static void kvm_exec_notification_vma_close(struct vm_area_struct *vma)
+{
+	struct kvm_exec_notification_runner *runner = vma->vm_private_data;
+
+	kref_put(&runner->kref, kvm_exec_notification_free);
+}
+
+static const struct vm_operations_struct kvm_exec_notification_vm_ops = {
+	.open = kvm_exec_notification_vma_open,
+	.close = kvm_exec_notification_vma_close,
+};
+
+static int kvm_exec_notification_mmap(struct file *file,
+				      struct vm_area_struct *vma)
+{
+	struct kvm_exec_notification_runner *runner = file->private_data;
+	unsigned long size = vma->vm_end - vma->vm_start;
+	unsigned long pfn;
+	int ret;
+
+	ret = kvm_exec_domain_access(runner->domain);
+	if (ret)
+		return ret;
+	if (vma->vm_pgoff || size != KVM_EXEC_NOTIFICATION_MMAP_SIZE ||
+	    !(vma->vm_flags & VM_SHARED) || (vma->vm_flags & VM_EXEC))
+		return -EINVAL;
+
+	pfn = page_to_pfn(virt_to_page(runner->region));
+	vm_flags_set(vma, VM_DONTCOPY | VM_DONTEXPAND | VM_DONTDUMP);
+	vma->vm_ops = &kvm_exec_notification_vm_ops;
+	vma->vm_private_data = runner;
+	kvm_exec_notification_vma_open(vma);
+	ret = remap_pfn_range(vma, vma->vm_start, pfn, size,
+			      vma->vm_page_prot);
+	if (ret)
+		kvm_exec_notification_vma_close(vma);
+	return ret;
+}
+
+static const struct file_operations kvm_exec_notification_fops = {
+	.owner = THIS_MODULE,
+	.flush = kvm_exec_notification_flush,
+	.release = kvm_exec_notification_release,
+	.unlocked_ioctl = kvm_exec_notification_ioctl,
+	.mmap = kvm_exec_notification_mmap,
+	.llseek = noop_llseek,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl = kvm_exec_notification_ioctl,
+#endif
+};
+
+static long
+kvm_exec_create_notification_runner(struct kvm_exec_domain *domain,
+				    void __user *argp)
+{
+	struct kvm_exec_create_notification_runner create;
+	struct kvm_exec_notification_runner *runner;
+	struct file *file;
+	int fd, ret;
+
+	if (!(domain->negotiated_features &
+	      KVM_EXEC_FEATURE_NOTIFICATION_RING))
+		return -EOPNOTSUPP;
+	if (copy_from_user(&create, argp, sizeof(create)))
+		return -EFAULT;
+	if (create.size != sizeof(create) ||
+	    create.flags != KVM_EXEC_NOTIFICATION_F_STRICT_CPU ||
+	    create.domain_generation != domain->generation ||
+	    create.requested_cpu >= nr_cpu_ids ||
+	    !cpu_possible(create.requested_cpu) || create.reserved0 ||
+	    create.runner_generation ||
+	    memchr_inv(create.reserved, 0, sizeof(create.reserved)))
+		return -EINVAL;
+
+	fd = get_unused_fd_flags(O_CLOEXEC);
+	if (fd < 0)
+		return fd;
+	runner = kzalloc(sizeof(*runner), GFP_KERNEL_ACCOUNT);
+	if (!runner) {
+		put_unused_fd(fd);
+		return -ENOMEM;
+	}
+	runner->region = alloc_pages_exact(KVM_EXEC_NOTIFICATION_MMAP_SIZE,
+					   GFP_KERNEL_ACCOUNT | __GFP_ZERO);
+	if (!runner->region) {
+		kfree(runner);
+		put_unused_fd(fd);
+		return -ENOMEM;
+	}
+
+	runner->domain = domain;
+	runner->generation =
+		kvm_exec_next_generation(&kvm_exec_notification_generation);
+	runner->cookie = create.runner_cookie;
+	runner->requested_cpu = create.requested_cpu;
+	atomic_set(&runner->observed_cpu, KVM_EXEC_CPU_ANY);
+	runner->state = KVM_EXEC_NOTIFICATION_STATE_CREATED;
+	kref_init(&runner->kref);
+	mutex_init(&runner->run_lock);
+	spin_lock_init(&runner->state_lock);
+	init_waitqueue_head(&runner->wait);
+	atomic64_set(&runner->heartbeat, 0);
+	atomic64_set(&runner->consumed_count, 0);
+	atomic64_set(&runner->completed_count, 0);
+	atomic64_set(&runner->full_count, 0);
+	atomic64_set(&runner->malformed_count, 0);
+	atomic64_set(&runner->stale_count, 0);
+	atomic64_set(&runner->high_watermark, 0);
+	atomic64_set(&runner->return_count, 0);
+	kvm_exec_notification_region_init(runner);
+	kref_get(&domain->kref);
+	file = anon_inode_getfile("kvm-exec-notification",
+				  &kvm_exec_notification_fops, runner, O_RDWR);
+	if (IS_ERR(file)) {
+		ret = PTR_ERR(file);
+		kref_put(&runner->kref, kvm_exec_notification_free);
+		put_unused_fd(fd);
+		return ret;
+	}
+
+	mutex_lock(&domain->lock);
+	if (domain->stopping) {
+		ret = -ESHUTDOWN;
+	} else if (domain->notification_runner) {
+		ret = -EBUSY;
+	} else {
+		domain->notification_runner = runner;
+		runner->listed = true;
+		ret = 0;
+	}
+	mutex_unlock(&domain->lock);
+	if (ret)
+		goto out_file;
+
+	create.runner_generation = runner->generation;
+	if (copy_to_user(argp, &create, sizeof(create))) {
+		ret = -EFAULT;
+		goto out_file;
+	}
+	fd_install(fd, file);
+	return fd;
+
+out_file:
+	fput(file);
+	put_unused_fd(fd);
+	return ret;
+}
+
 static long kvm_exec_interrupt(struct kvm_exec_executor *executor,
 			       void __user *argp)
 {
@@ -3636,6 +4409,7 @@ static const struct file_operations kvm_exec_executor_fops = {
 
 static void kvm_exec_domain_stop(struct kvm_exec_domain *domain)
 {
+	struct kvm_exec_notification_runner *runner = NULL;
 	struct kvm_exec_capsule *capsule;
 	struct file *vcpu_file;
 	unsigned long index;
@@ -3643,8 +4417,17 @@ static void kvm_exec_domain_stop(struct kvm_exec_domain *domain)
 	mutex_lock(&domain->lock);
 	domain->stopping = true;
 	domain->paused = true;
+	if (domain->notification_runner) {
+		runner = domain->notification_runner;
+		kref_get(&runner->kref);
+	}
 	kvm_exec_kick_running_locked(domain);
 	mutex_unlock(&domain->lock);
+	if (runner) {
+		kvm_exec_notification_request_stop(runner);
+		wait_event(runner->wait, !READ_ONCE(runner->running));
+		kref_put(&runner->kref, kvm_exec_notification_free);
+	}
 
 	wait_event(domain->drain_wait, !atomic_read(&domain->active_runs));
 
@@ -3711,7 +4494,8 @@ static long kvm_exec_configure_interrupt_delivery(
 	if (domain->stopping) {
 		ret = -ESHUTDOWN;
 	} else if (domain->interrupt_delivery_configured ||
-		   domain->nr_attached || domain->nr_executors) {
+		   domain->nr_attached || domain->nr_executors ||
+		   domain->notification_runner) {
 		ret = -EBUSY;
 	} else {
 		domain->interrupt_delivery = config.delivery;
@@ -3744,6 +4528,8 @@ static long kvm_exec_domain_ioctl(struct file *file, unsigned int ioctl,
 		return kvm_exec_detach_vcpu(domain, argp);
 	case KVM_EXEC_CREATE_EXECUTOR:
 		return kvm_exec_create_executor(domain, argp);
+	case KVM_EXEC_CREATE_NOTIFICATION_RUNNER:
+		return kvm_exec_create_notification_runner(domain, argp);
 	case KVM_EXEC_QUERY_CAPSULE:
 		return kvm_exec_query_capsule(domain, argp);
 	case KVM_EXEC_PAUSE:
@@ -3823,6 +4609,13 @@ int kvm_dev_ioctl_create_exec_domain(void __user *argp)
 	       KVM_EXEC_FEATURE_INTERRUPT_PUBLICATION)) !=
 	     (KVM_EXEC_FEATURE_LOCAL_APIC_DELIVERY |
 	      KVM_EXEC_FEATURE_EXACT_INTERRUPT |
+	      KVM_EXEC_FEATURE_INTERRUPT_PUBLICATION)) ||
+	    ((create.requested_features &
+	      KVM_EXEC_FEATURE_NOTIFICATION_RING) &&
+	     (create.requested_features &
+	      (KVM_EXEC_FEATURE_EXACT_INTERRUPT |
+	       KVM_EXEC_FEATURE_INTERRUPT_PUBLICATION)) !=
+	     (KVM_EXEC_FEATURE_EXACT_INTERRUPT |
 	      KVM_EXEC_FEATURE_INTERRUPT_PUBLICATION)) ||
 	    ((create.requested_features & KVM_EXEC_FEATURE_LIFECYCLE_STATE) &&
 	     (create.requested_features &
