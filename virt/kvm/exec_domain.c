@@ -2956,10 +2956,15 @@ kvm_exec_deliver_interrupt_local_apic_locked(
 	int ret;
 
 	lockdep_assert_held(&executor->domain->lock);
-	mutex_lock(&capsule->vcpu->mutex);
+	/*
+	 * This ioctl intentionally runs concurrently with the persistent task's
+	 * KVM_RUN.  Taking vcpu->mutex here would wait for that run to return,
+	 * while the vector and kick below are what make it return.  The LAPIC
+	 * injection path is already designed for cross-vCPU callers and provides
+	 * its own atomic IRR synchronization.
+	 */
 	ret = kvm_arch_vcpu_exec_queue_local_apic_interrupt(
 		capsule->vcpu, request->vector, &coalesced);
-	mutex_unlock(&capsule->vcpu->mutex);
 	if (ret)
 		return ret;
 
