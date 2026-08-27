@@ -4272,6 +4272,37 @@ static int vmx_deliver_posted_interrupt(struct kvm_vcpu *vcpu, int vector)
 	return 0;
 }
 
+static bool vmx_exec_posted_interrupt_supported(void)
+{
+	return enable_apicv && cpu_has_vmx_posted_intr();
+}
+
+static bool vmx_exec_deliver_posted_interrupt(struct kvm_vcpu *vcpu,
+					       int vector, bool *coalesced)
+{
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+
+	*coalesced = false;
+	if (!vmx_exec_posted_interrupt_supported() ||
+	    !vcpu->arch.apic || !vcpu->arch.apic->apicv_active ||
+	    READ_ONCE(vcpu->mode) != IN_GUEST_MODE || vcpu->cpu < 0 ||
+	    READ_ONCE(vmx->pi_desc.nv) != POSTED_INTR_VECTOR ||
+	    pi_test_sn(&vmx->pi_desc))
+		return false;
+
+	if (pi_test_and_set_pir(vector, &vmx->pi_desc)) {
+		*coalesced = true;
+		return true;
+	}
+	if (pi_test_and_set_on(&vmx->pi_desc)) {
+		*coalesced = true;
+		return true;
+	}
+
+	kvm_vcpu_trigger_posted_interrupt(vcpu, POSTED_INTR_VECTOR);
+	return true;
+}
+
 static void vmx_deliver_interrupt(struct kvm_lapic *apic, int delivery_mode,
 				  int trig_mode, int vector)
 {
@@ -8349,6 +8380,8 @@ static struct kvm_x86_ops vmx_x86_ops __initdata = {
 	.guest_apic_has_interrupt = vmx_guest_apic_has_interrupt,
 	.sync_pir_to_irr = vmx_sync_pir_to_irr,
 	.deliver_interrupt = vmx_deliver_interrupt,
+	.exec_posted_interrupt_supported = vmx_exec_posted_interrupt_supported,
+	.exec_deliver_posted_interrupt = vmx_exec_deliver_posted_interrupt,
 	.dy_apicv_has_pending_interrupt = pi_has_pending_interrupt,
 
 	.set_tss_addr = vmx_set_tss_addr,

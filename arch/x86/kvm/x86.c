@@ -73,6 +73,7 @@
 #include <asm/pkru.h>
 #include <linux/kernel_stat.h>
 #include <asm/fpu/api.h>
+#include <asm/hardirq.h>
 #include <asm/fpu/xcr.h>
 #include <asm/fpu/xstate.h>
 #include <asm/pvclock.h>
@@ -11349,6 +11350,12 @@ bool kvm_arch_vcpu_exec_copy_pio_data(struct kvm_vcpu *vcpu, void *data,
 	return true;
 }
 
+u64 kvm_arch_exec_supported_features(void)
+{
+	return static_call(kvm_x86_exec_posted_interrupt_supported)() ?
+		KVM_EXEC_FEATURE_POSTED_INTERRUPT_DELIVERY : 0;
+}
+
 int kvm_arch_vcpu_exec_inject_interrupt(struct kvm_vcpu *vcpu, u32 vector)
 {
 	struct kvm_interrupt irq = {
@@ -11373,10 +11380,18 @@ int kvm_arch_vcpu_exec_configure_interrupt_delivery(struct kvm_vcpu *vcpu,
 	struct kvm *kvm = vcpu->kvm;
 	int count;
 
-	if (delivery != KVM_EXEC_INTERRUPT_DELIVERY_LOCAL_APIC_KICK)
+	if (delivery != KVM_EXEC_INTERRUPT_DELIVERY_LOCAL_APIC_KICK &&
+	    delivery != KVM_EXEC_INTERRUPT_DELIVERY_POSTED)
 		return -EOPNOTSUPP;
 	if (!lapic_in_kernel(vcpu))
 		return -EOPNOTSUPP;
+	if (delivery == KVM_EXEC_INTERRUPT_DELIVERY_POSTED) {
+		if (!static_call(kvm_x86_exec_posted_interrupt_supported)())
+			return -EOPNOTSUPP;
+		if (enable && !kvm_vcpu_apicv_active(vcpu))
+			return -EOPNOTSUPP;
+		return 0;
+	}
 
 	if (enable) {
 		count = atomic_inc_return(
@@ -11424,10 +11439,36 @@ int kvm_arch_vcpu_exec_queue_local_apic_interrupt(struct kvm_vcpu *vcpu,
 }
 
 void kvm_arch_vcpu_exec_cancel_local_apic_interrupt(struct kvm_vcpu *vcpu,
-						     u32 vector)
+					     u32 vector)
 {
 	if (lapic_in_kernel(vcpu))
 		kvm_apic_cancel_irq(vcpu, vector);
+}
+
+int kvm_arch_vcpu_exec_queue_posted_interrupt(struct kvm_vcpu *vcpu,
+					       u32 vector,
+					       bool *coalesced)
+{
+	if (vector > U8_MAX || !lapic_in_kernel(vcpu) ||
+	    !static_call(kvm_x86_exec_posted_interrupt_supported)())
+		return -EOPNOTSUPP;
+	if (!static_call(kvm_x86_exec_deliver_posted_interrupt)(vcpu, vector,
+							 coalesced))
+		return -EAGAIN;
+	return 0;
+}
+
+bool kvm_arch_vcpu_exec_posted_interrupt_active(struct kvm_vcpu *vcpu)
+{
+	return lapic_in_kernel(vcpu) && kvm_vcpu_apicv_active(vcpu) &&
+	       static_call(kvm_x86_exec_posted_interrupt_supported)();
+}
+
+u64 kvm_arch_exec_posted_notification_exits(u32 cpu)
+{
+	if (cpu >= nr_cpu_ids || !cpu_possible(cpu))
+		return 0;
+	return per_cpu(irq_stat, cpu).kvm_posted_intr_ipis;
 }
 
 int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)

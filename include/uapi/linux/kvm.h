@@ -891,10 +891,14 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_FEATURE_EXACT_INTERRUPT (1ULL << 8)
 #define KVM_EXEC_FEATURE_INTERRUPT_PUBLICATION (1ULL << 9)
 #define KVM_EXEC_FEATURE_LOCAL_APIC_DELIVERY (1ULL << 10)
+#define KVM_EXEC_FEATURE_POSTED_INTERRUPT_DELIVERY (1ULL << 11)
 
 #define KVM_EXEC_INTERRUPT_DELIVERY_DIRECT_KICK	1U
 #define KVM_EXEC_INTERRUPT_DELIVERY_LOCAL_APIC_KICK 2U
+#define KVM_EXEC_INTERRUPT_DELIVERY_POSTED	3U
 #define KVM_EXEC_INTERRUPT_DELIVERY_COALESCED	4U
+#define KVM_EXEC_INTERRUPT_DELIVERY_ROOT_MODE_QUEUE 5U
+#define KVM_EXEC_INTERRUPT_DELIVERY_FALLBACK	6U
 #define KVM_EXEC_CPU_ANY		((__u32)-1)
 
 #define KVM_EXEC_TRACE_MAX_ENTRIES	256U
@@ -1251,6 +1255,27 @@ struct kvm_exec_query_interrupt_delivery {
 	__u64 reserved[5];
 };
 
+struct kvm_exec_query_posted_interrupt {
+	__u32 size;
+	__u32 flags;
+	__u64 domain_generation;
+	__u64 executor_generation;
+	__u64 posted_count;
+	__u64 notification_coalesced_count;
+	__u64 root_mode_rejection_count;
+	__u64 inactive_rejection_count;
+	__u64 stale_rejection_count;
+	__u64 disarmed_count;
+	__u64 superseded_count;
+	__u64 target_notification_exit_count;
+	__u64 pending_sequence;
+	__u64 last_notification_cpu;
+	__u64 last_delivery_tsc;
+	__u32 apicv_active;
+	__u32 strict_mode;
+	__u64 reserved[5];
+};
+
 struct kvm_exec_cancel {
 	__u32 size;
 	__u32 flags;
@@ -1383,6 +1408,9 @@ struct kvm_exec_query_interrupt_publication {
 #define KVM_EXEC_QUERY_INTERRUPT_DELIVERY \
 				_IOWR(KVMIO, 0xff, \
 				      struct kvm_exec_query_interrupt_delivery)
+#define KVM_EXEC_QUERY_POSTED_INTERRUPT \
+				_IOWR(KVMIO, 0xff, \
+				      struct kvm_exec_query_posted_interrupt)
 
 /*
  * Extension capability list.
