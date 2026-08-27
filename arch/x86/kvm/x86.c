@@ -9960,6 +9960,7 @@ static void kvm_apicv_init(struct kvm *kvm)
 	unsigned long *inhibits = &kvm->arch.apicv_inhibit_reasons;
 
 	init_rwsem(&kvm->arch.apicv_update_lock);
+	atomic_set(&kvm->arch.exact_interrupt_apicv_inhibit_count, 0);
 
 	set_or_clear_apicv_inhibit(inhibits, APICV_INHIBIT_REASON_ABSENT, true);
 
@@ -11363,6 +11364,70 @@ int kvm_arch_vcpu_exec_inject_interrupt(struct kvm_vcpu *vcpu, u32 vector)
 
 	vcpu->run->request_interrupt_window = 0;
 	return kvm_vcpu_ioctl_interrupt(vcpu, &irq);
+}
+
+int kvm_arch_vcpu_exec_configure_interrupt_delivery(struct kvm_vcpu *vcpu,
+						     u32 delivery,
+						     bool enable)
+{
+	struct kvm *kvm = vcpu->kvm;
+	int count;
+
+	if (delivery != KVM_EXEC_INTERRUPT_DELIVERY_LOCAL_APIC_KICK)
+		return -EOPNOTSUPP;
+	if (!lapic_in_kernel(vcpu))
+		return -EOPNOTSUPP;
+
+	if (enable) {
+		count = atomic_inc_return(
+			&kvm->arch.exact_interrupt_apicv_inhibit_count);
+		if (count == 1)
+			kvm_set_apicv_inhibit(
+				kvm,
+				APICV_INHIBIT_REASON_EXACT_INTERRUPT_CONTROL);
+		return 0;
+	}
+
+	count = atomic_dec_return(
+		&kvm->arch.exact_interrupt_apicv_inhibit_count);
+	if (WARN_ON_ONCE(count < 0)) {
+		atomic_set(&kvm->arch.exact_interrupt_apicv_inhibit_count, 0);
+		return -EINVAL;
+	}
+	if (!count)
+		kvm_clear_apicv_inhibit(
+			kvm, APICV_INHIBIT_REASON_EXACT_INTERRUPT_CONTROL);
+	return 0;
+}
+
+int kvm_arch_vcpu_exec_queue_local_apic_interrupt(struct kvm_vcpu *vcpu,
+						   u32 vector,
+						   bool *coalesced)
+{
+	struct kvm_lapic_irq irq = {
+		.delivery_mode = APIC_DM_FIXED,
+		.vector = vector,
+	};
+	int ret;
+
+	if (!lapic_in_kernel(vcpu) || vector > U8_MAX)
+		return -EOPNOTSUPP;
+
+	ret = kvm_apic_set_irq(vcpu, &irq, NULL);
+	if (ret < 0)
+		return ret;
+	*coalesced = ret == 0;
+	kvm_make_request(KVM_REQ_EVENT, vcpu);
+	kvm_make_request(KVM_REQ_UNBLOCK, vcpu);
+	kvm_vcpu_kick(vcpu);
+	return 0;
+}
+
+void kvm_arch_vcpu_exec_cancel_local_apic_interrupt(struct kvm_vcpu *vcpu,
+						     u32 vector)
+{
+	if (lapic_in_kernel(vcpu))
+		kvm_apic_cancel_irq(vcpu, vector);
 }
 
 int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)

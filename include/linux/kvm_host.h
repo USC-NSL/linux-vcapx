@@ -1487,6 +1487,17 @@ bool kvm_arch_vcpu_exec_completion_pending(struct kvm_vcpu *vcpu);
 bool kvm_arch_vcpu_exec_copy_pio_data(struct kvm_vcpu *vcpu, void *data,
 				      size_t len);
 int kvm_arch_vcpu_exec_inject_interrupt(struct kvm_vcpu *vcpu, u32 vector);
+int kvm_arch_vcpu_exec_configure_interrupt_delivery(struct kvm_vcpu *vcpu,
+						     u32 delivery,
+						     bool enable);
+int kvm_arch_vcpu_exec_queue_local_apic_interrupt(struct kvm_vcpu *vcpu,
+						   u32 vector,
+						   bool *coalesced);
+void kvm_arch_vcpu_exec_cancel_local_apic_interrupt(struct kvm_vcpu *vcpu,
+						     u32 vector);
+void kvm_exec_domain_apic_interrupt_delivered(struct kvm_vcpu *vcpu,
+					       u32 vector);
+void kvm_exec_domain_apic_eoi(struct kvm_vcpu *vcpu, u32 vector);
 u64 kvm_exec_supported_features(void);
 
 int kvm_dev_ioctl_create_exec_domain(void __user *argp);

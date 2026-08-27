@@ -1239,6 +1239,12 @@ enum kvm_apicv_inhibit {
 	APICV_INHIBIT_REASON_APIC_ID_MODIFIED,
 	APICV_INHIBIT_REASON_APIC_BASE_MODIFIED,
 
+	/*
+	 * An execution domain selected root-mode local-APIC delivery as an
+	 * explicit control for exact guest interrupts.
+	 */
+	APICV_INHIBIT_REASON_EXACT_INTERRUPT_CONTROL,
+
 	/******************************************************/
 	/* INHIBITs that are relevant only to the AMD's AVIC. */
 	/******************************************************/
@@ -1330,6 +1336,7 @@ struct kvm_arch {
 	/* Protects apicv_inhibit_reasons */
 	struct rw_semaphore apicv_update_lock;
 	unsigned long apicv_inhibit_reasons;
+	atomic_t exact_interrupt_apicv_inhibit_count;
 
 	gpa_t wall_clock;
 

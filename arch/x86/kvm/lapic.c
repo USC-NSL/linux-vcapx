@@ -1480,7 +1480,25 @@ static int apic_set_eoi(struct kvm_lapic *apic)
 
 	kvm_ioapic_send_eoi(apic, vector);
 	kvm_make_request(KVM_REQ_EVENT, apic->vcpu);
+	kvm_exec_domain_apic_eoi(apic->vcpu, vector);
 	return vector;
+}
+
+void kvm_apic_cancel_irq(struct kvm_vcpu *vcpu, int vector)
+{
+	struct kvm_lapic *apic = vcpu->arch.apic;
+
+	if (!apic || vector < 0 || vector > U8_MAX)
+		return;
+
+	apic_clear_irr(vector, apic);
+	if (!apic_test_vector(vector, apic->regs + APIC_ISR))
+		return;
+
+	apic_clear_isr(vector, apic);
+	apic_update_ppr(apic);
+	kvm_ioapic_send_eoi(apic, vector);
+	kvm_make_request(KVM_REQ_EVENT, vcpu);
 }
 
 /*
@@ -2922,6 +2940,7 @@ int kvm_get_apic_interrupt(struct kvm_vcpu *vcpu)
 		__apic_update_ppr(apic, &ppr);
 	}
 
+	kvm_exec_domain_apic_interrupt_delivered(vcpu, vector);
 	return vector;
 }
 

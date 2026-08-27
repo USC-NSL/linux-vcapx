@@ -115,6 +115,11 @@ static void test_cross_vm_feature_dependencies(int kvm_fd)
 				    KVM_EXEC_FEATURE_DYNAMIC_DISPATCH |
 				    KVM_EXEC_FEATURE_INTERRUPT_PUBLICATION;
 	assert_ioctl_errno(kvm_fd, KVM_CREATE_EXEC_DOMAIN, &create, EINVAL);
+	create.requested_features = KVM_EXEC_FEATURE_BASE_OBJECTS |
+				    KVM_EXEC_FEATURE_DYNAMIC_DISPATCH |
+				    KVM_EXEC_FEATURE_EXACT_INTERRUPT |
+				    KVM_EXEC_FEATURE_LOCAL_APIC_DELIVERY;
+	assert_ioctl_errno(kvm_fd, KVM_CREATE_EXEC_DOMAIN, &create, EINVAL);
 
 	create.requested_features = complete_features;
 	domain_fd = ioctl(kvm_fd, KVM_CREATE_EXEC_DOMAIN, &create);
@@ -134,6 +139,8 @@ static void test_dynamic_dispatch_uapi_layout(void)
 	TEST_ASSERT_EQ(sizeof(struct kvm_exec_run_dispatch), 104);
 	TEST_ASSERT_EQ(sizeof(struct kvm_exec_kick), 48);
 	TEST_ASSERT_EQ(sizeof(struct kvm_exec_interrupt), 72);
+	TEST_ASSERT_EQ(sizeof(struct kvm_exec_interrupt_delivery_config), 64);
+	TEST_ASSERT_EQ(sizeof(struct kvm_exec_query_interrupt_delivery), 128);
 	TEST_ASSERT_EQ(sizeof(struct kvm_exec_cancel), 56);
 	TEST_ASSERT_EQ(sizeof(struct kvm_exec_query_capsule), 144);
 	TEST_ASSERT_EQ(sizeof(struct kvm_exec_query_executor), 152);
@@ -1984,6 +1991,9 @@ static uint64_t halt_wake_stress_blocks;
 static uint64_t halt_wake_stress_interrupts;
 static uint64_t exact_interrupt_progress;
 static uint64_t exact_interrupt_count;
+static uint64_t local_apic_interrupt_count;
+static uint64_t local_apic_allow_eoi;
+static uint64_t local_apic_eoi_count;
 
 #define HALT_WAKE_VECTOR 0x42
 #define HALT_WAKE_STRESS_ITERATIONS 256
@@ -2035,6 +2045,27 @@ static void guest_exact_interrupt_then_halt(void)
 	WRITE_ONCE(exact_interrupt_progress, 1);
 	asm volatile("cli; hlt" ::: "memory");
 	GUEST_ASSERT(0);
+}
+
+static void guest_local_apic_interrupt_handler(struct ex_regs *regs)
+{
+	WRITE_ONCE(local_apic_interrupt_count,
+		   READ_ONCE(local_apic_interrupt_count) + 1);
+	while (!READ_ONCE(local_apic_allow_eoi))
+		asm volatile("pause");
+	x2apic_write_reg(APIC_EOI, 0);
+	WRITE_ONCE(local_apic_eoi_count,
+		   READ_ONCE(local_apic_eoi_count) + 1);
+}
+
+static void guest_local_apic_interrupt_spin(void)
+{
+	x2apic_enable();
+	x2apic_write_reg(APIC_TASKPRI, 0);
+	asm volatile("sti" ::: "memory");
+	WRITE_ONCE(guest_started, 1);
+	for (;;)
+		asm volatile("pause");
 }
 
 static void guest_spin(void)
@@ -4407,6 +4438,194 @@ static void test_exact_interrupt_avoids_executor_return(int kvm_fd)
 	kvm_vm_free(vm);
 }
 
+static void test_local_apic_interrupt_waits_for_eoi(int kvm_fd)
+{
+	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
+				  KVM_EXEC_FEATURE_DYNAMIC_DISPATCH |
+				  KVM_EXEC_FEATURE_SYNC_EXITS |
+				  KVM_EXEC_FEATURE_RETURN_KICK |
+				  KVM_EXEC_FEATURE_LIFECYCLE_STATE |
+				  KVM_EXEC_FEATURE_EXACT_INTERRUPT |
+				  KVM_EXEC_FEATURE_INTERRUPT_PUBLICATION |
+				  KVM_EXEC_FEATURE_LOCAL_APIC_DELIVERY;
+	struct kvm_exec_interrupt_delivery_config config = {
+		.size = sizeof(config),
+		.delivery = KVM_EXEC_INTERRUPT_DELIVERY_LOCAL_APIC_KICK,
+	};
+	struct kvm_exec_command command = {
+		.opcode = KVM_EXEC_CMD_SWITCH,
+		.request_sequence = 1,
+		.target_capsule_id = 93,
+		.target_lifecycle_generation = 7,
+	};
+	struct kvm_exec_interrupt interrupt = {
+		.size = sizeof(interrupt),
+		.request_sequence = 100,
+		.capsule_id = 93,
+		.lifecycle_generation = 7,
+		.vector = HALT_WAKE_VECTOR,
+	};
+	struct kvm_exec_query_interrupt_delivery delivery;
+	struct kvm_exec_query_interrupt_publication publication;
+	struct kvm_exec_domain_control control = { .size = sizeof(control) };
+	struct kvm_exec_completion completion;
+	struct dispatch_run_arg run_arg = { };
+	struct dispatch_mapping mapping;
+	struct kvm_vcpu *vcpu;
+	struct kvm_vm *vm;
+	uint64_t *started, *interrupts, *allow_eoi, *eois;
+	uint64_t domain_generation, executor_generation;
+	pthread_t thread;
+	int domain_fd, executor_fd, ret;
+
+	TEST_REQUIRE(ioctl(kvm_fd, KVM_CHECK_EXTENSION,
+			   KVM_CAP_SPLIT_IRQCHIP) > 0);
+	vm = __vm_create_without_irqchip(VM_SHAPE_DEFAULT, 1, 0);
+	vm_enable_cap(vm, KVM_CAP_SPLIT_IRQCHIP, 24);
+	vcpu = vm_vcpu_add(vm, 0, guest_local_apic_interrupt_spin);
+	disable_nested_cpuid(vcpu);
+	vm_init_descriptor_tables(vm);
+	vcpu_init_descriptor_tables(vcpu);
+	vm_install_exception_handler(vm, HALT_WAKE_VECTOR,
+				     guest_local_apic_interrupt_handler);
+	started = guest_started_hva(vm);
+	interrupts = addr_gva2hva(
+		vm, (vm_vaddr_t)&local_apic_interrupt_count);
+	allow_eoi = addr_gva2hva(vm, (vm_vaddr_t)&local_apic_allow_eoi);
+	eois = addr_gva2hva(vm, (vm_vaddr_t)&local_apic_eoi_count);
+	WRITE_ONCE(*interrupts, 0);
+	WRITE_ONCE(*allow_eoi, 0);
+	WRITE_ONCE(*eois, 0);
+
+	domain_fd = create_domain_with_features(kvm_fd, 1, 1, features,
+						&domain_generation);
+	config.domain_generation = domain_generation;
+	ret = ioctl(domain_fd, KVM_EXEC_CONFIGURE_INTERRUPT_DELIVERY, &config);
+	TEST_ASSERT(!ret,
+		    KVM_IOCTL_ERROR(KVM_EXEC_CONFIGURE_INTERRUPT_DELIVERY, ret));
+	assert_ioctl_errno(domain_fd, KVM_EXEC_CONFIGURE_INTERRUPT_DELIVERY,
+			   &config, EBUSY);
+	attach_vcpu(domain_fd, vcpu->fd, 93, 7);
+	executor_fd = create_executor(domain_fd, 0x937, &executor_generation);
+	mapping = map_dispatch(executor_fd);
+	command.domain_generation = domain_generation;
+	command.executor_generation = executor_generation;
+	TEST_ASSERT(publish_dispatch_command(&mapping, command),
+		    "failed to publish local-APIC initial command");
+
+	run_arg.executor_fd = executor_fd;
+	run_arg.run = (struct kvm_exec_run_dispatch) {
+		.size = sizeof(run_arg.run),
+		.domain_generation = domain_generation,
+		.executor_generation = executor_generation,
+	};
+	TEST_ASSERT(!pthread_create(&thread, NULL, dispatch_runner, &run_arg),
+		    "pthread_create failed");
+	wait_for_guest(started);
+	completion = consume_dispatch_completion(&mapping);
+	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_APPLIED);
+
+	interrupt.domain_generation = domain_generation;
+	interrupt.executor_generation = executor_generation;
+	ret = ioctl(executor_fd, KVM_EXEC_INTERRUPT, &interrupt);
+	TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_EXEC_INTERRUPT, ret));
+	wait_for_trace_progress(interrupts, 0);
+
+	interrupt.request_sequence++;
+	assert_ioctl_errno(executor_fd, KVM_EXEC_INTERRUPT, &interrupt, EBUSY);
+	interrupt.request_sequence--;
+	assert_ioctl_errno(domain_fd, KVM_EXEC_PAUSE, &control, EBUSY);
+
+	delivery = (struct kvm_exec_query_interrupt_delivery) {
+		.size = sizeof(delivery),
+		.domain_generation = domain_generation,
+		.executor_generation = executor_generation,
+	};
+	ret = ioctl(executor_fd, KVM_EXEC_QUERY_INTERRUPT_DELIVERY, &delivery);
+	TEST_ASSERT(!ret,
+		    KVM_IOCTL_ERROR(KVM_EXEC_QUERY_INTERRUPT_DELIVERY, ret));
+	TEST_ASSERT_EQ(delivery.configured_delivery,
+		       KVM_EXEC_INTERRUPT_DELIVERY_LOCAL_APIC_KICK);
+	TEST_ASSERT_EQ(delivery.apicv_inhibited, 1);
+	TEST_ASSERT_EQ(delivery.vector_queued_count, 1);
+	TEST_ASSERT_EQ(delivery.forced_kick_count, 1);
+	TEST_ASSERT_EQ(delivery.handler_delivery_count, 1);
+	TEST_ASSERT_EQ(delivery.eoi_count, 0);
+	TEST_ASSERT_EQ(delivery.coalesced_count, 0);
+	TEST_ASSERT_EQ(delivery.rejection_count, 1);
+	TEST_ASSERT_EQ(delivery.pending_sequence, 100);
+
+	publication = (struct kvm_exec_query_interrupt_publication) {
+		.size = sizeof(publication),
+		.domain_generation = domain_generation,
+		.executor_generation = executor_generation,
+	};
+	ret = ioctl(executor_fd, KVM_EXEC_QUERY_INTERRUPT_PUBLICATION,
+		    &publication);
+	TEST_ASSERT(!ret,
+		    KVM_IOCTL_ERROR(KVM_EXEC_QUERY_INTERRUPT_PUBLICATION, ret));
+	TEST_ASSERT_EQ(publication.actual_delivery,
+		       KVM_EXEC_INTERRUPT_DELIVERY_LOCAL_APIC_KICK);
+
+	command = (struct kvm_exec_command) {
+		.opcode = KVM_EXEC_CMD_RELEASE,
+		.request_sequence = 2,
+		.domain_generation = domain_generation,
+		.executor_generation = executor_generation,
+		.expected_current_id = 93,
+		.expected_current_generation = 7,
+	};
+	TEST_ASSERT(publish_dispatch_command(&mapping, command),
+		    "failed to publish release while EOI was pending");
+	kick_dispatch(executor_fd, domain_generation, executor_generation, 102);
+	completion = consume_dispatch_completion(&mapping);
+	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_INTERRUPT_PENDING);
+	TEST_ASSERT_EQ(completion.owned_capsule_id, 93);
+
+	WRITE_ONCE(*allow_eoi, 1);
+	wait_for_trace_progress(eois, 0);
+	delivery = (struct kvm_exec_query_interrupt_delivery) {
+		.size = sizeof(delivery),
+		.domain_generation = domain_generation,
+		.executor_generation = executor_generation,
+	};
+	ret = ioctl(executor_fd, KVM_EXEC_QUERY_INTERRUPT_DELIVERY, &delivery);
+	TEST_ASSERT(!ret,
+		    KVM_IOCTL_ERROR(KVM_EXEC_QUERY_INTERRUPT_DELIVERY, ret));
+	TEST_ASSERT_EQ(delivery.handler_delivery_count, 1);
+	TEST_ASSERT_EQ(delivery.eoi_count, 1);
+	TEST_ASSERT_EQ(delivery.pending_sequence, 0);
+
+	command.request_sequence = 3;
+	TEST_ASSERT(publish_dispatch_command(&mapping, command),
+		    "failed to publish release after EOI");
+	kick_dispatch(executor_fd, domain_generation, executor_generation, 103);
+	completion = consume_dispatch_completion(&mapping);
+	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_RETURNED);
+	TEST_ASSERT_EQ(completion.owned_capsule_id, 0);
+
+	kick_dispatch_flags(executor_fd, domain_generation, executor_generation,
+			    104, KVM_EXEC_KICK_F_RETURN_TO_VMM);
+	pthread_join(thread, NULL);
+	TEST_ASSERT(!run_arg.ret,
+		    "local-APIC dispatch returned %d errno %d",
+		    run_arg.ret, run_arg.error);
+	TEST_ASSERT_EQ(run_arg.run.return_reason, KVM_EXEC_RETURN_SIGNAL);
+
+	ret = ioctl(domain_fd, KVM_EXEC_PAUSE, &control);
+	TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_EXEC_PAUSE, ret));
+	ret = ioctl(domain_fd, KVM_EXEC_DRAIN, &control);
+	TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_EXEC_DRAIN, ret));
+	ret = ioctl(domain_fd, KVM_EXEC_RESUME, &control);
+	TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_EXEC_RESUME, ret));
+
+	munmap(mapping.header, KVM_EXEC_DISPATCH_MMAP_SIZE);
+	close(executor_fd);
+	detach_vcpu(domain_fd, 93, 7);
+	close(domain_fd);
+	kvm_vm_free(vm);
+}
+
 static void test_pending_exact_interrupt_yields_to_release(int kvm_fd)
 {
 	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
@@ -5782,7 +6001,8 @@ int main(int argc, char **argv)
 				    KVM_EXEC_FEATURE_RETURN_KICK |
 				    KVM_EXEC_FEATURE_LIFECYCLE_STATE |
 				    KVM_EXEC_FEATURE_EXACT_INTERRUPT |
-				    KVM_EXEC_FEATURE_INTERRUPT_PUBLICATION)) ==
+				    KVM_EXEC_FEATURE_INTERRUPT_PUBLICATION |
+				    KVM_EXEC_FEATURE_LOCAL_APIC_DELIVERY)) ==
 		     (KVM_EXEC_FEATURE_BASE_OBJECTS |
 		      KVM_EXEC_FEATURE_INTRA_VM_CHAIN |
 		      KVM_EXEC_FEATURE_CROSS_VM_CHAIN |
@@ -5792,7 +6012,8 @@ int main(int argc, char **argv)
 		      KVM_EXEC_FEATURE_RETURN_KICK |
 		      KVM_EXEC_FEATURE_LIFECYCLE_STATE |
 		      KVM_EXEC_FEATURE_EXACT_INTERRUPT |
-		      KVM_EXEC_FEATURE_INTERRUPT_PUBLICATION));
+		      KVM_EXEC_FEATURE_INTERRUPT_PUBLICATION |
+		      KVM_EXEC_FEATURE_LOCAL_APIC_DELIVERY));
 	if (argc == 2 && !strcmp(argv[1], "--dynamic-kick-cancel-only")) {
 		test_dynamic_return_kick(kvm_fd);
 		test_dynamic_kick_and_cancel(kvm_fd);
@@ -5802,6 +6023,11 @@ int main(int argc, char **argv)
 	if (argc == 2 && !strcmp(argv[1], "--exact-interrupt-only")) {
 		test_exact_interrupt_avoids_executor_return(kvm_fd);
 		test_pending_exact_interrupt_yields_to_release(kvm_fd);
+		close(kvm_fd);
+		return 0;
+	}
+	if (argc == 2 && !strcmp(argv[1], "--local-apic-interrupt-only")) {
+		test_local_apic_interrupt_waits_for_eoi(kvm_fd);
 		close(kvm_fd);
 		return 0;
 	}
@@ -5860,6 +6086,7 @@ int main(int argc, char **argv)
 	test_attached_capsule_accepts_interrupt_before_entry(kvm_fd);
 	test_exact_interrupt_avoids_executor_return(kvm_fd);
 	test_pending_exact_interrupt_yields_to_release(kvm_fd);
+	test_local_apic_interrupt_waits_for_eoi(kvm_fd);
 	test_halt_wake_requires_exact_dispatch(kvm_fd);
 	test_halt_wake_dispatch_stress(kvm_fd);
 	test_cross_vm_halt_interrupt_migration(kvm_fd);
