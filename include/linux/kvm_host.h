@@ -1500,6 +1500,7 @@ int kvm_arch_vcpu_exec_queue_posted_interrupt(struct kvm_vcpu *vcpu,
 					       u32 vector,
 					       bool *coalesced);
 bool kvm_arch_vcpu_exec_posted_interrupt_active(struct kvm_vcpu *vcpu);
+bool kvm_arch_vcpu_exec_apic_interrupt_pending(struct kvm_vcpu *vcpu, u32 vector);
 u64 kvm_arch_exec_posted_notification_exits(u32 cpu);
 void kvm_exec_domain_apic_interrupt_delivered(struct kvm_vcpu *vcpu,
 					       u32 vector);

@@ -4636,7 +4636,8 @@ static void test_apic_interrupt_waits_for_eoi(int kvm_fd, uint32_t mode)
 	TEST_ASSERT_EQ(delivery.vector_queued_count, 1);
 	TEST_ASSERT_EQ(delivery.forced_kick_count,
 		       mode == KVM_EXEC_INTERRUPT_DELIVERY_LOCAL_APIC_KICK);
-	TEST_ASSERT_EQ(delivery.handler_delivery_count, 1);
+	TEST_ASSERT_EQ(delivery.handler_delivery_count,
+		       mode == KVM_EXEC_INTERRUPT_DELIVERY_LOCAL_APIC_KICK);
 	TEST_ASSERT_EQ(delivery.eoi_count, 0);
 	TEST_ASSERT_EQ(delivery.coalesced_count, 0);
 	TEST_ASSERT(delivery.rejection_count >= 1,
@@ -4692,6 +4693,23 @@ static void test_apic_interrupt_waits_for_eoi(int kvm_fd, uint32_t mode)
 
 	WRITE_ONCE(*allow_eoi, 1);
 	wait_for_trace_progress(eois, 0);
+	kick_dispatch(executor_fd, domain_generation, executor_generation, 103);
+	for (ret = 0; ret < 1000000; ret++) {
+		delivery = (struct kvm_exec_query_interrupt_delivery) {
+			.size = sizeof(delivery),
+			.domain_generation = domain_generation,
+			.executor_generation = executor_generation,
+		};
+		TEST_ASSERT(!ioctl(executor_fd, KVM_EXEC_QUERY_INTERRUPT_DELIVERY,
+				   &delivery),
+			    KVM_IOCTL_ERROR(KVM_EXEC_QUERY_INTERRUPT_DELIVERY,
+					    -1));
+		if (!delivery.pending_sequence)
+			break;
+		sched_yield();
+	}
+	TEST_ASSERT(!delivery.pending_sequence,
+		    "posted interrupt did not retire at the next VM boundary");
 	delivery = (struct kvm_exec_query_interrupt_delivery) {
 		.size = sizeof(delivery),
 		.domain_generation = domain_generation,
@@ -4707,13 +4725,13 @@ static void test_apic_interrupt_waits_for_eoi(int kvm_fd, uint32_t mode)
 	command.request_sequence = 3;
 	TEST_ASSERT(publish_dispatch_command(&mapping, command),
 		    "failed to publish release after EOI");
-	kick_dispatch(executor_fd, domain_generation, executor_generation, 103);
+	kick_dispatch(executor_fd, domain_generation, executor_generation, 104);
 	completion = consume_dispatch_completion(&mapping);
 	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_RETURNED);
 	TEST_ASSERT_EQ(completion.owned_capsule_id, 0);
 
 	kick_dispatch_flags(executor_fd, domain_generation, executor_generation,
-			    104, KVM_EXEC_KICK_F_RETURN_TO_VMM);
+			    105, KVM_EXEC_KICK_F_RETURN_TO_VMM);
 	pthread_join(thread, NULL);
 	TEST_ASSERT(!run_arg.ret,
 		    "APIC-delivery dispatch returned %d errno %d",

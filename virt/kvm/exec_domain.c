@@ -2323,6 +2323,27 @@ void kvm_exec_domain_apic_eoi(struct kvm_vcpu *vcpu, u32 vector)
 		wake_up_interruptible(&executor->dispatch_wait);
 }
 
+static void
+kvm_exec_refresh_posted_interrupt(struct kvm_exec_executor *executor,
+				  struct kvm_vcpu *vcpu)
+{
+	struct kvm_exec_pending_interrupt interrupt = { };
+
+	if (!kvm_exec_interrupt_snapshot(executor, &interrupt) ||
+	    interrupt.delivery != KVM_EXEC_INTERRUPT_DELIVERY_POSTED ||
+	    kvm_arch_vcpu_exec_apic_interrupt_pending(vcpu, interrupt.vector))
+		return;
+
+	/*
+	 * APICv delivers a posted vector without traversing the software LAPIC
+	 * acceptance hook.  At a later VM boundary, an empty PIR/IRR/ISR set is
+	 * proof that hardware delivered the vector and the guest issued EOI.
+	 * Observe and retire that exact request without forcing a delivery exit.
+	 */
+	kvm_exec_domain_apic_interrupt_delivered(vcpu, interrupt.vector);
+	kvm_exec_domain_apic_eoi(vcpu, interrupt.vector);
+}
+
 static bool kvm_exec_dispatch_failed(const struct kvm_exec_run_dispatch *run)
 {
 	if (run->return_reason == KVM_EXEC_RETURN_DISPATCH_EMPTY)
@@ -2749,6 +2770,8 @@ command_done:
 		} else {
 			attempted_kvm_run = true;
 			run_ret = kvm_exec_vcpu_run(executor, capsule);
+			kvm_exec_refresh_posted_interrupt(executor,
+							  capsule->vcpu);
 			reported_exit_reason = capsule->vcpu->run->exit_reason;
 			pending_after_run =
 				kvm_arch_vcpu_exec_completion_pending(capsule->vcpu);

@@ -11464,6 +11464,14 @@ bool kvm_arch_vcpu_exec_posted_interrupt_active(struct kvm_vcpu *vcpu)
 	       static_call(kvm_x86_exec_posted_interrupt_supported)();
 }
 
+bool kvm_arch_vcpu_exec_apic_interrupt_pending(struct kvm_vcpu *vcpu, u32 vector)
+{
+	if (!lapic_in_kernel(vcpu) || vector > U8_MAX)
+		return false;
+	static_call_cond(kvm_x86_sync_pir_to_irr)(vcpu);
+	return kvm_apic_pending_eoi(vcpu, vector);
+}
+
 u64 kvm_arch_exec_posted_notification_exits(u32 cpu)
 {
 	if (cpu >= nr_cpu_ids || !cpu_possible(cpu))
