@@ -3823,7 +3823,9 @@ static int kvm_exec_notification_flush(struct file *file, fl_owner_t id)
 {
 	struct kvm_exec_notification_runner *runner = file->private_data;
 
-	kvm_exec_notification_request_stop(runner);
+	/* A forked, wrong-mm descriptor must not stop the owning runner. */
+	if (!kvm_exec_domain_access(runner->domain))
+		kvm_exec_notification_request_stop(runner);
 	return 0;
 }
 
