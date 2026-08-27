@@ -62,6 +62,7 @@ feature mask on x86-64 and zero elsewhere.  The current dependencies are:
 * ``SYNC_EXITS`` requires ``DYNAMIC_DISPATCH``;
 * ``ASYNC_PIO_WRITE`` requires ``DYNAMIC_DISPATCH`` and ``SYNC_EXITS``;
 * ``RETURN_KICK`` and ``EXACT_INTERRUPT`` require ``DYNAMIC_DISPATCH``;
+* ``INTERRUPT_PUBLICATION`` requires ``EXACT_INTERRUPT``; and
 * ``LIFECYCLE_STATE`` requires ``DYNAMIC_DISPATCH`` and ``SYNC_EXITS``.
 
 Negotiation is exact: the kernel rejects unsupported requested bits and
@@ -167,6 +168,13 @@ An ordinary ``KVM_INTERRUPT`` remains allowed for an attached vCPU and is
 serialized by the vCPU mutex.  Other vCPU state-mutating ioctls require the
 domain to be paused, the capsule not running and no completion pending.
 
+When ``KVM_EXEC_FEATURE_INTERRUPT_PUBLICATION`` is negotiated,
+``KVM_EXEC_QUERY_INTERRUPT_PUBLICATION`` returns accepted and delivered
+counts, the last accepted request sequence, acceptance and delivery
+``ktime_get_ns()`` timestamps, and the actual delivery action.  A successful
+exact-interrupt ioctl updates both counts exactly once.  The query is
+observability only; it neither submits nor retries an interrupt.
+
 Lifecycle and queries
 =====================
 
@@ -179,7 +187,9 @@ therefore pause, drain, detach, then resume when the domain remains usable.
 blocked reason, exit sequence, run/exit/halt/wake counters, runtime and last
 CPU.  ``KVM_EXEC_QUERY_EXECUTOR`` reports exact executor identity, current
 owner, lifecycle state, run/switch/release/reject/cancel/exit/failure counters,
-runtime and exact-interrupt counters.  Query state is the reconciliation
+runtime and exact-interrupt counters.
+``KVM_EXEC_QUERY_INTERRUPT_PUBLICATION`` separately reconciles exact request
+acceptance with the delivery action.  Query state is the reconciliation
 authority after userspace loses a completion or observes a timeout.
 
 Compatibility and reserved fields

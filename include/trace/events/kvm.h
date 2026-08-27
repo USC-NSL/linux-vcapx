@@ -504,6 +504,46 @@ TRACE_EVENT(kvm_test_age_hva,
 	TP_printk("mmu notifier test age hva: %#016lx", __entry->hva)
 );
 
+TRACE_EVENT(kvm_exec_interrupt_publication,
+	TP_PROTO(u64 domain_generation, u64 executor_generation,
+		 u64 executor_cookie, u64 capsule_id,
+		 u64 lifecycle_generation, u64 request_sequence,
+		 u32 vector, u32 phase, u64 timestamp_ns),
+	TP_ARGS(domain_generation, executor_generation, executor_cookie,
+		capsule_id, lifecycle_generation, request_sequence, vector,
+		phase, timestamp_ns),
+
+	TP_STRUCT__entry(
+		__field(u64, domain_generation)
+		__field(u64, executor_generation)
+		__field(u64, executor_cookie)
+		__field(u64, capsule_id)
+		__field(u64, lifecycle_generation)
+		__field(u64, request_sequence)
+		__field(u32, vector)
+		__field(u32, phase)
+		__field(u64, timestamp_ns)
+	),
+
+	TP_fast_assign(
+		__entry->domain_generation = domain_generation;
+		__entry->executor_generation = executor_generation;
+		__entry->executor_cookie = executor_cookie;
+		__entry->capsule_id = capsule_id;
+		__entry->lifecycle_generation = lifecycle_generation;
+		__entry->request_sequence = request_sequence;
+		__entry->vector = vector;
+		__entry->phase = phase;
+		__entry->timestamp_ns = timestamp_ns;
+	),
+
+	TP_printk("domain_generation=%llu executor_generation=%llu executor_cookie=%llu capsule_id=%llu lifecycle_generation=%llu request_sequence=%llu vector=%u phase=%u timestamp_ns=%llu",
+		  __entry->domain_generation, __entry->executor_generation,
+		  __entry->executor_cookie, __entry->capsule_id,
+		  __entry->lifecycle_generation, __entry->request_sequence,
+		  __entry->vector, __entry->phase, __entry->timestamp_ns)
+);
+
 #endif /* _TRACE_KVM_MAIN_H */
 
 /* This part must be outside protection */

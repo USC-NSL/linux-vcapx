@@ -111,6 +111,10 @@ static void test_cross_vm_feature_dependencies(int kvm_fd)
 	create.requested_features = KVM_EXEC_FEATURE_BASE_OBJECTS |
 				    KVM_EXEC_FEATURE_EXACT_INTERRUPT;
 	assert_ioctl_errno(kvm_fd, KVM_CREATE_EXEC_DOMAIN, &create, EINVAL);
+	create.requested_features = KVM_EXEC_FEATURE_BASE_OBJECTS |
+				    KVM_EXEC_FEATURE_DYNAMIC_DISPATCH |
+				    KVM_EXEC_FEATURE_INTERRUPT_PUBLICATION;
+	assert_ioctl_errno(kvm_fd, KVM_CREATE_EXEC_DOMAIN, &create, EINVAL);
 
 	create.requested_features = complete_features;
 	domain_fd = ioctl(kvm_fd, KVM_CREATE_EXEC_DOMAIN, &create);
@@ -4235,7 +4239,8 @@ static void test_exact_interrupt_avoids_executor_return(int kvm_fd)
 				  KVM_EXEC_FEATURE_SYNC_EXITS |
 				  KVM_EXEC_FEATURE_RETURN_KICK |
 				  KVM_EXEC_FEATURE_LIFECYCLE_STATE |
-				  KVM_EXEC_FEATURE_EXACT_INTERRUPT;
+				  KVM_EXEC_FEATURE_EXACT_INTERRUPT |
+				  KVM_EXEC_FEATURE_INTERRUPT_PUBLICATION;
 	struct kvm_exec_command command = {
 		.opcode = KVM_EXEC_CMD_SWITCH,
 		.request_sequence = 1,
@@ -4256,6 +4261,9 @@ static void test_exact_interrupt_avoids_executor_return(int kvm_fd)
 	};
 	struct kvm_exec_query_executor query = {
 		.size = sizeof(query),
+	};
+	struct kvm_exec_query_interrupt_publication publication = {
+		.size = sizeof(publication),
 	};
 	struct kvm_exec_completion completion;
 	struct dispatch_run_arg run_arg = { };
@@ -4343,6 +4351,22 @@ static void test_exact_interrupt_avoids_executor_return(int kvm_fd)
 	TEST_ASSERT_EQ(query.interrupt_applied_count, 1);
 	TEST_ASSERT_EQ(query.last_interrupt_sequence, 100);
 	TEST_ASSERT_EQ(query.pending_interrupt_sequence, 0);
+
+	publication.domain_generation = domain_generation;
+	publication.executor_generation = executor_generation;
+	ret = ioctl(executor_fd, KVM_EXEC_QUERY_INTERRUPT_PUBLICATION,
+		    &publication);
+	TEST_ASSERT(!ret,
+		    KVM_IOCTL_ERROR(KVM_EXEC_QUERY_INTERRUPT_PUBLICATION, ret));
+	TEST_ASSERT_EQ(publication.accepted_count, 1);
+	TEST_ASSERT_EQ(publication.delivered_count, 1);
+	TEST_ASSERT_EQ(publication.last_request_sequence, 100);
+	TEST_ASSERT(publication.accepted_ns,
+		    "exact interrupt acceptance timestamp is zero");
+	TEST_ASSERT(publication.delivered_ns >= publication.accepted_ns,
+		    "exact interrupt delivery predates acceptance");
+	TEST_ASSERT_EQ(publication.actual_delivery,
+		       KVM_EXEC_INTERRUPT_DELIVERY_DIRECT_KICK);
 	assert_ioctl_errno(executor_fd, KVM_EXEC_INTERRUPT, &interrupt,
 			   EAGAIN);
 
@@ -5753,7 +5777,8 @@ int main(int argc, char **argv)
 				    KVM_EXEC_FEATURE_ASYNC_PIO_WRITE |
 				    KVM_EXEC_FEATURE_RETURN_KICK |
 				    KVM_EXEC_FEATURE_LIFECYCLE_STATE |
-				    KVM_EXEC_FEATURE_EXACT_INTERRUPT)) ==
+				    KVM_EXEC_FEATURE_EXACT_INTERRUPT |
+				    KVM_EXEC_FEATURE_INTERRUPT_PUBLICATION)) ==
 		     (KVM_EXEC_FEATURE_BASE_OBJECTS |
 		      KVM_EXEC_FEATURE_INTRA_VM_CHAIN |
 		      KVM_EXEC_FEATURE_CROSS_VM_CHAIN |
@@ -5762,7 +5787,8 @@ int main(int argc, char **argv)
 		      KVM_EXEC_FEATURE_ASYNC_PIO_WRITE |
 		      KVM_EXEC_FEATURE_RETURN_KICK |
 		      KVM_EXEC_FEATURE_LIFECYCLE_STATE |
-		      KVM_EXEC_FEATURE_EXACT_INTERRUPT));
+		      KVM_EXEC_FEATURE_EXACT_INTERRUPT |
+		      KVM_EXEC_FEATURE_INTERRUPT_PUBLICATION));
 	if (argc == 2 && !strcmp(argv[1], "--dynamic-kick-cancel-only")) {
 		test_dynamic_return_kick(kvm_fd);
 		test_dynamic_kick_and_cancel(kvm_fd);

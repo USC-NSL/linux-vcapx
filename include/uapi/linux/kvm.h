@@ -889,6 +889,9 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_FEATURE_RETURN_KICK	(1ULL << 6)
 #define KVM_EXEC_FEATURE_LIFECYCLE_STATE (1ULL << 7)
 #define KVM_EXEC_FEATURE_EXACT_INTERRUPT (1ULL << 8)
+#define KVM_EXEC_FEATURE_INTERRUPT_PUBLICATION (1ULL << 9)
+
+#define KVM_EXEC_INTERRUPT_DELIVERY_DIRECT_KICK	1U
 #define KVM_EXEC_CPU_ANY		((__u32)-1)
 
 #define KVM_EXEC_TRACE_MAX_ENTRIES	256U
@@ -1274,6 +1277,21 @@ struct kvm_exec_query_executor {
 	__u64 pending_interrupt_sequence;
 };
 
+struct kvm_exec_query_interrupt_publication {
+	__u32 size;
+	__u32 flags;
+	__u64 domain_generation;
+	__u64 executor_generation;
+	__u64 accepted_count;
+	__u64 delivered_count;
+	__u64 last_request_sequence;
+	__u64 accepted_ns;
+	__u64 delivered_ns;
+	__u32 actual_delivery;
+	__u32 reserved0;
+	__u64 reserved[3];
+};
+
 /*
  * ioctls for /dev/kvm fds:
  */
@@ -1304,6 +1322,7 @@ struct kvm_exec_query_executor {
 				      struct kvm_exec_detach_vcpu)
 #define KVM_EXEC_CREATE_EXECUTOR  _IOWR(KVMIO, 0xf2, \
 				       struct kvm_exec_create_executor)
+
 #define KVM_EXEC_PAUSE            _IOW(KVMIO,  0xf3, \
 				      struct kvm_exec_domain_control)
 #define KVM_EXEC_RESUME           _IOW(KVMIO,  0xf4, \
@@ -1323,6 +1342,9 @@ struct kvm_exec_query_executor {
 				       struct kvm_exec_query_executor)
 #define KVM_EXEC_INTERRUPT        _IOW(KVMIO,  0xfd, \
 				      struct kvm_exec_interrupt)
+#define KVM_EXEC_QUERY_INTERRUPT_PUBLICATION \
+				_IOWR(KVMIO, 0xfe, \
+				      struct kvm_exec_query_interrupt_publication)
 
 /*
  * Extension capability list.
