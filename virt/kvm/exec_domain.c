@@ -3790,7 +3790,13 @@ kvm_exec_run_notification(struct kvm_exec_notification_runner *runner,
 			atomic64_inc(&runner->stale_count);
 		kvm_exec_notification_publish(runner, &completion,
 					      completion_tail);
-		atomic64_inc(&runner->completed_count);
+		/*
+		 * Publish completion accounting after every preceding command-side
+		 * update.  Queries acquire this counter before reading consumed_count
+		 * so they cannot combine a new completion count with an older consumed
+		 * count.
+		 */
+		atomic64_inc_return_release(&runner->completed_count);
 
 heartbeat:
 		heartbeat = atomic64_inc_return(&runner->heartbeat);
@@ -3905,8 +3911,9 @@ kvm_exec_query_notification(struct kvm_exec_notification_runner *runner,
 	query.last_error = runner->last_error;
 	query.runner_tid = runner->runner_tid;
 	query.heartbeat = atomic64_read(&runner->heartbeat);
+	query.completed_count =
+		atomic64_read_acquire(&runner->completed_count);
 	query.consumed_count = atomic64_read(&runner->consumed_count);
-	query.completed_count = atomic64_read(&runner->completed_count);
 	query.full_count = atomic64_read(&runner->full_count);
 	query.malformed_count = atomic64_read(&runner->malformed_count);
 	query.stale_count = atomic64_read(&runner->stale_count);
