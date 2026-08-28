@@ -237,6 +237,10 @@ static const struct file_operations kvm_exec_notification_fops;
 
 static void kvm_exec_interrupt_clear_retained_halt(
 	struct kvm_exec_executor *executor);
+static void
+kvm_exec_interrupt_abort_capsule(struct kvm_exec_executor *executor,
+				 struct kvm_exec_capsule *capsule,
+				 bool superseded);
 static void kvm_exec_interrupt_abort(struct kvm_exec_executor *executor,
 				     bool superseded);
 static bool
@@ -1932,7 +1936,8 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 		kvm_exec_dispatch_header(executor);
 	struct kvm_exec_command command;
 	struct kvm_exec_capsule *current_capsule, *target = NULL;
-	bool has_command, completion_full;
+	struct kvm_exec_capsule *superseded_capsule = NULL;
+	bool has_command, completion_full, supersede_interrupt = false;
 	unsigned long flags;
 	u16 status = KVM_EXEC_COMPLETE_REJECTED;
 	int ret;
@@ -2049,7 +2054,8 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 					command.request_sequence)) {
 		status = KVM_EXEC_COMPLETE_CANCELLED_BEFORE_APPLY;
 	} else if (command.opcode == KVM_EXEC_CMD_RELEASE) {
-		kvm_exec_interrupt_abort(executor, true);
+		supersede_interrupt = true;
+		superseded_capsule = current_capsule;
 		if (current_capsule) {
 			current_capsule->exit.async_entry_authorized = false;
 			current_capsule->exit.async_reentry_required = false;
@@ -2063,7 +2069,8 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 		status = KVM_EXEC_COMPLETE_RETURNED;
 	} else {
 		if (current_capsule != target) {
-			kvm_exec_interrupt_abort(executor, true);
+			supersede_interrupt = true;
+			superseded_capsule = current_capsule;
 			if (current_capsule) {
 				current_capsule->exit.async_entry_authorized = false;
 				current_capsule->exit.async_reentry_required = false;
@@ -2086,6 +2093,14 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 	executor->last_terminal_sequence = command.request_sequence;
 	executor->last_terminal_status = status;
 	spin_unlock_irqrestore(&executor->dispatch_lock, flags);
+	/*
+	 * Ownership is now installed and cancellation must reconcile as APPLIED.
+	 * Keep domain->lock across interrupt disarm so no new publication, capsule
+	 * claim, or guest entry can race the old capsule.  Disarm outside the
+	 * dispatch spinlock because the architecture path takes vcpu->mutex.
+	 */
+	if (supersede_interrupt)
+		kvm_exec_interrupt_abort_capsule(executor, superseded_capsule, true);
 	completion->status = status;
 	completion->applied_ns = ktime_get_ns();
 	kvm_exec_dispatch_owner(executor, completion);
@@ -2269,18 +2284,19 @@ static bool kvm_exec_interrupt_consume_retained_halt(
 	return retain;
 }
 
-static void kvm_exec_interrupt_abort(struct kvm_exec_executor *executor,
-				     bool superseded)
+static void
+kvm_exec_interrupt_abort_capsule(struct kvm_exec_executor *executor,
+				 struct kvm_exec_capsule *capsule,
+				 bool superseded)
 {
 	struct kvm_exec_pending_interrupt interrupt = { };
-	struct kvm_exec_capsule *capsule;
 	struct kvm_vcpu *vcpu;
 
 	lockdep_assert_held(&executor->domain->lock);
+	lockdep_assert_not_held(&executor->dispatch_lock);
 	if (kvm_exec_interrupt_snapshot(executor, &interrupt)) {
 		if (interrupt.delivery ==
 		    KVM_EXEC_INTERRUPT_DELIVERY_DIRECT_KICK) {
-			capsule = executor->current_capsule;
 			if (capsule && capsule->vcpu &&
 			    capsule->capsule_id == interrupt.capsule_id &&
 			    capsule->lifecycle_generation ==
@@ -2291,7 +2307,6 @@ static void kvm_exec_interrupt_abort(struct kvm_exec_executor *executor,
 				mutex_unlock(&vcpu->mutex);
 			}
 		} else if (kvm_exec_delivery_uses_local_apic(interrupt.delivery)) {
-			capsule = executor->current_capsule;
 			if (capsule && capsule->vcpu &&
 			    capsule->capsule_id == interrupt.capsule_id &&
 			    capsule->lifecycle_generation ==
@@ -2316,6 +2331,13 @@ static void kvm_exec_interrupt_abort(struct kvm_exec_executor *executor,
 		kvm_exec_interrupt_finish(executor, interrupt.sequence, false);
 	}
 	kvm_exec_interrupt_clear_retained_halt(executor);
+}
+
+static void kvm_exec_interrupt_abort(struct kvm_exec_executor *executor,
+				     bool superseded)
+{
+	kvm_exec_interrupt_abort_capsule(executor, executor->current_capsule,
+					 superseded);
 }
 
 void kvm_exec_domain_apic_interrupt_delivered(struct kvm_vcpu *vcpu,
