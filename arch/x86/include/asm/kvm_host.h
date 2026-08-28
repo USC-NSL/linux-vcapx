@@ -1715,6 +1715,7 @@ struct kvm_x86_ops {
 	bool (*exec_deliver_posted_interrupt)(struct kvm_vcpu *vcpu,
 					      int vector,
 					      bool *coalesced);
+	bool (*exec_posted_interrupt_pending)(struct kvm_vcpu *vcpu, int vector);
 	int (*sync_pir_to_irr)(struct kvm_vcpu *vcpu);
 	int (*set_tss_addr)(struct kvm *kvm, unsigned int addr);
 	int (*set_identity_map_addr)(struct kvm *kvm, u64 ident_addr);

@@ -11462,8 +11462,12 @@ void kvm_arch_vcpu_exec_cancel_local_apic_interrupt(struct kvm_vcpu *vcpu,
 					     u32 vector)
 {
 	if (lapic_in_kernel(vcpu)) {
+		lockdep_assert_held(&vcpu->mutex);
+		/* PIR synchronization updates VMCS interrupt state. */
+		vcpu_load(vcpu);
 		static_call_cond(kvm_x86_sync_pir_to_irr)(vcpu);
 		kvm_apic_cancel_irq(vcpu, vector);
+		vcpu_put(vcpu);
 	}
 }
 
@@ -11490,15 +11494,19 @@ bool kvm_arch_vcpu_exec_apic_interrupt_pending(struct kvm_vcpu *vcpu, u32 vector
 {
 	if (!lapic_in_kernel(vcpu) || vector > U8_MAX)
 		return false;
-	static_call_cond(kvm_x86_sync_pir_to_irr)(vcpu);
-	return kvm_apic_pending_eoi(vcpu, vector);
+	/*
+	 * This check runs after KVM_RUN has put the VMCS.  Inspect PIR directly
+	 * and combine it with the software IRR/ISR state instead of issuing a
+	 * VMREAD from an unloaded VMCS.
+	 */
+	return static_call(kvm_x86_exec_posted_interrupt_pending)(vcpu, vector) ||
+	       kvm_apic_pending_eoi(vcpu, vector);
 }
 
 bool kvm_arch_vcpu_exec_apic_in_service(struct kvm_vcpu *vcpu, u32 vector)
 {
 	if (!lapic_in_kernel(vcpu) || vector > U8_MAX)
 		return false;
-	static_call_cond(kvm_x86_sync_pir_to_irr)(vcpu);
 	return kvm_apic_interrupt_in_service(vcpu, vector);
 }
 
