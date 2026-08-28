@@ -3181,6 +3181,14 @@ kvm_exec_deliver_interrupt_local_apic_locked(
 
 	lockdep_assert_held(&executor->domain->lock);
 	/*
+	 * Capture the causal start of the delivery action.  The target can enter
+	 * its handler before a cross-CPU queue-and-kick helper returns, especially
+	 * with posted interrupts, so a timestamp taken after the helper would not
+	 * be ordered before guest handler entry.
+	 */
+	delivered_ns = ktime_get_ns();
+	delivered_tsc = kvm_arch_exec_host_tsc();
+	/*
 	 * This ioctl intentionally runs concurrently with the persistent task's
 	 * KVM_RUN.  Taking vcpu->mutex here would wait for that run to return,
 	 * while the vector and kick below are what make it return.  The LAPIC
@@ -3191,9 +3199,6 @@ kvm_exec_deliver_interrupt_local_apic_locked(
 		capsule->vcpu, request->vector, &coalesced);
 	if (ret)
 		return ret;
-
-	delivered_ns = ktime_get_ns();
-	delivered_tsc = kvm_arch_exec_host_tsc();
 	if (atomic_cmpxchg(&capsule->block_reason, KVM_EXEC_BLOCK_HLT,
 			   KVM_EXEC_BLOCK_NONE) == KVM_EXEC_BLOCK_HLT)
 		atomic64_inc(&capsule->wake_count);
@@ -3253,6 +3258,13 @@ kvm_exec_deliver_interrupt_posted_locked(
 	notification_cpu = READ_ONCE(capsule->vcpu->cpu);
 	target_exit_baseline =
 		kvm_arch_exec_posted_notification_exits(notification_cpu);
+	/*
+	 * Record the start of publication before PIR is made visible.  The target
+	 * may accept the notification and enter its handler before the posting
+	 * helper returns to this CPU.
+	 */
+	delivered_ns = ktime_get_ns();
+	delivered_tsc = kvm_arch_exec_host_tsc();
 	ret = kvm_arch_vcpu_exec_queue_posted_interrupt(
 		capsule->vcpu, request->vector, &coalesced);
 	if (ret) {
@@ -3265,8 +3277,6 @@ kvm_exec_deliver_interrupt_posted_locked(
 		return ret;
 	}
 
-	delivered_ns = ktime_get_ns();
-	delivered_tsc = kvm_arch_exec_host_tsc();
 	if (atomic_cmpxchg(&capsule->block_reason, KVM_EXEC_BLOCK_HLT,
 			   KVM_EXEC_BLOCK_NONE) == KVM_EXEC_BLOCK_HLT)
 		atomic64_inc(&capsule->wake_count);
