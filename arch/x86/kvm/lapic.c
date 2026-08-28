@@ -816,7 +816,8 @@ int kvm_lapic_find_highest_irr(struct kvm_vcpu *vcpu)
 	 * will cause vmexit immediately and the value will be recalculated
 	 * on the next vmentry.
 	 */
-	return apic_find_highest_irr(vcpu->arch.apic);
+	/* KCSAN: the lockless read and recovery are intentional. */
+	return data_race(apic_find_highest_irr(vcpu->arch.apic));
 }
 EXPORT_SYMBOL_GPL(kvm_lapic_find_highest_irr);
 
