@@ -352,7 +352,8 @@ kvm_arch_vcpu_exec_posted_interrupt_active(struct kvm_vcpu *vcpu)
 	return false;
 }
 
-u64 __weak kvm_arch_exec_posted_notification_exits(u32 cpu)
+u64 __weak
+kvm_arch_vcpu_exec_posted_notification_exits(struct kvm_vcpu *vcpu)
 {
 	return 0;
 }
@@ -2392,12 +2393,12 @@ void kvm_exec_domain_apic_eoi(struct kvm_vcpu *vcpu, u32 vector)
 	    executor->pending_interrupt_handler_observed) {
 		if (executor->pending_interrupt_delivery ==
 		    KVM_EXEC_INTERRUPT_DELIVERY_POSTED) {
-			u64 exits = kvm_arch_exec_posted_notification_exits(
-				executor->last_interrupt_notification_cpu);
+			u64 exits =
+				kvm_arch_vcpu_exec_posted_notification_exits(vcpu);
 
 			executor->interrupt_posted_target_exit_count +=
-				(u32)exits -
-				(u32)executor->interrupt_posted_target_exit_baseline;
+				exits -
+				executor->interrupt_posted_target_exit_baseline;
 			executor->interrupt_posted_target_exit_baseline = exits;
 		}
 		executor->pending_interrupt_sequence = 0;
@@ -3279,7 +3280,7 @@ kvm_exec_deliver_interrupt_posted_locked(
 	 */
 	notification_cpu = READ_ONCE(capsule->vcpu->cpu);
 	target_exit_baseline =
-		kvm_arch_exec_posted_notification_exits(notification_cpu);
+		kvm_arch_vcpu_exec_posted_notification_exits(capsule->vcpu);
 	/*
 	 * Record the start of publication before PIR is made visible.  The target
 	 * may accept the notification and enter its handler before the posting
@@ -4438,6 +4439,7 @@ kvm_exec_query_posted_interrupt(struct kvm_exec_executor *executor,
 
 	mutex_lock(&domain->lock);
 	spin_lock_irqsave(&executor->interrupt_lock, flags);
+	capsule = executor->current_capsule;
 	query.posted_count = executor->interrupt_posted_count;
 	query.notification_coalesced_count =
 		executor->interrupt_posted_coalesced_count;
@@ -4452,18 +4454,17 @@ kvm_exec_query_posted_interrupt(struct kvm_exec_executor *executor,
 	query.target_notification_exit_count =
 		executor->interrupt_posted_target_exit_count;
 	if (executor->pending_interrupt_delivery ==
-	    KVM_EXEC_INTERRUPT_DELIVERY_POSTED)
+	    KVM_EXEC_INTERRUPT_DELIVERY_POSTED && capsule && capsule->vcpu)
 		query.target_notification_exit_count +=
-			(u32)kvm_arch_exec_posted_notification_exits(
-				executor->last_interrupt_notification_cpu) -
-			(u32)executor->interrupt_posted_target_exit_baseline;
+			kvm_arch_vcpu_exec_posted_notification_exits(
+				capsule->vcpu) -
+			executor->interrupt_posted_target_exit_baseline;
 	query.pending_sequence = executor->pending_interrupt_sequence;
 	query.last_notification_cpu =
 		executor->last_interrupt_notification_cpu;
 	query.last_delivery_tsc = executor->last_interrupt_delivered_tsc;
 	query.strict_mode = domain->interrupt_delivery ==
 		KVM_EXEC_INTERRUPT_DELIVERY_POSTED;
-	capsule = executor->current_capsule;
 	query.apicv_active = capsule && capsule->vcpu &&
 		kvm_arch_vcpu_exec_posted_interrupt_active(capsule->vcpu);
 	memset(query.reserved, 0, sizeof(query.reserved));

@@ -7011,6 +7011,13 @@ static void handle_external_interrupt_irqoff(struct kvm_vcpu *vcpu)
 	if (KVM_BUG(!is_external_intr(intr_info), vcpu->kvm,
 	    "unexpected VM-Exit interrupt info: 0x%x", intr_info))
 		return;
+	/*
+	 * APICv consumes the posted-interrupt notification in non-root mode.
+	 * Seeing its host vector here means the notification instead caused an
+	 * external-interrupt VM-Exit for this exact vCPU.
+	 */
+	if (vector == POSTED_INTR_VECTOR)
+		atomic64_inc(&vcpu->arch.exec_posted_notification_exit_count);
 
 	kvm_before_interrupt(vcpu, KVM_HANDLING_IRQ);
 	vmx_do_interrupt_irqoff(gate_offset(desc));

@@ -11510,11 +11510,9 @@ bool kvm_arch_vcpu_exec_apic_in_service(struct kvm_vcpu *vcpu, u32 vector)
 	return kvm_apic_interrupt_in_service(vcpu, vector);
 }
 
-u64 kvm_arch_exec_posted_notification_exits(u32 cpu)
+u64 kvm_arch_vcpu_exec_posted_notification_exits(struct kvm_vcpu *vcpu)
 {
-	if (cpu >= nr_cpu_ids || !cpu_possible(cpu))
-		return 0;
-	return per_cpu(irq_stat, cpu).kvm_posted_intr_ipis;
+	return atomic64_read(&vcpu->arch.exec_posted_notification_exit_count);
 }
 
 int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
