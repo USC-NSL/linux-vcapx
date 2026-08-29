@@ -4563,6 +4563,7 @@ static void test_apic_interrupt_waits_for_eoi(int kvm_fd, uint32_t mode)
 	struct kvm_vm *vm;
 	uint64_t *started, *interrupts, *allow_eoi, *eois;
 	uint64_t domain_generation, executor_generation;
+	uint64_t boundary_retry_count = 0;
 	pthread_t thread;
 	int capability, domain_fd, executor_fd, ret;
 
@@ -4629,8 +4630,10 @@ static void test_apic_interrupt_waits_for_eoi(int kvm_fd, uint32_t mode)
 	interrupt.executor_generation = executor_generation;
 	do {
 		ret = ioctl(executor_fd, KVM_EXEC_INTERRUPT, &interrupt);
-		if (ret && errno == EAGAIN)
+		if (ret && errno == EAGAIN) {
+			boundary_retry_count++;
 			interrupt.request_sequence++;
+		}
 	} while (ret && errno == EAGAIN);
 	TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_EXEC_INTERRUPT, ret));
 	wait_for_trace_progress(interrupts, 0);
@@ -4685,6 +4688,9 @@ static void test_apic_interrupt_waits_for_eoi(int kvm_fd, uint32_t mode)
 			    KVM_IOCTL_ERROR(KVM_EXEC_QUERY_POSTED_INTERRUPT,
 					    ret));
 		TEST_ASSERT_EQ(posted.posted_count, 1);
+		TEST_ASSERT_EQ(posted.root_mode_rejection_count +
+			       posted.boundary_state_rejection_count,
+			       boundary_retry_count);
 		TEST_ASSERT_EQ(posted.pending_sequence,
 			       interrupt.request_sequence);
 		TEST_ASSERT_EQ(posted.apicv_active, 1);
@@ -4807,6 +4813,7 @@ test_queued_apic_handoff(int kvm_fd, uint32_t mode)
 	struct kvm_vm *vm;
 	uint64_t *started, *interrupts, *allow_eoi, *open_window, *progress;
 	uint64_t domain_generation, executor_generation;
+	uint64_t boundary_retry_count = 0;
 	pthread_t thread;
 	int capability, domain_fd, executor_fd, ret;
 
@@ -4875,8 +4882,10 @@ test_queued_apic_handoff(int kvm_fd, uint32_t mode)
 	interrupt.executor_generation = executor_generation;
 	do {
 		ret = ioctl(executor_fd, KVM_EXEC_INTERRUPT, &interrupt);
-		if (ret && errno == EAGAIN)
+		if (ret && errno == EAGAIN) {
+			boundary_retry_count++;
 			interrupt.request_sequence++;
+		}
 	} while (ret && errno == EAGAIN);
 	TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_EXEC_INTERRUPT, ret));
 
@@ -4930,6 +4939,9 @@ test_queued_apic_handoff(int kvm_fd, uint32_t mode)
 			    KVM_IOCTL_ERROR(KVM_EXEC_QUERY_POSTED_INTERRUPT,
 					    ret));
 		TEST_ASSERT_EQ(posted.superseded_count, 1);
+		TEST_ASSERT_EQ(posted.root_mode_rejection_count +
+			       posted.boundary_state_rejection_count,
+			       boundary_retry_count);
 		TEST_ASSERT_EQ(posted.disarmed_count, 0);
 		TEST_ASSERT_EQ(posted.pending_sequence, 0);
 	}

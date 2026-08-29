@@ -183,9 +183,12 @@ observability only; it neither submits nor retries an interrupt.
 ``KVM_EXEC_QUERY_POSTED_INTERRUPT`` provides the stricter posted-delivery
 accounting.  A successful ``posted_count`` increment means APICv was active and
 the exact vCPU was in guest mode when KVM published the vector.  A concurrent
-guest exit is rejected before acceptance and increments
-``root_mode_rejection_count``; userspace may reconcile that result only through
-its own safe-boundary protocol.  ``target_notification_exit_count`` counts an
+guest exit observed by the VMX posted-interrupt helper increments
+``root_mode_rejection_count``.  An earlier execution-boundary observation,
+including a capsule that has left guest execution or has a pending exit
+completion, increments ``boundary_state_rejection_count``.  Both results are
+reported as ``EAGAIN`` and userspace may reconcile them only through its own
+safe-boundary protocol.  ``target_notification_exit_count`` counts an
 actual external-interrupt VM-Exit whose host vector is the posted-interrupt
 notification vector on the target vCPU.  It does not count notification IPIs
 that arrive after an unrelated guest exit.  ``apicv_active`` is a point-in-time

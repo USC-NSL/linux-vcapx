@@ -145,6 +145,7 @@ struct kvm_exec_executor {
 	u64 interrupt_posted_count;
 	u64 interrupt_posted_coalesced_count;
 	u64 interrupt_posted_root_rejection_count;
+	u64 interrupt_posted_boundary_state_rejection_count;
 	u64 interrupt_posted_inactive_rejection_count;
 	u64 interrupt_posted_stale_rejection_count;
 	u64 interrupt_posted_disarmed_count;
@@ -3349,6 +3350,7 @@ kvm_exec_submit_interrupt(struct kvm_exec_executor *executor,
 	struct kvm_exec_capsule *capsule;
 	u64 accepted_ns = 0;
 	u64 accepted_tsc = 0;
+	bool boundary_state_rejection = false;
 	int ret;
 
 	ret = kvm_exec_domain_access(domain);
@@ -3364,8 +3366,10 @@ kvm_exec_submit_interrupt(struct kvm_exec_executor *executor,
 
 	mutex_lock(&domain->lock);
 	ret = kvm_exec_validate_interrupt_locked(executor, request, &capsule);
-	if (ret)
+	if (ret) {
+		boundary_state_rejection = ret == -EAGAIN;
 		goto out;
+	}
 	ret = kvm_exec_accept_interrupt_locked(executor, request, &accepted_ns,
 					       &accepted_tsc);
 	if (ret)
@@ -3404,6 +3408,10 @@ out:
 			    KVM_EXEC_INTERRUPT_DELIVERY_POSTED &&
 		    ret == -ESTALE)
 			executor->interrupt_posted_stale_rejection_count++;
+		if (request->requested_delivery ==
+			    KVM_EXEC_INTERRUPT_DELIVERY_POSTED &&
+		    boundary_state_rejection)
+			executor->interrupt_posted_boundary_state_rejection_count++;
 		spin_unlock_irqrestore(&executor->interrupt_lock, flags);
 	}
 	mutex_unlock(&domain->lock);
@@ -4434,6 +4442,7 @@ kvm_exec_query_posted_interrupt(struct kvm_exec_executor *executor,
 	    query.target_notification_exit_count || query.pending_sequence ||
 	    query.last_notification_cpu || query.last_delivery_tsc ||
 	    query.apicv_active || query.strict_mode ||
+	    query.boundary_state_rejection_count ||
 	    memchr_inv(query.reserved, 0, sizeof(query.reserved)))
 		return -EINVAL;
 
@@ -4445,6 +4454,8 @@ kvm_exec_query_posted_interrupt(struct kvm_exec_executor *executor,
 		executor->interrupt_posted_coalesced_count;
 	query.root_mode_rejection_count =
 		executor->interrupt_posted_root_rejection_count;
+	query.boundary_state_rejection_count =
+		executor->interrupt_posted_boundary_state_rejection_count;
 	query.inactive_rejection_count =
 		executor->interrupt_posted_inactive_rejection_count;
 	query.stale_rejection_count =

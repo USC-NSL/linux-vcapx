@@ -1303,7 +1303,8 @@ struct kvm_exec_query_posted_interrupt {
 	__u64 last_delivery_tsc;
 	__u32 apicv_active;
 	__u32 strict_mode;
-	__u64 reserved[5];
+	__u64 boundary_state_rejection_count;
+	__u64 reserved[4];
 };
 
 struct kvm_exec_notification_header {
