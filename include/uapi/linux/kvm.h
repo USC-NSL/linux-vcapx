@@ -1178,7 +1178,7 @@ struct kvm_exec_completion {
 	__u64 applied_ns;
 	__u64 entry_attempt_ns;
 	__u64 executor_return_count;
-	__u64 reserved;
+	__u64 handoff_started_ns;
 };
 
 struct kvm_exec_exit_request {

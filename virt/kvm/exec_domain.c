@@ -2056,6 +2056,7 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 					command.request_sequence)) {
 		status = KVM_EXEC_COMPLETE_CANCELLED_BEFORE_APPLY;
 	} else if (command.opcode == KVM_EXEC_CMD_RELEASE) {
+		completion->handoff_started_ns = ktime_get_ns();
 		supersede_interrupt = true;
 		superseded_capsule = current_capsule;
 		if (current_capsule) {
@@ -2070,6 +2071,7 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 		atomic64_inc(&executor->release_count);
 		status = KVM_EXEC_COMPLETE_RETURNED;
 	} else {
+		completion->handoff_started_ns = ktime_get_ns();
 		if (current_capsule != target) {
 			supersede_interrupt = true;
 			superseded_capsule = current_capsule;
@@ -2095,6 +2097,8 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 	executor->last_terminal_sequence = command.request_sequence;
 	executor->last_terminal_status = status;
 	spin_unlock_irqrestore(&executor->dispatch_lock, flags);
+	completion->status = status;
+	completion->applied_ns = ktime_get_ns();
 	/*
 	 * Ownership is now installed and cancellation must reconcile as APPLIED.
 	 * Keep domain->lock across interrupt disarm so no new publication, capsule
@@ -2103,8 +2107,6 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 	 */
 	if (supersede_interrupt)
 		kvm_exec_interrupt_abort_capsule(executor, superseded_capsule, true);
-	completion->status = status;
-	completion->applied_ns = ktime_get_ns();
 	kvm_exec_dispatch_owner(executor, completion);
 	mutex_unlock(&domain->lock);
 	if (status == KVM_EXEC_COMPLETE_APPLIED ||

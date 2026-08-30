@@ -3591,8 +3591,9 @@ static void test_dynamic_kick_and_cancel(int kvm_fd)
 	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_APPLIED);
 	TEST_ASSERT_EQ(completion.previous_capsule_id, 0);
 	TEST_ASSERT_EQ(completion.owned_capsule_id, 41);
-	TEST_ASSERT(completion.applied_ns && completion.entry_attempt_ns >=
-					 completion.applied_ns,
+	TEST_ASSERT(completion.handoff_started_ns >= completion.consumed_ns &&
+		    completion.applied_ns >= completion.handoff_started_ns &&
+		    completion.entry_attempt_ns >= completion.applied_ns,
 		    "dispatch timestamps are not ordered");
 	wait_for_guest(started);
 
