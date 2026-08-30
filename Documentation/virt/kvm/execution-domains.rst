@@ -61,6 +61,7 @@ feature mask on x86-64 and zero elsewhere.  The current dependencies are:
 * ``CROSS_VM_CHAIN`` requires ``INTRA_VM_CHAIN``;
 * ``SYNC_EXITS`` requires ``DYNAMIC_DISPATCH``;
 * ``ASYNC_PIO_WRITE`` requires ``DYNAMIC_DISPATCH`` and ``SYNC_EXITS``;
+* ``ASYNC_PIO_HANDOFF`` requires ``ASYNC_PIO_WRITE``;
 * ``RETURN_KICK`` and ``EXACT_INTERRUPT`` require ``DYNAMIC_DISPATCH``;
 * ``INTERRUPT_PUBLICATION`` requires ``EXACT_INTERRUPT``;
 * ``NOTIFICATION_RING`` requires ``EXACT_INTERRUPT`` and
@@ -133,6 +134,13 @@ otherwise it is only a dispatcher wake.  A late return request may be
 coalesced with an already published mapped exit, but an ownership-changing
 command is still required before another capsule can run.
 
+``KVM_EXEC_KICK_F_COMPLETION_AVAILABLE`` is a narrower wake used after
+userspace publishes an exit completion.  It wakes a sleeping dispatcher but
+does not request an exit from the capsule currently running on that executor.
+Userspace must publish the completion ring tail before issuing the kick.  The
+kick is only a notification; the dispatcher still validates and consumes the
+ring entry.
+
 Exit completion
 ===============
 
@@ -149,6 +157,23 @@ data and exit-sequence metadata.  Userspace returns a matching
 ``KVM_EXEC_EXIT_COMPLETE_OK`` completion.  Reads, MMIO and unsupported or
 backpressured exits use the synchronous return path.  Ring pressure increments
 the observable fallback counter; it does not drop an exit.
+
+``ASYNC_PIO_HANDOFF`` permits one exact ``SWITCH`` to a different capsule
+after KVM has copied a single non-string output PIO operation of width 1, 2 or
+4 bytes into the mapped request ring.  The source loses execution ownership
+but remains completion-pending, non-runnable and bound to the publishing
+executor generation.  The matching command completion sets
+``KVM_EXEC_COMPLETE_F_ASYNC_PIO_HANDOFF`` so userspace can distinguish this
+state from an ordinary ownership change.
+
+The source cannot be claimed, detached or drained until its tagged completion
+is validated and applied exactly once.  Applying that completion retires only
+the source instruction with immediate exit; it does not run source guest code.
+A later exact command is required to make the source runnable again.  Closing
+the publishing executor with such a completion outstanding stops the domain.
+Same-capsule ``SWITCH``, ``RELEASE``, reads, string PIO, MMIO and ring-pressure
+fallback remain conservative and wait for completion before ownership can
+change.
 
 Interrupts and blocked capsules
 ===============================
