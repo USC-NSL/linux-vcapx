@@ -1357,6 +1357,10 @@ struct kvm_exec_notification_completion {
 	__u64 correlation_cookie;
 	__u64 consumed_ns;
 	__u64 accepted_tsc;
+	/*
+	 * Frozen field name: timestamp immediately before the selected host
+	 * notification action starts, not guest interrupt-delivery completion.
+	 */
 	__u64 delivered_tsc;
 	__u64 reserved[3];
 };
@@ -1487,6 +1491,10 @@ struct kvm_exec_query_interrupt_publication {
 	__u32 actual_delivery;
 	__u32 reserved0;
 	__u64 accepted_tsc;
+	/*
+	 * Frozen field name: timestamp immediately before the selected host
+	 * notification action starts, not guest interrupt-delivery completion.
+	 */
 	__u64 delivered_tsc;
 	__u64 reserved[1];
 };

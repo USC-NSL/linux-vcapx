@@ -3163,6 +3163,7 @@ kvm_exec_deliver_interrupt_direct_kick_locked(
 	u64 epoch;
 
 	lockdep_assert_held(&executor->domain->lock);
+	/* Record the causal start, before requests and the physical kick. */
 	delivered_ns = ktime_get_ns();
 	delivered_tsc = kvm_arch_exec_host_tsc();
 	epoch = atomic64_inc_return(&executor->kick_epoch);
