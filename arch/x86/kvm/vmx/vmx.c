@@ -4159,11 +4159,24 @@ static void vmx_msr_filter_changed(struct kvm_vcpu *vcpu)
 		pt_update_intercept_for_msr(vcpu);
 }
 
+static inline int vmx_posted_interrupt_vcpu_mode(struct kvm_vcpu *vcpu)
+{
+	/*
+	 * Posted-interrupt delivery deliberately samples vcpu->mode without
+	 * excluding the vCPU's entry/exit path.  PIR.ON and the barrier after
+	 * publishing IN_GUEST_MODE form the actual synchronization protocol:
+	 * either the notification reaches a running guest, or KVM observes PIR
+	 * before the next entry.  Preserve READ_ONCE()'s compiler constraints
+	 * while documenting this expected race for KCSAN.
+	 */
+	return data_race(READ_ONCE(vcpu->mode));
+}
+
 static inline void kvm_vcpu_trigger_posted_interrupt(struct kvm_vcpu *vcpu,
 						     int pi_vec)
 {
 #ifdef CONFIG_SMP
-	if (READ_ONCE(vcpu->mode) == IN_GUEST_MODE) {
+	if (vmx_posted_interrupt_vcpu_mode(vcpu) == IN_GUEST_MODE) {
 		/*
 		 * The vector of the virtual has already been set in the PIR.
 		 * Send a notification event to deliver the virtual interrupt
@@ -4285,7 +4298,8 @@ static bool vmx_exec_deliver_posted_interrupt(struct kvm_vcpu *vcpu,
 	*coalesced = false;
 	if (!vmx_exec_posted_interrupt_supported() ||
 	    !vcpu->arch.apic || !vcpu->arch.apic->apicv_active ||
-	    READ_ONCE(vcpu->mode) != IN_GUEST_MODE || vcpu->cpu < 0 ||
+	    vmx_posted_interrupt_vcpu_mode(vcpu) != IN_GUEST_MODE ||
+	    vcpu->cpu < 0 ||
 	    READ_ONCE(vmx->pi_desc.nv) != POSTED_INTR_VECTOR ||
 	    pi_test_sn(&vmx->pi_desc))
 		return false;
