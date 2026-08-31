@@ -895,6 +895,7 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_FEATURE_NOTIFICATION_RING	(1ULL << 12)
 #define KVM_EXEC_FEATURE_ASYNC_PIO_HANDOFF	(1ULL << 13)
 #define KVM_EXEC_FEATURE_PIO_WRITE_GATE		(1ULL << 14)
+#define KVM_EXEC_FEATURE_HANDOFF_ENTRY_OBSERVATION (1ULL << 15)
 
 #define KVM_EXEC_INTERRUPT_DELIVERY_DIRECT_KICK	1U
 #define KVM_EXEC_INTERRUPT_DELIVERY_LOCAL_APIC_KICK 2U
@@ -1148,7 +1149,10 @@ struct kvm_exec_dispatch_header {
 	__u64 async_exit_completion_count;
 	__u64 async_exit_fallback_count;
 	__u64 last_async_exit_sequence;
-	__u64 reserved[3];
+	/* Stable until the next ownership-changing command reaches entry. */
+	__u64 last_handoff_entry_sequence;
+	__u64 last_handoff_entry_ns;
+	__u64 reserved[1];
 };
 
 struct kvm_exec_command {

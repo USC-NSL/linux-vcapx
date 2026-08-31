@@ -117,6 +117,9 @@ static void test_cross_vm_feature_dependencies(int kvm_fd)
 				    KVM_EXEC_FEATURE_PIO_WRITE_GATE;
 	assert_ioctl_errno(kvm_fd, KVM_CREATE_EXEC_DOMAIN, &create, EINVAL);
 	create.requested_features = KVM_EXEC_FEATURE_BASE_OBJECTS |
+				    KVM_EXEC_FEATURE_HANDOFF_ENTRY_OBSERVATION;
+	assert_ioctl_errno(kvm_fd, KVM_CREATE_EXEC_DOMAIN, &create, EINVAL);
+	create.requested_features = KVM_EXEC_FEATURE_BASE_OBJECTS |
 				    KVM_EXEC_FEATURE_RETURN_KICK;
 	assert_ioctl_errno(kvm_fd, KVM_CREATE_EXEC_DOMAIN, &create, EINVAL);
 	create.requested_features = KVM_EXEC_FEATURE_BASE_OBJECTS |
@@ -238,7 +241,8 @@ static void test_dynamic_dispatch_mapping(int kvm_fd)
 	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
 				  KVM_EXEC_FEATURE_INTRA_VM_CHAIN |
 				  KVM_EXEC_FEATURE_CROSS_VM_CHAIN |
-				  KVM_EXEC_FEATURE_DYNAMIC_DISPATCH;
+				  KVM_EXEC_FEATURE_DYNAMIC_DISPATCH |
+				  KVM_EXEC_FEATURE_HANDOFF_ENTRY_OBSERVATION;
 	struct kvm_exec_dispatch_header *header;
 	uint64_t domain_generation, executor_generation;
 	pid_t child;
@@ -4708,9 +4712,10 @@ static void test_dynamic_cross_vm_seeded_trace(int kvm_fd)
 	uint64_t *counts[2], *errors[2];
 	uint64_t domain_generation, executor_generation;
 	uint64_t previous_id = 0, previous_generation = 0;
+	uint64_t last_handoff_entry_ns = 0, last_handoff_sequence = 0;
 	uint64_t random = 0x7018c055600dULL;
 	pthread_t thread;
-	int domain_fd, i;
+	int domain_fd, i, same_target_steps = 0;
 
 	sigemptyset(&action.sa_mask);
 	TEST_ASSERT(!sigaction(SIGUSR1, &action, &old_action),
@@ -4744,13 +4749,19 @@ static void test_dynamic_cross_vm_seeded_trace(int kvm_fd)
 	command.executor_generation = executor_generation;
 
 	for (i = 0; i < 4096; i++) {
-		uint64_t entry_ns, entry_sequence, progress_before;
+		uint64_t entry_ns, entry_sequence, handoff_entry_ns;
+		uint64_t handoff_entry_sequence, progress_before;
+		bool ownership_changed;
 		int target;
 
 		random ^= random << 13;
 		random ^= random >> 7;
 		random ^= random << 17;
 		target = random & 1;
+		ownership_changed = previous_id != capsule_ids[target] ||
+			previous_generation != generations[target];
+		if (!ownership_changed)
+			same_target_steps++;
 		progress_before = READ_ONCE(counts[target][target]);
 		command.request_sequence = i + 1;
 		command.expected_current_id = previous_id;
@@ -4789,6 +4800,18 @@ static void test_dynamic_cross_vm_seeded_trace(int kvm_fd)
 		TEST_ASSERT(entry_ns >= completion.applied_ns,
 			    "entry observation did not follow apply at step %d",
 			    i);
+		if (ownership_changed) {
+			last_handoff_sequence = i + 1;
+			last_handoff_entry_ns = entry_ns;
+		}
+		handoff_entry_sequence = __atomic_load_n(
+			&mapping.header->last_handoff_entry_sequence,
+			__ATOMIC_ACQUIRE);
+		handoff_entry_ns = __atomic_load_n(
+			&mapping.header->last_handoff_entry_ns,
+			__ATOMIC_RELAXED);
+		TEST_ASSERT_EQ(handoff_entry_sequence, last_handoff_sequence);
+		TEST_ASSERT_EQ(handoff_entry_ns, last_handoff_entry_ns);
 		previous_id = capsule_ids[target];
 		previous_generation = generations[target];
 	}
@@ -4803,6 +4826,8 @@ static void test_dynamic_cross_vm_seeded_trace(int kvm_fd)
 		       KVM_EXEC_RETURN_DOMAIN_PAUSED);
 	TEST_ASSERT(run_arg.signal_returns > 0,
 		    "dispatcher did not re-enter after any signal return");
+	TEST_ASSERT(same_target_steps > 0,
+		    "seeded trace did not exercise same-capsule re-entry");
 	TEST_ASSERT_EQ(run_arg.run.owned_capsule_id, previous_id);
 	TEST_ASSERT(READ_ONCE(counts[0][0]) > 0,
 		    "first dynamic capsule made no guest progress");
