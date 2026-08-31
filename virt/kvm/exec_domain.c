@@ -23,7 +23,8 @@
 	 KVM_EXEC_FEATURE_INTERRUPT_PUBLICATION | \
 	 KVM_EXEC_FEATURE_LOCAL_APIC_DELIVERY | \
 	 KVM_EXEC_FEATURE_NOTIFICATION_RING | \
-	 KVM_EXEC_FEATURE_ASYNC_PIO_HANDOFF)
+	 KVM_EXEC_FEATURE_ASYNC_PIO_HANDOFF | \
+	 KVM_EXEC_FEATURE_PIO_WRITE_GATE)
 
 struct kvm_exec_domain;
 struct kvm_exec_executor;
@@ -111,6 +112,7 @@ struct kvm_exec_executor {
 	atomic64_t return_kick_epoch;
 	u64 consumed_return_kick_epoch;
 	u64 mapped_boundary_return_kick_epoch;
+	bool gated_command_waiting;
 	u64 command_head;
 	u64 completion_tail;
 	u64 exit_request_tail;
@@ -1546,12 +1548,32 @@ static int kvm_exec_dispatch_ring_state(struct kvm_exec_executor *executor,
 
 static bool kvm_exec_dispatch_command_shape_valid(struct kvm_exec_command *cmd)
 {
-	if (cmd->size != sizeof(*cmd) || cmd->flags ||
-	    !cmd->request_sequence || cmd->reserved0 ||
-	    memchr_inv(cmd->reserved, 0, sizeof(cmd->reserved)))
+	u64 gate_mask;
+
+	if (cmd->size != sizeof(*cmd) ||
+	    cmd->flags & ~KVM_EXEC_CMD_F_PIO_WRITE_GATE ||
+	    !cmd->request_sequence ||
+	    memchr_inv(cmd->reserved0, 0, sizeof(cmd->reserved0)) ||
+	    cmd->reserved)
 		return false;
 	if (!!cmd->expected_current_id != !!cmd->expected_current_generation)
 		return false;
+	if (cmd->flags & KVM_EXEC_CMD_F_PIO_WRITE_GATE) {
+		if (cmd->opcode != KVM_EXEC_CMD_SWITCH ||
+		    !cmd->expected_current_id ||
+		    (cmd->gate_width != 1 && cmd->gate_width != 2 &&
+		     cmd->gate_width != 4) ||
+		    (cmd->target_capsule_id == cmd->expected_current_id &&
+		     cmd->target_lifecycle_generation ==
+			cmd->expected_current_generation))
+			return false;
+		gate_mask = cmd->gate_width == 4 ? U32_MAX :
+			   (1ULL << (cmd->gate_width * 8)) - 1;
+		if (cmd->gate_value & ~gate_mask)
+			return false;
+	} else if (cmd->gate_port || cmd->gate_width || cmd->gate_value) {
+		return false;
+	}
 	if (cmd->opcode == KVM_EXEC_CMD_SWITCH)
 		return cmd->target_capsule_id &&
 		       cmd->target_lifecycle_generation;
@@ -1559,6 +1581,25 @@ static bool kvm_exec_dispatch_command_shape_valid(struct kvm_exec_command *cmd)
 		return !cmd->target_capsule_id &&
 		       !cmd->target_lifecycle_generation;
 	return false;
+}
+
+static bool
+kvm_exec_pio_gate_matches(struct kvm_exec_capsule *source,
+			  const struct kvm_exec_command *command)
+{
+	u64 value = 0;
+
+	if (!(command->flags & KVM_EXEC_CMD_F_PIO_WRITE_GATE))
+		return true;
+	if (!source->exit.async_request_pending ||
+	    source->exit.reason != KVM_EXIT_IO ||
+	    source->exit.direction != KVM_EXIT_IO_OUT ||
+	    source->exit.address != command->gate_port ||
+	    source->exit.len != command->gate_width ||
+	    source->exit.count != 1 || !source->exit.payload_valid)
+		return false;
+	memcpy(&value, source->exit.data, source->exit.len);
+	return value == command->gate_value;
 }
 
 static bool
@@ -1575,8 +1616,16 @@ kvm_exec_async_handoff_command(struct kvm_exec_executor *executor,
 	       command->expected_current_id == source->capsule_id &&
 	       command->expected_current_generation ==
 			source->lifecycle_generation &&
-	       command->target_capsule_id != source->capsule_id;
+	       command->target_capsule_id != source->capsule_id &&
+	       kvm_exec_pio_gate_matches(source, command);
 }
+
+#define KVM_EXEC_HANDOFF_NONE	0
+#define KVM_EXEC_HANDOFF_READY	1
+#define KVM_EXEC_HANDOFF_ARMED	2
+
+static bool kvm_exec_dispatch_cancelled(struct kvm_exec_executor *executor,
+					u64 sequence);
 
 static int kvm_exec_async_handoff_ready(struct kvm_exec_executor *executor)
 {
@@ -1584,7 +1633,7 @@ static int kvm_exec_async_handoff_ready(struct kvm_exec_executor *executor)
 	struct kvm_exec_capsule *source;
 	struct kvm_exec_command command;
 	bool has_command, completion_full;
-	bool ready;
+	int readiness;
 	int ret;
 
 	if (!(domain->negotiated_features & KVM_EXEC_FEATURE_ASYNC_PIO_HANDOFF))
@@ -1603,13 +1652,26 @@ static int kvm_exec_async_handoff_ready(struct kvm_exec_executor *executor)
 	if (!kvm_exec_dispatch_command_shape_valid(&command) ||
 	    command.domain_generation != domain->generation ||
 	    command.executor_generation != executor->generation)
-		return 0;
+		return KVM_EXEC_HANDOFF_NONE;
+	if ((command.flags & KVM_EXEC_CMD_F_PIO_WRITE_GATE) &&
+	    !(domain->negotiated_features & KVM_EXEC_FEATURE_PIO_WRITE_GATE))
+		return KVM_EXEC_HANDOFF_NONE;
+	if (kvm_exec_dispatch_cancelled(executor, command.request_sequence))
+		return KVM_EXEC_HANDOFF_READY;
 
 	mutex_lock(&domain->lock);
 	source = executor->current_capsule;
-	ready = kvm_exec_async_handoff_command(executor, source, &command);
+	if (kvm_exec_async_handoff_command(executor, source, &command))
+		readiness = KVM_EXEC_HANDOFF_READY;
+	else if ((command.flags & KVM_EXEC_CMD_F_PIO_WRITE_GATE) && source &&
+		 source->capsule_id == command.expected_current_id &&
+		 source->lifecycle_generation ==
+			command.expected_current_generation)
+		readiness = KVM_EXEC_HANDOFF_ARMED;
+	else
+		readiness = KVM_EXEC_HANDOFF_NONE;
 	mutex_unlock(&domain->lock);
-	return ready;
+	return readiness;
 }
 
 static void kvm_exec_snapshot_exit(struct kvm_vcpu *vcpu,
@@ -1982,7 +2044,13 @@ kvm_exec_dispatch_begin(struct kvm_exec_executor *executor, u64 sequence,
 static bool kvm_exec_dispatch_cancelled(struct kvm_exec_executor *executor,
 					u64 sequence)
 {
-	return executor->cancel_sequence == sequence;
+	unsigned long flags;
+	bool cancelled;
+
+	spin_lock_irqsave(&executor->dispatch_lock, flags);
+	cancelled = executor->cancel_sequence == sequence;
+	spin_unlock_irqrestore(&executor->dispatch_lock, flags);
+	return cancelled;
 }
 
 static void kvm_exec_dispatch_owner(struct kvm_exec_executor *executor,
@@ -2058,7 +2126,9 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 		goto terminal;
 	if (!kvm_exec_dispatch_command_shape_valid(&command) ||
 	    command.domain_generation != domain->generation ||
-	    command.executor_generation != executor->generation)
+	    command.executor_generation != executor->generation ||
+	    ((command.flags & KVM_EXEC_CMD_F_PIO_WRITE_GATE) &&
+	     !(domain->negotiated_features & KVM_EXEC_FEATURE_PIO_WRITE_GATE)))
 		goto terminal;
 
 	mutex_lock(&domain->lock);
@@ -2137,8 +2207,7 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 
 	/* Cancellation and ownership replacement share one serialized apply point. */
 	spin_lock_irqsave(&executor->dispatch_lock, flags);
-	if (kvm_exec_dispatch_cancelled(executor,
-					command.request_sequence)) {
+	if (executor->cancel_sequence == command.request_sequence) {
 		status = KVM_EXEC_COMPLETE_CANCELLED_BEFORE_APPLY;
 	} else if (command.opcode == KVM_EXEC_CMD_RELEASE) {
 		completion->handoff_started_ns = ktime_get_ns();
@@ -2252,7 +2321,8 @@ static bool kvm_exec_ready(struct kvm_exec_executor *executor, u64 kick_epoch)
 	return READ_ONCE(executor->domain->paused) ||
 	       READ_ONCE(executor->domain->stopping) ||
 	       atomic64_read(&executor->kick_epoch) != kick_epoch ||
-	       command_tail != executor->command_head ||
+	       (command_tail != executor->command_head &&
+		!READ_ONCE(executor->gated_command_waiting)) ||
 	       exit_completion_tail != executor->exit_completion_head;
 }
 
@@ -2730,6 +2800,8 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 		command_ret = 0;
 		handoff_ready = completion_pending ? 0 :
 			kvm_exec_async_handoff_ready(executor);
+		WRITE_ONCE(executor->gated_command_waiting,
+			   handoff_ready == KVM_EXEC_HANDOFF_ARMED);
 		if (handoff_ready == -EPROTO) {
 			run.return_reason = KVM_EXEC_RETURN_DISPATCH_CORRUPT;
 			run.run_result = -EPROTO;
@@ -2740,7 +2812,7 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 			run.run_result = -ENOSPC;
 			break;
 		}
-		if (handoff_ready > 0) {
+		if (handoff_ready == KVM_EXEC_HANDOFF_READY) {
 			memset(&completion, 0, sizeof(completion));
 			command_ret =
 				kvm_exec_dispatch_consume(executor, &completion);
@@ -2800,7 +2872,8 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 		 * local-APIC interrupt is rejected by command validation until the
 		 * guest retires it with EOI.
 		 */
-		if (!completion_pending && !command_ret) {
+		if (!completion_pending && !command_ret &&
+		    handoff_ready != KVM_EXEC_HANDOFF_ARMED) {
 			bool command_blocked;
 
 			mutex_lock(&domain->lock);
@@ -4917,6 +4990,8 @@ int kvm_dev_ioctl_create_exec_domain(void __user *argp)
 	      KVM_EXEC_FEATURE_SYNC_EXITS)) ||
 	    ((create.requested_features & KVM_EXEC_FEATURE_ASYNC_PIO_HANDOFF) &&
 	     !(create.requested_features & KVM_EXEC_FEATURE_ASYNC_PIO_WRITE)) ||
+	    ((create.requested_features & KVM_EXEC_FEATURE_PIO_WRITE_GATE) &&
+	     !(create.requested_features & KVM_EXEC_FEATURE_ASYNC_PIO_HANDOFF)) ||
 	    ((create.requested_features & KVM_EXEC_FEATURE_RETURN_KICK) &&
 	     !(create.requested_features & KVM_EXEC_FEATURE_DYNAMIC_DISPATCH)) ||
 	    ((create.requested_features & KVM_EXEC_FEATURE_EXACT_INTERRUPT) &&

@@ -62,6 +62,7 @@ feature mask on x86-64 and zero elsewhere.  The current dependencies are:
 * ``SYNC_EXITS`` requires ``DYNAMIC_DISPATCH``;
 * ``ASYNC_PIO_WRITE`` requires ``DYNAMIC_DISPATCH`` and ``SYNC_EXITS``;
 * ``ASYNC_PIO_HANDOFF`` requires ``ASYNC_PIO_WRITE``;
+* ``PIO_WRITE_GATE`` requires ``ASYNC_PIO_HANDOFF``;
 * ``RETURN_KICK`` and ``EXACT_INTERRUPT`` require ``DYNAMIC_DISPATCH``;
 * ``INTERRUPT_PUBLICATION`` requires ``EXACT_INTERRUPT``;
 * ``NOTIFICATION_RING`` requires ``EXACT_INTERRUPT`` and
@@ -102,6 +103,15 @@ completion.  Important completion states include:
 A submission alone is not proof that ownership changed.  Userspace must
 consume the matching completion and reconcile an ambiguous timeout with query
 state.  Cancellation after ``APPLIED`` cannot roll ownership back.
+
+With ``KVM_EXEC_FEATURE_PIO_WRITE_GATE``, an exact different-capsule
+``SWITCH`` may set ``KVM_EXEC_CMD_F_PIO_WRITE_GATE`` and name one output port,
+width and value.  The command must name an exact current capsule.  KVM leaves
+the command at the head of the ring and continues that capsule until its fully
+snapshotted, single non-string output PIO matches all three fields.  A
+nonmatching output follows the normal exit path and does not consume the
+command.  Cancellation remains ordered against the normal ownership apply
+point.
 
 Mapped transport
 ================
@@ -174,6 +184,14 @@ the publishing executor with such a completion outstanding stops the domain.
 Same-capsule ``SWITCH``, ``RELEASE``, reads, string PIO, MMIO and ring-pressure
 fallback remain conservative and wait for completion before ownership can
 change.
+
+The independently negotiated ``PIO_WRITE_GATE`` feature lets userspace publish
+the exact switch before the matching output exists.  The matching output both
+satisfies the gate and reaches the in-kernel dispatcher, so no userspace exit
+acknowledgment or command wake is required before recipient entry.  KVM
+matches only the command's expected-current identity, lifecycle generation,
+port, width and value.  It assigns no scheduler or guest-protocol meaning to
+the output and does not treat it as a park acknowledgment.
 
 Interrupts and blocked capsules
 ===============================

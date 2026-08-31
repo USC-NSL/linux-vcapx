@@ -894,6 +894,7 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_FEATURE_POSTED_INTERRUPT_DELIVERY (1ULL << 11)
 #define KVM_EXEC_FEATURE_NOTIFICATION_RING	(1ULL << 12)
 #define KVM_EXEC_FEATURE_ASYNC_PIO_HANDOFF	(1ULL << 13)
+#define KVM_EXEC_FEATURE_PIO_WRITE_GATE		(1ULL << 14)
 
 #define KVM_EXEC_INTERRUPT_DELIVERY_DIRECT_KICK	1U
 #define KVM_EXEC_INTERRUPT_DELIVERY_LOCAL_APIC_KICK 2U
@@ -963,6 +964,8 @@ struct kvm_ppc_resize_hpt {
 
 #define KVM_EXEC_CMD_SWITCH		1U
 #define KVM_EXEC_CMD_RELEASE		2U
+
+#define KVM_EXEC_CMD_F_PIO_WRITE_GATE	(1U << 0)
 
 #define KVM_EXEC_COMPLETE_APPLIED	1U
 #define KVM_EXEC_COMPLETE_RETURNED	2U
@@ -1159,9 +1162,12 @@ struct kvm_exec_command {
 	__u64 expected_current_generation;
 	__u64 target_capsule_id;
 	__u64 target_lifecycle_generation;
-	__u64 reserved0;
+	__u16 gate_port;
+	__u8 gate_width;
+	__u8 reserved0[5];
 	__u64 user_cookie;
-	__u64 reserved[2];
+	__u64 gate_value;
+	__u64 reserved;
 };
 
 struct kvm_exec_completion {
