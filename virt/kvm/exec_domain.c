@@ -419,6 +419,17 @@ void kvm_exec_domain_vcpu_ioctl_complete(struct kvm_vcpu *vcpu,
 		atomic64_inc(&capsule->wake_count);
 }
 
+bool kvm_exec_domain_vcpu_exit_on_hlt(struct kvm_vcpu *vcpu)
+{
+	struct kvm_exec_capsule *capsule = READ_ONCE(vcpu->exec_capsule);
+
+	return capsule &&
+	       READ_ONCE(capsule->exit.completion_pending) &&
+	       READ_ONCE(capsule->exit.async_completion_ready) &&
+	       READ_ONCE(capsule->exit.async_entry_authorized) &&
+	       !READ_ONCE(capsule->exit.async_reentry_required);
+}
+
 static int kvm_exec_vcpu_run(struct kvm_exec_executor *executor,
 			     struct kvm_exec_capsule *capsule)
 {

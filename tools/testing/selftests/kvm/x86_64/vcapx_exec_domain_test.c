@@ -2564,6 +2564,19 @@ static void guest_async_pio_write(void)
 	asm volatile("ud2");
 }
 
+static void guest_async_pio_then_halt(void)
+{
+	uint16_t value = 0xa5c3;
+
+	asm volatile("outw %%ax, %%dx" : : "a"(value),
+		     "d"((uint16_t)ASYNC_PIO_TEST_PORT));
+	WRITE_ONCE(async_pio_progress, 1);
+	asm volatile("sti; hlt; cli" ::: "memory");
+	WRITE_ONCE(async_pio_progress, 2);
+	for (;;)
+		asm volatile("pause");
+}
+
 static void guest_async_pio_then_exact_interrupt(void)
 {
 	uint16_t value = 0xa5c3;
@@ -6103,6 +6116,190 @@ static void test_halt_wake_requires_exact_dispatch(int kvm_fd)
 	kvm_vm_free(vm);
 }
 
+static void test_split_irqchip_deferred_pio_halt_returns_to_dispatcher(int kvm_fd)
+{
+	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
+				  KVM_EXEC_FEATURE_INTRA_VM_CHAIN |
+				  KVM_EXEC_FEATURE_CROSS_VM_CHAIN |
+				  KVM_EXEC_FEATURE_DYNAMIC_DISPATCH |
+				  KVM_EXEC_FEATURE_SYNC_EXITS |
+				  KVM_EXEC_FEATURE_ASYNC_PIO_WRITE |
+				  KVM_EXEC_FEATURE_RETURN_KICK |
+				  KVM_EXEC_FEATURE_LIFECYCLE_STATE |
+				  KVM_EXEC_FEATURE_ASYNC_PIO_HANDOFF |
+				  KVM_EXEC_FEATURE_EXACT_INTERRUPT |
+				  KVM_EXEC_FEATURE_INTERRUPT_PUBLICATION |
+				  KVM_EXEC_FEATURE_LOCAL_APIC_DELIVERY;
+	struct kvm_exec_interrupt_delivery_config config = {
+		.size = sizeof(config),
+		.delivery = KVM_EXEC_INTERRUPT_DELIVERY_LOCAL_APIC_KICK,
+	};
+	struct kvm_exec_command command = {
+		.opcode = KVM_EXEC_CMD_SWITCH,
+		.request_sequence = 1,
+		.target_capsule_id = 87,
+		.target_lifecycle_generation = 9,
+	};
+	struct kvm_exec_query_capsule capsule = {
+		.size = sizeof(capsule),
+		.capsule_id = 87,
+		.lifecycle_generation = 9,
+	};
+	struct kvm_exec_exit_request request;
+	struct kvm_exec_completion completion;
+	struct dispatch_run_arg run_arg = { };
+	struct dispatch_mapping mapping;
+	struct kvm_exec_run_dispatch run;
+	struct kvm_vcpu *donor_vcpu, *recipient_vcpu;
+	struct kvm_vm *donor_vm, *recipient_vm;
+	uint64_t *progress;
+	uint64_t domain_generation, executor_generation, return_count;
+	bool forced_return = false;
+	pthread_t thread;
+	int domain_fd, executor_fd, ret, i;
+
+	TEST_REQUIRE(ioctl(kvm_fd, KVM_CHECK_EXTENSION,
+			   KVM_CAP_SPLIT_IRQCHIP) > 0);
+	donor_vm = __vm_create_without_irqchip(VM_SHAPE_DEFAULT, 1, 0);
+	vm_enable_cap(donor_vm, KVM_CAP_SPLIT_IRQCHIP, 24);
+	donor_vcpu = vm_vcpu_add(donor_vm, 0, guest_async_pio_then_halt);
+	recipient_vm = vm_create_with_one_vcpu(&recipient_vcpu,
+					       guest_async_recipient);
+	disable_nested_cpuid(donor_vcpu);
+	disable_nested_cpuid(recipient_vcpu);
+	progress = addr_gva2hva(donor_vm,
+				(vm_vaddr_t)&async_pio_progress);
+	WRITE_ONCE(*progress, 0);
+
+	domain_fd = create_domain_with_features(kvm_fd, 2, 1, features,
+						&domain_generation);
+	config.domain_generation = domain_generation;
+	ret = ioctl(domain_fd, KVM_EXEC_CONFIGURE_INTERRUPT_DELIVERY, &config);
+	TEST_ASSERT(!ret,
+		    KVM_IOCTL_ERROR(KVM_EXEC_CONFIGURE_INTERRUPT_DELIVERY, ret));
+	attach_vcpu(domain_fd, donor_vcpu->fd, 87, 9);
+	attach_vcpu(domain_fd, recipient_vcpu->fd, 88, 10);
+	executor_fd = create_executor(domain_fd, 0x879,
+				      &executor_generation);
+	mapping = map_dispatch(executor_fd);
+	command.domain_generation = domain_generation;
+	command.executor_generation = executor_generation;
+	TEST_ASSERT(publish_dispatch_command(&mapping, command),
+		    "failed to publish deferred-PIO donor command");
+
+	run_arg.executor_fd = executor_fd;
+	run_arg.run = (struct kvm_exec_run_dispatch) {
+		.size = sizeof(run_arg.run),
+		.domain_generation = domain_generation,
+		.executor_generation = executor_generation,
+	};
+	TEST_ASSERT(!pthread_create(&thread, NULL, dispatch_runner, &run_arg),
+		    "pthread_create failed");
+	completion = consume_dispatch_completion(&mapping);
+	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_APPLIED);
+	request = consume_exit_request(&mapping);
+	TEST_ASSERT_EQ(request.capsule_id, 87);
+	TEST_ASSERT_EQ(request.port, ASYNC_PIO_TEST_PORT);
+	TEST_ASSERT_EQ(READ_ONCE(*progress), 0);
+
+	command = (struct kvm_exec_command) {
+		.opcode = KVM_EXEC_CMD_SWITCH,
+		.request_sequence = 2,
+		.domain_generation = domain_generation,
+		.executor_generation = executor_generation,
+		.expected_current_id = 87,
+		.expected_current_generation = 9,
+		.target_capsule_id = 88,
+		.target_lifecycle_generation = 10,
+	};
+	TEST_ASSERT(publish_dispatch_command(&mapping, command),
+		    "failed to publish deferred-PIO recipient command");
+	kick_dispatch(executor_fd, domain_generation, executor_generation, 2);
+	completion = consume_dispatch_completion(&mapping);
+	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_APPLIED);
+	TEST_ASSERT_EQ(completion.flags,
+		       KVM_EXEC_COMPLETE_F_ASYNC_PIO_HANDOFF);
+	pthread_join(thread, NULL);
+	TEST_ASSERT(!run_arg.ret,
+		    "recipient dispatch returned %d errno %d",
+		    run_arg.ret, run_arg.error);
+	TEST_ASSERT_EQ(run_arg.run.return_reason, KVM_EXEC_RETURN_VCPU_EXIT);
+	TEST_ASSERT_EQ(run_arg.run.vcpu_exit_reason, KVM_EXIT_SHUTDOWN);
+
+	publish_exit_completion(&mapping, request);
+	kick_dispatch_flags(executor_fd, domain_generation,
+			    executor_generation, request.exit_sequence,
+			    KVM_EXEC_KICK_F_COMPLETION_AVAILABLE);
+	run = run_dispatch_once(executor_fd, domain_generation,
+				executor_generation);
+	TEST_ASSERT_EQ(run.return_reason, KVM_EXEC_RETURN_VCPU_EXIT);
+	TEST_ASSERT_EQ(run.vcpu_exit_reason, KVM_EXIT_SHUTDOWN);
+
+	command = (struct kvm_exec_command) {
+		.opcode = KVM_EXEC_CMD_SWITCH,
+		.request_sequence = 3,
+		.domain_generation = domain_generation,
+		.executor_generation = executor_generation,
+		.expected_current_id = 88,
+		.expected_current_generation = 10,
+		.target_capsule_id = 87,
+		.target_lifecycle_generation = 9,
+	};
+	TEST_ASSERT(publish_dispatch_command(&mapping, command),
+		    "failed to reselect the deferred-PIO donor");
+	run_arg = (struct dispatch_run_arg) {
+		.executor_fd = executor_fd,
+		.run = {
+			.size = sizeof(run_arg.run),
+			.domain_generation = domain_generation,
+			.executor_generation = executor_generation,
+		},
+	};
+	return_count = READ_ONCE(mapping.header->executor_return_count);
+	TEST_ASSERT(!pthread_create(&thread, NULL, dispatch_runner, &run_arg),
+		    "pthread_create failed");
+	completion = consume_dispatch_completion(&mapping);
+	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_APPLIED);
+	wait_for_trace_progress(progress, 0);
+	for (i = 0; i < 100000; i++) {
+		if (READ_ONCE(mapping.header->executor_return_count) >
+		    return_count)
+			break;
+		sched_yield();
+	}
+	if (READ_ONCE(mapping.header->executor_return_count) == return_count) {
+		forced_return = true;
+		kick_dispatch_flags(executor_fd, domain_generation,
+				    executor_generation, 100,
+				    KVM_EXEC_KICK_F_RETURN_TO_VMM);
+	}
+	pthread_join(thread, NULL);
+	TEST_ASSERT(!run_arg.ret,
+		    "deferred-PIO HLT dispatch returned %d errno %d",
+		    run_arg.ret, run_arg.error);
+	TEST_ASSERT(!forced_return,
+		    "deferred-PIO HLT remained blocked inside KVM_RUN");
+	TEST_ASSERT_EQ(run_arg.run.return_reason, KVM_EXEC_RETURN_VCPU_EXIT);
+	TEST_ASSERT_EQ(run_arg.run.vcpu_exit_reason, KVM_EXIT_HLT);
+	TEST_ASSERT_EQ(READ_ONCE(*progress), 1);
+
+	capsule.domain_generation = domain_generation;
+	ret = ioctl(domain_fd, KVM_EXEC_QUERY_CAPSULE, &capsule);
+	TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_EXEC_QUERY_CAPSULE, ret));
+	TEST_ASSERT_EQ(capsule.state, KVM_EXEC_CAPSULE_STATE_BLOCKED_HLT);
+	TEST_ASSERT_EQ(capsule.block_reason, KVM_EXEC_BLOCK_HLT);
+	TEST_ASSERT_EQ(capsule.halt_count, 1);
+	TEST_ASSERT_EQ(capsule.run_count, 2);
+
+	munmap(mapping.header, KVM_EXEC_DISPATCH_MMAP_SIZE);
+	close(executor_fd);
+	detach_vcpu(domain_fd, 87, 9);
+	detach_vcpu(domain_fd, 88, 10);
+	close(domain_fd);
+	kvm_vm_free(recipient_vm);
+	kvm_vm_free(donor_vm);
+}
+
 static void test_halt_wake_dispatch_stress(int kvm_fd)
 {
 	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
@@ -7220,6 +7417,7 @@ int main(int argc, char **argv)
 	}
 	if (argc == 2 && !strcmp(argv[1], "--halt-wake-only")) {
 		test_halt_wake_requires_exact_dispatch(kvm_fd);
+		test_split_irqchip_deferred_pio_halt_returns_to_dispatcher(kvm_fd);
 		test_halt_wake_dispatch_stress(kvm_fd);
 		close(kvm_fd);
 		return 0;
@@ -7297,6 +7495,7 @@ int main(int argc, char **argv)
 			kvm_fd, KVM_EXEC_INTERRUPT_DELIVERY_POSTED);
 	}
 	test_halt_wake_requires_exact_dispatch(kvm_fd);
+	test_split_irqchip_deferred_pio_halt_returns_to_dispatcher(kvm_fd);
 	test_halt_wake_dispatch_stress(kvm_fd);
 	test_cross_vm_halt_interrupt_migration(kvm_fd);
 	test_fd_close_orders(kvm_fd);

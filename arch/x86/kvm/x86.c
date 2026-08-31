@@ -9837,7 +9837,8 @@ static int __kvm_emulate_halt(struct kvm_vcpu *vcpu, int state, int reason)
 	 * handling wake events.
 	 */
 	++vcpu->stat.halt_exits;
-	if (lapic_in_kernel(vcpu)) {
+	if (lapic_in_kernel(vcpu) &&
+	    !kvm_exec_domain_vcpu_exit_on_hlt(vcpu)) {
 		vcpu->arch.mp_state = state;
 		return 1;
 	} else {

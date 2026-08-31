@@ -1515,6 +1515,7 @@ bool kvm_exec_domain_vcpu_ioctl_allowed(struct kvm_vcpu *vcpu,
 					unsigned int ioctl);
 void kvm_exec_domain_vcpu_ioctl_complete(struct kvm_vcpu *vcpu,
 					 unsigned int ioctl, long result);
+bool kvm_exec_domain_vcpu_exit_on_hlt(struct kvm_vcpu *vcpu);
 struct kvm_vcpu *kvm_vcpu_from_fd(int fd, struct file **filep);
 int kvm_vcpu_run(struct kvm_vcpu *vcpu);
 
