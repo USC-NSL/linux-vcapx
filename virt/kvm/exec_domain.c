@@ -3302,6 +3302,17 @@ command_done:
 		}
 	}
 
+	/*
+	 * Ownership may be replaced before the selected capsule can attempt
+	 * entry.  Preserve that APPLIED completion if a signal or return request
+	 * ends this dispatcher invocation in the intervening window.  Otherwise
+	 * userspace can observe last_applied_sequence without any corresponding
+	 * completion and cannot reconcile the exact command after re-entry.
+	 */
+	if (completion_pending) {
+		kvm_exec_dispatch_publish(executor, &completion);
+		completion_pending = false;
+	}
 	mutex_lock(&domain->lock);
 	kvm_exec_interrupt_clear_retained_halt(executor);
 	kvm_exec_dispatch_run_owner(executor, &run);

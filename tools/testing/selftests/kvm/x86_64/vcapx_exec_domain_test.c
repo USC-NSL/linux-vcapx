@@ -2295,6 +2295,8 @@ struct dispatch_run_arg {
 	int ret;
 	int error;
 	bool finished;
+	bool reenter_signals;
+	uint64_t signal_returns;
 };
 
 struct interrupt_arg {
@@ -2493,10 +2495,26 @@ static uint32_t cancel_dispatch(int executor_fd, uint64_t domain_generation,
 static void *dispatch_runner(void *opaque)
 {
 	struct dispatch_run_arg *arg = opaque;
+	uint32_t flags = arg->run.flags;
+	uint64_t domain_generation = arg->run.domain_generation;
+	uint64_t executor_generation = arg->run.executor_generation;
 
-	errno = 0;
-	arg->ret = ioctl(arg->executor_fd, KVM_EXEC_RUN_DISPATCH, &arg->run);
-	arg->error = errno;
+	for (;;) {
+		errno = 0;
+		arg->ret = ioctl(arg->executor_fd, KVM_EXEC_RUN_DISPATCH,
+				 &arg->run);
+		arg->error = errno;
+		if (arg->ret || !arg->reenter_signals ||
+		    arg->run.return_reason != KVM_EXEC_RETURN_SIGNAL)
+			break;
+		arg->signal_returns++;
+		arg->run = (struct kvm_exec_run_dispatch) {
+			.size = sizeof(arg->run),
+			.flags = flags,
+			.domain_generation = domain_generation,
+			.executor_generation = executor_generation,
+		};
+	}
 	__atomic_store_n(&arg->finished, true, __ATOMIC_RELEASE);
 	return NULL;
 }
@@ -4678,6 +4696,10 @@ static void test_dynamic_cross_vm_seeded_trace(int kvm_fd)
 	struct kvm_exec_command command = {
 		.opcode = KVM_EXEC_CMD_SWITCH,
 	};
+	struct sigaction action = {
+		.sa_handler = signal_handler,
+	};
+	struct sigaction old_action;
 	struct dispatch_run_arg run_arg = { };
 	struct dispatch_mapping mapping;
 	struct kvm_exec_completion completion;
@@ -4690,6 +4712,9 @@ static void test_dynamic_cross_vm_seeded_trace(int kvm_fd)
 	pthread_t thread;
 	int domain_fd, i;
 
+	sigemptyset(&action.sa_mask);
+	TEST_ASSERT(!sigaction(SIGUSR1, &action, &old_action),
+		    "sigaction failed, errno %d", errno);
 	vms[0] = vm_create_with_one_vcpu(&vcpus[0], guest_single_step_trace);
 	vms[1] = vm_create_with_one_vcpu(&vcpus[1], guest_single_step_trace);
 	for (i = 0; i < 2; i++) {
@@ -4714,6 +4739,7 @@ static void test_dynamic_cross_vm_seeded_trace(int kvm_fd)
 	run_arg.run.size = sizeof(run_arg.run);
 	run_arg.run.domain_generation = domain_generation;
 	run_arg.run.executor_generation = executor_generation;
+	run_arg.reenter_signals = true;
 	command.domain_generation = domain_generation;
 	command.executor_generation = executor_generation;
 
@@ -4742,6 +4768,8 @@ static void test_dynamic_cross_vm_seeded_trace(int kvm_fd)
 			kick_dispatch(run_arg.executor_fd, domain_generation,
 				      executor_generation, i + 1);
 		}
+		TEST_ASSERT(!pthread_kill(thread, SIGUSR1),
+			    "pthread_kill failed at step %d", i);
 		completion = consume_dispatch_completion(&mapping);
 		TEST_ASSERT_EQ(completion.request_sequence, i + 1);
 		TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_APPLIED);
@@ -4764,6 +4792,8 @@ static void test_dynamic_cross_vm_seeded_trace(int kvm_fd)
 		    run_arg.ret, run_arg.error);
 	TEST_ASSERT_EQ(run_arg.run.return_reason,
 		       KVM_EXEC_RETURN_DOMAIN_PAUSED);
+	TEST_ASSERT(run_arg.signal_returns > 0,
+		    "dispatcher did not re-enter after any signal return");
 	TEST_ASSERT_EQ(run_arg.run.owned_capsule_id, previous_id);
 	TEST_ASSERT(READ_ONCE(counts[0][0]) > 0,
 		    "first dynamic capsule made no guest progress");
@@ -4779,6 +4809,8 @@ static void test_dynamic_cross_vm_seeded_trace(int kvm_fd)
 	close(domain_fd);
 	kvm_vm_free(vms[1]);
 	kvm_vm_free(vms[0]);
+	TEST_ASSERT(!sigaction(SIGUSR1, &old_action, NULL),
+		    "restoring signal action failed, errno %d", errno);
 }
 
 static void test_dynamic_two_executor_migration(int kvm_fd)
@@ -7386,6 +7418,11 @@ int main(int argc, char **argv)
 	if (argc == 2 && !strcmp(argv[1], "--dynamic-kick-cancel-only")) {
 		test_dynamic_return_kick(kvm_fd);
 		test_dynamic_kick_and_cancel(kvm_fd);
+		close(kvm_fd);
+		return 0;
+	}
+	if (argc == 2 && !strcmp(argv[1], "--dynamic-signal-only")) {
+		test_dynamic_cross_vm_seeded_trace(kvm_fd);
 		close(kvm_fd);
 		return 0;
 	}
