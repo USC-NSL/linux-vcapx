@@ -1846,7 +1846,8 @@ kvm_exec_async_publish(struct kvm_exec_executor *executor,
 
 static int
 kvm_exec_async_consume(struct kvm_exec_executor *executor,
-		       struct kvm_exec_capsule **completed_capsule)
+		       struct kvm_exec_capsule **completed_capsule,
+		       bool detached_only)
 {
 	struct kvm_exec_domain *domain = executor->domain;
 	struct kvm_exec_dispatch_header *header =
@@ -1868,10 +1869,6 @@ kvm_exec_async_consume(struct kvm_exec_executor *executor,
 		[executor->exit_completion_head %
 		 KVM_EXEC_DISPATCH_RING_ENTRIES],
 	       sizeof(response));
-	executor->exit_completion_head++;
-	/* Userspace may reuse the response slot after observing this head. */
-	smp_store_release(&header->exit_completion_head,
-			  executor->exit_completion_head);
 
 	valid = response.size == sizeof(response) &&
 		response.status == KVM_EXEC_EXIT_COMPLETE_OK &&
@@ -1894,6 +1891,10 @@ kvm_exec_async_consume(struct kvm_exec_executor *executor,
 		capsule->exit.completion_pending &&
 		capsule->exit.async_request_pending &&
 		!capsule->exit.async_completion_ready;
+	if (valid && detached_only && capsule->owner) {
+		mutex_unlock(&domain->lock);
+		return 0;
+	}
 	if (valid) {
 		capsule->exit.async_request_pending = false;
 		capsule->exit.async_completion_ready = true;
@@ -1901,12 +1902,30 @@ kvm_exec_async_consume(struct kvm_exec_executor *executor,
 		*completed_capsule = capsule;
 	}
 	mutex_unlock(&domain->lock);
+	executor->exit_completion_head++;
+	/* Userspace may reuse the response slot after observing this head. */
+	smp_store_release(&header->exit_completion_head,
+			  executor->exit_completion_head);
 	if (!valid)
 		return -EINVAL;
 
 	WRITE_ONCE(header->async_exit_completion_count,
 		   READ_ONCE(header->async_exit_completion_count) + 1);
 	return 1;
+}
+
+static void
+kvm_exec_async_finish_completion_locked(struct kvm_exec_capsule *capsule)
+{
+	lockdep_assert_held(&capsule->domain->lock);
+
+	WRITE_ONCE(capsule->exit.completion_pending, false);
+	capsule->exit.async_request_pending = false;
+	capsule->exit.async_completion_ready = false;
+	capsule->exit.async_entry_authorized = false;
+	capsule->exit.async_executor_generation = 0;
+	atomic_cmpxchg(&capsule->block_reason, KVM_EXEC_BLOCK_VMM_EXIT,
+		       KVM_EXEC_BLOCK_NONE);
 }
 
 static bool kvm_exec_async_blocks_entry(struct kvm_exec_capsule *capsule)
@@ -1951,15 +1970,8 @@ kvm_exec_async_apply_completion(struct kvm_exec_executor *executor,
 
 	mutex_lock(&domain->lock);
 	capsule->running = false;
-	if (!pending) {
-		WRITE_ONCE(capsule->exit.completion_pending, false);
-		capsule->exit.async_request_pending = false;
-		capsule->exit.async_completion_ready = false;
-		capsule->exit.async_entry_authorized = false;
-		capsule->exit.async_executor_generation = 0;
-		atomic_cmpxchg(&capsule->block_reason, KVM_EXEC_BLOCK_VMM_EXIT,
-			       KVM_EXEC_BLOCK_NONE);
-	}
+	if (!pending)
+		kvm_exec_async_finish_completion_locked(capsule);
 	mutex_unlock(&domain->lock);
 	wake_up_all(&domain->drain_wait);
 
@@ -1971,6 +1983,19 @@ kvm_exec_async_apply_completion(struct kvm_exec_executor *executor,
 static bool kvm_exec_exit_blocks_handoff(struct kvm_exec_capsule *capsule)
 {
 	return capsule->exit.completion_pending;
+}
+
+static bool
+kvm_exec_async_target_ready(struct kvm_exec_executor *executor,
+			    struct kvm_exec_capsule *capsule)
+{
+	lockdep_assert_held(&executor->domain->lock);
+
+	return capsule->exit.completion_pending &&
+	       !capsule->exit.async_request_pending &&
+	       capsule->exit.async_completion_ready &&
+	       capsule->exit.async_reentry_required &&
+	       capsule->exit.async_executor_generation == executor->generation;
 }
 
 static bool
@@ -2186,7 +2211,8 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 			goto terminal_locked;
 		}
 		if (target != current_capsule &&
-		    kvm_exec_exit_blocks_handoff(target)) {
+		    kvm_exec_exit_blocks_handoff(target) &&
+		    !kvm_exec_async_target_ready(executor, target)) {
 			status = KVM_EXEC_COMPLETE_EXIT_PENDING;
 			goto terminal_locked;
 		}
@@ -2736,6 +2762,7 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 		struct kvm_exec_pending_interrupt pending_interrupt = { };
 		struct kvm_exec_capsule *completed_capsule = NULL;
 		bool attempted_kvm_run = false;
+		bool async_completion_corrupt = false;
 		bool async_handoff_applied = false;
 		bool entry_allowed;
 		bool invalid_completion = false;
@@ -2791,6 +2818,29 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 		mutex_unlock(&domain->lock);
 
 		/*
+		 * Accept responses for previously detached capsules before an exact
+		 * command can select one of them again.  A response for the current
+		 * capsule stays queued: an output-gated command must install its
+		 * recipient before the current instruction-completion callback runs.
+		 */
+		do {
+			completed_capsule = NULL;
+			async_ret = kvm_exec_async_consume(executor,
+							   &completed_capsule,
+							   true);
+		} while (async_ret > 0);
+		if (async_ret == -EPROTO) {
+			run.return_reason = KVM_EXEC_RETURN_DISPATCH_CORRUPT;
+			run.run_result = -EPROTO;
+			break;
+		}
+		if (async_ret < 0) {
+			run.return_reason = KVM_EXEC_RETURN_INVALID_COMPLETION;
+			run.run_result = async_ret;
+			break;
+		}
+
+		/*
 		 * A separately negotiated handoff command is allowed to replace a
 		 * source only after that source's complete output PIO request is in
 		 * the mapped ring.  Consume that exact command before a racing
@@ -2841,10 +2891,17 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 		async_ret = 0;
 		if (!async_handoff_applied &&
 		    domain->negotiated_features &
-			    KVM_EXEC_FEATURE_ASYNC_PIO_WRITE)
+			    KVM_EXEC_FEATURE_ASYNC_PIO_WRITE) {
 			async_ret = kvm_exec_async_consume(executor,
-							   &completed_capsule);
-		if (async_ret == -EPROTO) {
+							   &completed_capsule,
+							   false);
+			async_completion_corrupt = async_ret == -EPROTO;
+			if (async_ret > 0)
+				async_ret =
+					kvm_exec_async_apply_completion(
+						executor, completed_capsule);
+		}
+		if (async_completion_corrupt) {
 			run.return_reason = KVM_EXEC_RETURN_DISPATCH_CORRUPT;
 			run.run_result = -EPROTO;
 			break;
@@ -2854,16 +2911,10 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 			run.run_result = async_ret;
 			break;
 		}
-		if (async_ret > 0) {
-			async_ret =
-				kvm_exec_async_apply_completion(executor,
-								completed_capsule);
-			if (async_ret) {
-				run.return_reason =
-					KVM_EXEC_RETURN_INVALID_COMPLETION;
-				run.run_result = async_ret;
-				break;
-			}
+		if (async_ret) {
+			run.return_reason = KVM_EXEC_RETURN_INVALID_COMPLETION;
+			run.run_result = async_ret;
+			break;
 		}
 
 		/*

@@ -2551,6 +2551,7 @@ static void guest_sync_mmio(void)
 
 static uint64_t async_pio_progress;
 static uint64_t async_pio_ring_progress;
+static uint64_t async_recipient_progress;
 
 static void guest_async_pio_write(void)
 {
@@ -2565,6 +2566,13 @@ static void guest_async_pio_write(void)
 static void guest_async_recipient(void)
 {
 	asm volatile("ud2");
+}
+
+static void guest_async_running_recipient(void)
+{
+	WRITE_ONCE(async_recipient_progress, 1);
+	for (;;)
+		asm volatile("pause");
 }
 
 static void guest_async_pio_ring_full(void)
@@ -3128,6 +3136,7 @@ static void test_output_gated_async_pio_handoff(int kvm_fd)
 				  KVM_EXEC_FEATURE_DYNAMIC_DISPATCH |
 				  KVM_EXEC_FEATURE_SYNC_EXITS |
 				  KVM_EXEC_FEATURE_ASYNC_PIO_WRITE |
+				  KVM_EXEC_FEATURE_RETURN_KICK |
 				  KVM_EXEC_FEATURE_LIFECYCLE_STATE |
 				  KVM_EXEC_FEATURE_ASYNC_PIO_HANDOFF |
 				  KVM_EXEC_FEATURE_PIO_WRITE_GATE;
@@ -3158,11 +3167,10 @@ static void test_output_gated_async_pio_handoff(int kvm_fd)
 	struct dispatch_run_arg run_arg = { };
 	struct kvm_exec_exit_request request;
 	struct kvm_exec_completion completion;
-	struct kvm_exec_run_dispatch run;
 	struct dispatch_mapping mapping;
 	struct kvm_vcpu *donor_vcpu, *recipient_vcpu;
 	struct kvm_vm *donor_vm, *recipient_vm;
-	uint64_t *progress;
+	uint64_t *progress, *recipient_progress;
 	uint64_t domain_generation, executor_generation;
 	pthread_t thread;
 	int domain_fd, ret;
@@ -3170,11 +3178,14 @@ static void test_output_gated_async_pio_handoff(int kvm_fd)
 	donor_vm = vm_create_with_one_vcpu(&donor_vcpu,
 					   guest_async_pio_write);
 	recipient_vm = vm_create_with_one_vcpu(&recipient_vcpu,
-					       guest_async_recipient);
+					       guest_async_running_recipient);
 	disable_nested_cpuid(donor_vcpu);
 	disable_nested_cpuid(recipient_vcpu);
 	progress = addr_gva2hva(donor_vm, (vm_vaddr_t)&async_pio_progress);
+	recipient_progress = addr_gva2hva(recipient_vm,
+					  (vm_vaddr_t)&async_recipient_progress);
 	WRITE_ONCE(*progress, 0);
+	WRITE_ONCE(*recipient_progress, 0);
 	domain_fd = create_domain_with_features(kvm_fd, 2, 1, features,
 						&domain_generation);
 	attach_vcpu(domain_fd, donor_vcpu->fd, 91, 51);
@@ -3230,13 +3241,10 @@ static void test_output_gated_async_pio_handoff(int kvm_fd)
 		       KVM_EXEC_COMPLETE_F_ASYNC_PIO_HANDOFF);
 	TEST_ASSERT_EQ(completion.previous_capsule_id, 91);
 	TEST_ASSERT_EQ(completion.owned_capsule_id, 92);
-	pthread_join(thread, NULL);
-	TEST_ASSERT(!run_arg.ret,
-		    "gated-handoff runner failed, ret %d errno %d",
-		    run_arg.ret, run_arg.error);
-	TEST_ASSERT_EQ(run_arg.run.return_reason, KVM_EXEC_RETURN_VCPU_EXIT);
-	TEST_ASSERT_EQ(run_arg.run.vcpu_exit_reason, KVM_EXIT_SHUTDOWN);
-	TEST_ASSERT_EQ(run_arg.run.owned_capsule_id, 92);
+	while (!READ_ONCE(*recipient_progress))
+		sched_yield();
+	TEST_ASSERT(!__atomic_load_n(&run_arg.finished, __ATOMIC_ACQUIRE),
+		    "recipient unexpectedly returned before donor completion");
 	TEST_ASSERT_EQ(READ_ONCE(*progress), 0);
 
 	donor_query.domain_generation = domain_generation;
@@ -3247,16 +3255,50 @@ static void test_output_gated_async_pio_handoff(int kvm_fd)
 	TEST_ASSERT_EQ(donor_query.owner_executor_generation, 0);
 
 	publish_exit_completion(&mapping, request);
-	run = run_dispatch_once(run_arg.executor_fd, domain_generation,
-				executor_generation);
-	TEST_ASSERT_EQ(run.return_reason, KVM_EXEC_RETURN_VCPU_EXIT);
-	TEST_ASSERT_EQ(run.vcpu_exit_reason, KVM_EXIT_SHUTDOWN);
+	kick_dispatch_flags(run_arg.executor_fd, domain_generation,
+			    executor_generation, request.exit_sequence,
+			    KVM_EXEC_KICK_F_COMPLETION_AVAILABLE);
 	TEST_ASSERT_EQ(READ_ONCE(*progress), 0);
 	donor_query.domain_generation = domain_generation;
 	ret = ioctl(domain_fd, KVM_EXEC_QUERY_CAPSULE, &donor_query);
 	TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_EXEC_QUERY_CAPSULE, ret));
-	TEST_ASSERT_EQ(donor_query.state, KVM_EXEC_CAPSULE_STATE_READY);
+	TEST_ASSERT_EQ(donor_query.state,
+		       KVM_EXEC_CAPSULE_STATE_COMPLETION_PENDING);
 	TEST_ASSERT_EQ(donor_query.owner_executor_generation, 0);
+	TEST_ASSERT(!__atomic_load_n(&run_arg.finished, __ATOMIC_ACQUIRE),
+		    "donor completion interrupted the running recipient");
+
+	kick_dispatch_flags(run_arg.executor_fd, domain_generation,
+			    executor_generation, 4,
+			    KVM_EXEC_KICK_F_RETURN_TO_VMM);
+	pthread_join(thread, NULL);
+	TEST_ASSERT(!run_arg.ret,
+		    "gated-handoff runner failed, ret %d errno %d",
+		    run_arg.ret, run_arg.error);
+	TEST_ASSERT_EQ(run_arg.run.return_reason, KVM_EXEC_RETURN_SIGNAL);
+	TEST_ASSERT_EQ(run_arg.run.owned_capsule_id, 92);
+
+	recipient_command = (struct kvm_exec_command) {
+		.opcode = KVM_EXEC_CMD_SWITCH,
+		.request_sequence = 4,
+		.domain_generation = domain_generation,
+		.executor_generation = executor_generation,
+		.expected_current_id = 92,
+		.expected_current_generation = 52,
+		.target_capsule_id = 91,
+		.target_lifecycle_generation = 51,
+	};
+	TEST_ASSERT(publish_dispatch_command(&mapping, recipient_command),
+		    "deferred-completion donor command did not publish");
+	run_arg.run = run_dispatch_once(run_arg.executor_fd, domain_generation,
+					executor_generation);
+	completion = consume_dispatch_completion(&mapping);
+	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_APPLIED);
+	TEST_ASSERT_EQ(completion.previous_capsule_id, 92);
+	TEST_ASSERT_EQ(completion.owned_capsule_id, 91);
+	TEST_ASSERT_EQ(run_arg.run.return_reason, KVM_EXEC_RETURN_VCPU_EXIT);
+	TEST_ASSERT_EQ(run_arg.run.vcpu_exit_reason, KVM_EXIT_SHUTDOWN);
+	TEST_ASSERT_EQ(READ_ONCE(*progress), 1);
 
 	control_domain(domain_fd, KVM_EXEC_PAUSE);
 	control_domain(domain_fd, KVM_EXEC_DRAIN);
