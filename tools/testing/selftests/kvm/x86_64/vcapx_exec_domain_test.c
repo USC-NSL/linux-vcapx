@@ -2552,6 +2552,7 @@ static void guest_sync_mmio(void)
 static uint64_t async_pio_progress;
 static uint64_t async_pio_ring_progress;
 static uint64_t async_recipient_progress;
+static uint64_t async_handoff_release;
 
 static void guest_async_pio_write(void)
 {
@@ -2588,6 +2589,17 @@ static void guest_async_running_recipient(void)
 	WRITE_ONCE(async_recipient_progress, 1);
 	for (;;)
 		asm volatile("pause");
+}
+
+static void guest_async_pio_after_release(void)
+{
+	uint16_t value = 0xb6d4;
+
+	while (!READ_ONCE(async_handoff_release))
+		asm volatile("pause");
+	asm volatile("outw %%ax, %%dx" : : "a"(value),
+		     "d"((uint16_t)ASYNC_PIO_TEST_PORT));
+	asm volatile("ud2");
 }
 
 static void guest_async_pio_ring_full(void)
@@ -3381,6 +3393,131 @@ static void test_output_gated_async_pio_handoff(int kvm_fd)
 	close(domain_fd);
 	kvm_vm_free(recipient_vm);
 	kvm_vm_free(donor_vm);
+}
+
+static void test_output_gated_handoff_with_completion_backlog(int kvm_fd)
+{
+	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
+				  KVM_EXEC_FEATURE_INTRA_VM_CHAIN |
+				  KVM_EXEC_FEATURE_CROSS_VM_CHAIN |
+				  KVM_EXEC_FEATURE_DYNAMIC_DISPATCH |
+				  KVM_EXEC_FEATURE_SYNC_EXITS |
+				  KVM_EXEC_FEATURE_ASYNC_PIO_WRITE |
+				  KVM_EXEC_FEATURE_LIFECYCLE_STATE |
+				  KVM_EXEC_FEATURE_ASYNC_PIO_HANDOFF |
+				  KVM_EXEC_FEATURE_PIO_WRITE_GATE;
+	struct kvm_exec_command commands[] = {
+		{
+			.opcode = KVM_EXEC_CMD_SWITCH,
+			.request_sequence = 1,
+			.target_capsule_id = 101,
+			.target_lifecycle_generation = 61,
+		},
+		{
+			.opcode = KVM_EXEC_CMD_SWITCH,
+			.flags = KVM_EXEC_CMD_F_PIO_WRITE_GATE,
+			.request_sequence = 2,
+			.expected_current_id = 101,
+			.expected_current_generation = 61,
+			.target_capsule_id = 102,
+			.target_lifecycle_generation = 62,
+			.gate_port = ASYNC_PIO_TEST_PORT,
+			.gate_width = 2,
+			.gate_value = 0xa5c3,
+		},
+		{
+			.opcode = KVM_EXEC_CMD_SWITCH,
+			.flags = KVM_EXEC_CMD_F_PIO_WRITE_GATE,
+			.request_sequence = 3,
+			.expected_current_id = 102,
+			.expected_current_generation = 62,
+			.target_capsule_id = 103,
+			.target_lifecycle_generation = 63,
+			.gate_port = ASYNC_PIO_TEST_PORT,
+			.gate_width = 2,
+			.gate_value = 0xb6d4,
+		},
+	};
+	struct dispatch_run_arg run_arg = { };
+	struct kvm_exec_exit_request first_request, second_request;
+	struct kvm_exec_completion completion;
+	struct dispatch_mapping mapping;
+	struct kvm_vcpu *first_vcpu, *second_vcpu, *third_vcpu;
+	struct kvm_vm *first_vm, *second_vm, *third_vm;
+	uint64_t *release;
+	uint64_t domain_generation, executor_generation;
+	pthread_t thread;
+	size_t i;
+	int domain_fd;
+
+	first_vm = vm_create_with_one_vcpu(&first_vcpu, guest_async_pio_write);
+	second_vm = vm_create_with_one_vcpu(&second_vcpu,
+					 guest_async_pio_after_release);
+	third_vm = vm_create_with_one_vcpu(&third_vcpu, guest_async_recipient);
+	disable_nested_cpuid(first_vcpu);
+	disable_nested_cpuid(second_vcpu);
+	disable_nested_cpuid(third_vcpu);
+	release = addr_gva2hva(second_vm,
+				(vm_vaddr_t)&async_handoff_release);
+	WRITE_ONCE(*release, 0);
+	domain_fd = create_domain_with_features(kvm_fd, 3, 1, features,
+						&domain_generation);
+	attach_vcpu(domain_fd, first_vcpu->fd, 101, 61);
+	attach_vcpu(domain_fd, second_vcpu->fd, 102, 62);
+	attach_vcpu(domain_fd, third_vcpu->fd, 103, 63);
+	run_arg.executor_fd = create_executor(domain_fd, 0x815,
+					      &executor_generation);
+	mapping = map_dispatch(run_arg.executor_fd);
+	for (i = 0; i < ARRAY_SIZE(commands); i++) {
+		commands[i].domain_generation = domain_generation;
+		commands[i].executor_generation = executor_generation;
+		TEST_ASSERT(publish_dispatch_command(&mapping, commands[i]),
+			    "back-to-back gated command %zu did not publish", i);
+	}
+	run_arg.run = (struct kvm_exec_run_dispatch) {
+		.size = sizeof(run_arg.run),
+		.domain_generation = domain_generation,
+		.executor_generation = executor_generation,
+	};
+	TEST_ASSERT(!pthread_create(&thread, NULL, dispatch_runner, &run_arg),
+		    "pthread_create failed");
+	completion = consume_dispatch_completion(&mapping);
+	TEST_ASSERT_EQ(completion.request_sequence, 1);
+	first_request = consume_exit_request(&mapping);
+	TEST_ASSERT_EQ(first_request.capsule_id, 101);
+	completion = consume_dispatch_completion(&mapping);
+	TEST_ASSERT_EQ(completion.request_sequence, 2);
+	TEST_ASSERT_EQ(completion.flags,
+		       KVM_EXEC_COMPLETE_F_ASYNC_PIO_HANDOFF);
+
+	/*
+	 * Leave the first source's response queued while the second source exits.
+	 * The independent request ring still has space, so the second gated output
+	 * must remain mapped instead of forcing the executor back to userspace.
+	 */
+	publish_exit_completion(&mapping, first_request);
+	WRITE_ONCE(*release, 1);
+	second_request = consume_exit_request(&mapping);
+	TEST_ASSERT_EQ(second_request.capsule_id, 102);
+	TEST_ASSERT_EQ(*(uint16_t *)second_request.data, 0xb6d4);
+	completion = consume_dispatch_completion(&mapping);
+	TEST_ASSERT_EQ(completion.request_sequence, 3);
+	TEST_ASSERT_EQ(completion.flags,
+		       KVM_EXEC_COMPLETE_F_ASYNC_PIO_HANDOFF);
+	TEST_ASSERT_EQ(mapping.header->async_exit_fallback_count, 0);
+	pthread_join(thread, NULL);
+	TEST_ASSERT(!run_arg.ret,
+		    "completion-backlog runner failed, ret %d errno %d",
+		    run_arg.ret, run_arg.error);
+	TEST_ASSERT_EQ(run_arg.run.return_reason, KVM_EXEC_RETURN_VCPU_EXIT);
+	TEST_ASSERT_EQ(run_arg.run.owned_capsule_id, 103);
+
+	munmap(mapping.header, KVM_EXEC_DISPATCH_MMAP_SIZE);
+	close(run_arg.executor_fd);
+	close(domain_fd);
+	kvm_vm_free(third_vm);
+	kvm_vm_free(second_vm);
+	kvm_vm_free(first_vm);
 }
 
 static void test_async_pio_handoff_before_completion(int kvm_fd)
@@ -7126,6 +7263,7 @@ int main(int argc, char **argv)
 		TEST_ASSERT(capability & KVM_EXEC_FEATURE_ASYNC_PIO_HANDOFF,
 			    "KVM does not advertise asynchronous PIO handoff");
 		test_output_gated_async_pio_handoff(kvm_fd);
+		test_output_gated_handoff_with_completion_backlog(kvm_fd);
 		test_async_pio_handoff_before_completion(kvm_fd);
 		test_async_pio_handoff_fallback(kvm_fd, KVM_EXEC_CMD_SWITCH);
 		test_async_pio_handoff_fallback(kvm_fd, KVM_EXEC_CMD_RELEASE);
@@ -7189,6 +7327,7 @@ int main(int argc, char **argv)
 	test_sync_exit_kick_preserves_completion(kvm_fd);
 	test_async_pio_write_switch(kvm_fd);
 	test_async_pio_handoff_before_completion(kvm_fd);
+	test_output_gated_handoff_with_completion_backlog(kvm_fd);
 	test_async_pio_handoff_fallback(kvm_fd, KVM_EXEC_CMD_SWITCH);
 	test_async_pio_handoff_fallback(kvm_fd, KVM_EXEC_CMD_RELEASE);
 	test_async_pio_handoff_executor_close(kvm_fd);

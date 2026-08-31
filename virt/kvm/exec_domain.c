@@ -1817,7 +1817,14 @@ kvm_exec_async_publish(struct kvm_exec_executor *executor,
 
 	ret = kvm_exec_async_ring_state(executor, &request_full,
 					&has_completion);
-	if (ret || request_full || has_completion) {
+	/*
+	 * Requests and responses have independent rings and capacity counters.
+	 * A response for an older, detached source may legitimately remain queued
+	 * while the current capsule reaches its next output-gated handoff.  Only
+	 * request-ring pressure prevents publishing this new exit; the dispatcher
+	 * consumes the older response at its next boundary.
+	 */
+	if (ret || request_full) {
 		WRITE_ONCE(header->async_exit_fallback_count,
 			   READ_ONCE(header->async_exit_fallback_count) + 1);
 		return false;
