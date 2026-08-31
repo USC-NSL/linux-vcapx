@@ -1999,6 +1999,28 @@ kvm_exec_async_target_ready(struct kvm_exec_executor *executor,
 }
 
 static bool
+kvm_exec_async_completion_inflight(struct kvm_exec_executor *executor,
+				   struct kvm_exec_capsule *capsule)
+{
+	lockdep_assert_held(&executor->domain->lock);
+
+	/*
+	 * Once a saved response has authorized entry, KVM_RUN first retires the
+	 * completed PIO instruction and then resumes guest execution.  Keep the
+	 * exit marked pending until the architecture confirms that retirement,
+	 * but allow an exact interrupt while this exact capsule is already
+	 * running.  Otherwise a compute-bound guest can neither reach another
+	 * boundary nor accept the interrupt intended to create that boundary.
+	 */
+	return capsule->exit.completion_pending &&
+	       !capsule->exit.async_request_pending &&
+	       capsule->exit.async_completion_ready &&
+	       capsule->exit.async_entry_authorized &&
+	       !capsule->exit.async_reentry_required &&
+	       capsule->exit.async_executor_generation == executor->generation;
+}
+
+static bool
 kvm_exec_interrupt_in_service(struct kvm_exec_executor *executor,
 			      struct kvm_exec_capsule *capsule)
 {
@@ -3388,8 +3410,9 @@ kvm_exec_validate_interrupt_locked(struct kvm_exec_executor *executor,
 	    capsule->capsule_id != request->capsule_id ||
 	    capsule->lifecycle_generation != request->lifecycle_generation)
 		return -ESTALE;
-	if (!capsule->running || capsule->exit.completion_pending ||
-	    capsule->exit.async_request_pending)
+	if (!capsule->running || capsule->exit.async_request_pending ||
+	    (capsule->exit.completion_pending &&
+	     !kvm_exec_async_completion_inflight(executor, capsule)))
 		return -EAGAIN;
 
 	*target = capsule;
