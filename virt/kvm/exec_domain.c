@@ -133,6 +133,10 @@ struct kvm_exec_executor {
 	u64 cancel_sequence;
 	u64 last_terminal_sequence;
 	u16 last_terminal_status;
+	/* Exact applied command whose target has not attempted entry yet. */
+	u64 pending_entry_sequence;
+	u64 pending_entry_capsule_id;
+	u64 pending_entry_lifecycle_generation;
 	u64 pending_interrupt_sequence;
 	u64 pending_interrupt_capsule_id;
 	u64 pending_interrupt_lifecycle_generation;
@@ -2130,6 +2134,50 @@ static void kvm_exec_dispatch_owner(struct kvm_exec_executor *executor,
 		current_capsule->lifecycle_generation;
 }
 
+static void
+kvm_exec_dispatch_expect_entry(struct kvm_exec_executor *executor,
+			       const struct kvm_exec_command *command,
+			       const struct kvm_exec_capsule *capsule)
+{
+	if (!capsule) {
+		executor->pending_entry_sequence = 0;
+		executor->pending_entry_capsule_id = 0;
+		executor->pending_entry_lifecycle_generation = 0;
+		return;
+	}
+
+	executor->pending_entry_sequence = command->request_sequence;
+	executor->pending_entry_capsule_id = capsule->capsule_id;
+	executor->pending_entry_lifecycle_generation =
+		capsule->lifecycle_generation;
+}
+
+static u64
+kvm_exec_dispatch_record_entry(struct kvm_exec_executor *executor,
+			       struct kvm_exec_capsule *capsule,
+			       struct kvm_exec_dispatch_header *header,
+			       u64 *request_sequence)
+{
+	u64 entry_ns, sequence = executor->pending_entry_sequence;
+
+	if (!sequence)
+		return 0;
+	if (executor->pending_entry_capsule_id != capsule->capsule_id ||
+	    executor->pending_entry_lifecycle_generation !=
+		capsule->lifecycle_generation) {
+		kvm_exec_dispatch_expect_entry(executor, NULL, NULL);
+		return 0;
+	}
+
+	entry_ns = ktime_get_ns();
+	WRITE_ONCE(header->last_entry_ns, entry_ns);
+	/* Pairs with userspace's acquire load before reading last_entry_ns. */
+	smp_store_release(&header->last_entry_sequence, sequence);
+	*request_sequence = sequence;
+	kvm_exec_dispatch_expect_entry(executor, NULL, NULL);
+	return entry_ns;
+}
+
 static void kvm_exec_dispatch_previous(struct kvm_exec_executor *executor,
 				       struct kvm_exec_completion *completion)
 {
@@ -2288,6 +2336,7 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 			current_capsule->owner = NULL;
 		}
 		executor->current_capsule = NULL;
+		kvm_exec_dispatch_expect_entry(executor, &command, NULL);
 		atomic64_inc(&executor->release_count);
 		status = KVM_EXEC_COMPLETE_RETURNED;
 	} else {
@@ -2314,6 +2363,7 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 		if (target->exit.async_completion_ready)
 			target->exit.async_entry_authorized = true;
 		target->exit.async_reentry_required = false;
+		kvm_exec_dispatch_expect_entry(executor, &command, target);
 		status = KVM_EXEC_COMPLETE_APPLIED;
 	}
 	executor->inflight_sequence = 0;
@@ -3166,14 +3216,18 @@ command_done:
 				entry_allowed = false;
 			}
 		}
+		if (entry_allowed) {
+			u64 entry_sequence = 0;
+			u64 entry_ns;
+
+			entry_ns =
+				kvm_exec_dispatch_record_entry(executor, capsule,
+							       header, &entry_sequence);
+			if (completion_pending &&
+			    entry_sequence == completion.request_sequence)
+				completion.entry_attempt_ns = entry_ns;
+		}
 		if (completion_pending && !kick_pending) {
-			if (entry_allowed) {
-				completion.entry_attempt_ns = ktime_get_ns();
-				WRITE_ONCE(header->last_entry_sequence,
-					   completion.request_sequence);
-				WRITE_ONCE(header->last_entry_ns,
-					   completion.entry_attempt_ns);
-			}
 			kvm_exec_dispatch_publish(executor, &completion);
 			completion_pending = false;
 		}

@@ -4744,7 +4744,7 @@ static void test_dynamic_cross_vm_seeded_trace(int kvm_fd)
 	command.executor_generation = executor_generation;
 
 	for (i = 0; i < 4096; i++) {
-		uint64_t progress_before;
+		uint64_t entry_ns, entry_sequence, progress_before;
 		int target;
 
 		random ^= random << 13;
@@ -4780,6 +4780,15 @@ static void test_dynamic_cross_vm_seeded_trace(int kvm_fd)
 			       generations[target]);
 		TEST_ASSERT_EQ(completion.user_cookie, random);
 		wait_for_trace_progress(&counts[target][target], progress_before);
+		entry_sequence =
+			__atomic_load_n(&mapping.header->last_entry_sequence,
+					__ATOMIC_ACQUIRE);
+		entry_ns = __atomic_load_n(&mapping.header->last_entry_ns,
+					   __ATOMIC_RELAXED);
+		TEST_ASSERT_EQ(entry_sequence, i + 1);
+		TEST_ASSERT(entry_ns >= completion.applied_ns,
+			    "entry observation did not follow apply at step %d",
+			    i);
 		previous_id = capsule_ids[target];
 		previous_generation = generations[target];
 	}
