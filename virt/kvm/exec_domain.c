@@ -4310,6 +4310,26 @@ kvm_exec_notification_control(struct kvm_exec_notification_runner *runner,
 	return ret;
 }
 
+static u64
+kvm_exec_notification_query_occupancy(u64 *headp, u64 *tailp)
+{
+	u64 head, tail, occupancy;
+
+	/*
+	 * The producer and consumer update their cursors independently.  Read
+	 * the producer first so a concurrently advancing consumer can only make
+	 * this observation smaller.  If the consumer passes the sampled tail,
+	 * the sampled prefix was drained during the query; report that transient
+	 * empty point rather than an unsigned underflow as impossible occupancy.
+	 * Stable cursors still produce the exact occupancy used by lifecycle
+	 * reconciliation after drain.
+	 */
+	tail = smp_load_acquire(tailp);
+	head = smp_load_acquire(headp);
+	occupancy = tail - head;
+	return occupancy <= KVM_EXEC_NOTIFICATION_RING_ENTRIES ? occupancy : 0;
+}
+
 static long
 kvm_exec_query_notification(struct kvm_exec_notification_runner *runner,
 			    void __user *argp)
@@ -4318,7 +4338,6 @@ kvm_exec_query_notification(struct kvm_exec_notification_runner *runner,
 		kvm_exec_notification_header(runner);
 	struct kvm_exec_query_notification_runner query;
 	unsigned long flags;
-	u64 command_head, command_tail, completion_head, completion_tail;
 	int ret;
 
 	ret = kvm_exec_domain_access(runner->domain);
@@ -4338,14 +4357,6 @@ kvm_exec_query_notification(struct kvm_exec_notification_runner *runner,
 	    memchr_inv(query.reserved, 0, sizeof(query.reserved)))
 		return -EINVAL;
 
-	/* Pair with both producers before reporting a coherent occupancy. */
-	command_head = smp_load_acquire(&header->command_head);
-	/* Acquire the userspace command publication point. */
-	command_tail = smp_load_acquire(&header->command_tail);
-	/* Acquire the userspace completion-consumption point. */
-	completion_head = smp_load_acquire(&header->completion_head);
-	/* Acquire the kernel completion publication point. */
-	completion_tail = smp_load_acquire(&header->completion_tail);
 	spin_lock_irqsave(&runner->state_lock, flags);
 	query.runner_cookie = runner->cookie;
 	query.requested_cpu = runner->requested_cpu;
@@ -4363,8 +4374,10 @@ kvm_exec_query_notification(struct kvm_exec_notification_runner *runner,
 	query.high_watermark = atomic64_read(&runner->high_watermark);
 	query.kernel_return_count = atomic64_read(&runner->return_count);
 	spin_unlock_irqrestore(&runner->state_lock, flags);
-	query.command_occupancy = command_tail - command_head;
-	query.completion_occupancy = completion_tail - completion_head;
+	query.command_occupancy = kvm_exec_notification_query_occupancy(
+		&header->command_head, &header->command_tail);
+	query.completion_occupancy = kvm_exec_notification_query_occupancy(
+		&header->completion_head, &header->completion_tail);
 	memset(query.reserved, 0, sizeof(query.reserved));
 
 	return copy_to_user(argp, &query, sizeof(query)) ? -EFAULT : 0;
