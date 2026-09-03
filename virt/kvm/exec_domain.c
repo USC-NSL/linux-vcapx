@@ -86,12 +86,13 @@ struct kvm_exec_capsule {
 	u64 next_exit_sequence;
 	struct kvm_exec_exit_state exit;
 	atomic_t block_reason;
-	atomic_t last_cpu;
-	atomic64_t run_count;
+	/* Exclusive execution gives these statistics one writer at a time. */
+	u32 last_cpu;
+	u64 run_count;
 	atomic64_t exit_count;
 	atomic64_t halt_count;
 	atomic64_t wake_count;
-	atomic64_t runtime_ns;
+	u64 runtime_cycles;
 	u32 trace_refs;
 	bool running;
 };
@@ -120,15 +121,16 @@ struct kvm_exec_executor {
 	u64 exit_completion_head;
 	u64 return_count;
 	u64 corruption_count;
-	atomic_t last_cpu;
-	atomic64_t run_count;
+	/* run_lock makes these statistics single-writer. */
+	u32 last_cpu;
+	u64 run_count;
 	atomic64_t switch_count;
 	atomic64_t release_count;
 	atomic64_t rejected_count;
 	atomic64_t cancelled_count;
 	atomic64_t exit_count;
 	atomic64_t failure_count;
-	atomic64_t runtime_ns;
+	u64 runtime_cycles;
 	u64 last_dispatch_sequence;
 	u64 inflight_sequence;
 	u64 cancel_sequence;
@@ -301,6 +303,11 @@ u64 __weak kvm_arch_exec_host_tsc(void)
 	return 0;
 }
 
+u64 __weak kvm_arch_exec_tsc_delta_to_ns(u64 cycles)
+{
+	return 0;
+}
+
 bool __weak kvm_arch_vcpu_exec_completion_pending(struct kvm_vcpu *vcpu)
 {
 	return false;
@@ -439,25 +446,29 @@ bool kvm_exec_domain_vcpu_exit_on_hlt(struct kvm_vcpu *vcpu)
 	       !READ_ONCE(capsule->exit.async_reentry_required);
 }
 
-static int kvm_exec_vcpu_run(struct kvm_exec_executor *executor,
-			     struct kvm_exec_capsule *capsule)
+static int kvm_exec_vcpu_run(struct kvm_exec_capsule *capsule,
+			     u64 *runtime_cycles)
 {
-	u64 start_ns = ktime_get_ns();
-	u64 runtime_ns;
-	u32 cpu;
+	u64 start_tsc = kvm_arch_exec_host_tsc();
 	int ret;
 
 	ret = kvm_vcpu_run(capsule->vcpu);
-	runtime_ns = ktime_get_ns() - start_ns;
-	cpu = get_cpu();
-	put_cpu();
-	atomic_set(&capsule->last_cpu, cpu);
-	atomic64_inc(&capsule->run_count);
-	atomic64_add(runtime_ns, &capsule->runtime_ns);
-	atomic_set(&executor->last_cpu, cpu);
-	atomic64_inc(&executor->run_count);
-	atomic64_add(runtime_ns, &executor->runtime_ns);
+	*runtime_cycles = kvm_arch_exec_host_tsc() - start_tsc;
 	return ret;
+}
+
+static void kvm_exec_account_run(struct kvm_exec_executor *executor,
+				 struct kvm_exec_capsule *capsule, u32 cpu,
+				 u64 runtime_cycles)
+{
+	WRITE_ONCE(capsule->last_cpu, cpu);
+	WRITE_ONCE(capsule->run_count, READ_ONCE(capsule->run_count) + 1);
+	WRITE_ONCE(capsule->runtime_cycles,
+		   READ_ONCE(capsule->runtime_cycles) + runtime_cycles);
+	WRITE_ONCE(executor->last_cpu, cpu);
+	WRITE_ONCE(executor->run_count, READ_ONCE(executor->run_count) + 1);
+	WRITE_ONCE(executor->runtime_cycles,
+		   READ_ONCE(executor->runtime_cycles) + runtime_cycles);
 }
 
 static void kvm_exec_account_exit(struct kvm_exec_executor *executor,
@@ -700,12 +711,12 @@ static int kvm_exec_attach_vcpu(struct kvm_exec_domain *domain,
 		capsule->next_exit_sequence = 0;
 		memset(&capsule->exit, 0, sizeof(capsule->exit));
 		atomic_set(&capsule->block_reason, KVM_EXEC_BLOCK_NONE);
-		atomic_set(&capsule->last_cpu, KVM_EXEC_CPU_ANY);
-		atomic64_set(&capsule->run_count, 0);
+		WRITE_ONCE(capsule->last_cpu, KVM_EXEC_CPU_ANY);
+		WRITE_ONCE(capsule->run_count, 0);
 		atomic64_set(&capsule->exit_count, 0);
 		atomic64_set(&capsule->halt_count, 0);
 		atomic64_set(&capsule->wake_count, 0);
-		atomic64_set(&capsule->runtime_ns, 0);
+		WRITE_ONCE(capsule->runtime_cycles, 0);
 		vcpu->exec_capsule = capsule;
 		domain->nr_attached++;
 		ret = 0;
@@ -834,12 +845,13 @@ static long kvm_exec_query_capsule(struct kvm_exec_domain *domain,
 		capsule->owner->generation : 0;
 	query.owner_cookie = capsule->owner ? capsule->owner->cookie : 0;
 	query.exit_sequence = capsule->exit.sequence;
-	query.run_count = atomic64_read(&capsule->run_count);
+	query.run_count = READ_ONCE(capsule->run_count);
 	query.exit_count = atomic64_read(&capsule->exit_count);
 	query.halt_count = atomic64_read(&capsule->halt_count);
 	query.wake_count = atomic64_read(&capsule->wake_count);
-	query.runtime_ns = atomic64_read(&capsule->runtime_ns);
-	query.last_cpu = atomic_read(&capsule->last_cpu);
+	query.runtime_ns = kvm_arch_exec_tsc_delta_to_ns(
+		READ_ONCE(capsule->runtime_cycles));
+	query.last_cpu = READ_ONCE(capsule->last_cpu);
 	query.reserved0 = 0;
 	memset(query.reserved, 0, sizeof(query.reserved));
 out:
@@ -962,15 +974,15 @@ static int kvm_exec_create_executor(struct kvm_exec_domain *domain,
 	init_waitqueue_head(&executor->dispatch_wait);
 	atomic64_set(&executor->kick_epoch, 0);
 	atomic64_set(&executor->return_kick_epoch, 0);
-	atomic_set(&executor->last_cpu, KVM_EXEC_CPU_ANY);
-	atomic64_set(&executor->run_count, 0);
+	WRITE_ONCE(executor->last_cpu, KVM_EXEC_CPU_ANY);
+	WRITE_ONCE(executor->run_count, 0);
 	atomic64_set(&executor->switch_count, 0);
 	atomic64_set(&executor->release_count, 0);
 	atomic64_set(&executor->rejected_count, 0);
 	atomic64_set(&executor->cancelled_count, 0);
 	atomic64_set(&executor->exit_count, 0);
 	atomic64_set(&executor->failure_count, 0);
-	atomic64_set(&executor->runtime_ns, 0);
+	WRITE_ONCE(executor->runtime_cycles, 0);
 	INIT_LIST_HEAD(&executor->node);
 	kref_get(&domain->kref);
 	if (domain->negotiated_features & KVM_EXEC_FEATURE_DYNAMIC_DISPATCH) {
@@ -1968,6 +1980,8 @@ kvm_exec_async_apply_completion(struct kvm_exec_executor *executor,
 				struct kvm_exec_capsule *capsule)
 {
 	struct kvm_exec_domain *domain = executor->domain;
+	u64 runtime_cycles;
+	u32 cpu;
 	u8 immediate_exit;
 	bool pending;
 	int run_ret;
@@ -1990,9 +2004,12 @@ kvm_exec_async_apply_completion(struct kvm_exec_executor *executor,
 	mutex_lock(&capsule->vcpu->mutex);
 	immediate_exit = READ_ONCE(capsule->vcpu->run->immediate_exit);
 	WRITE_ONCE(capsule->vcpu->run->immediate_exit, 1);
-	run_ret = kvm_exec_vcpu_run(executor, capsule);
+	run_ret = kvm_exec_vcpu_run(capsule, &runtime_cycles);
 	WRITE_ONCE(capsule->vcpu->run->immediate_exit, immediate_exit);
 	pending = kvm_arch_vcpu_exec_completion_pending(capsule->vcpu);
+	cpu = get_cpu();
+	put_cpu();
+	kvm_exec_account_run(executor, capsule, cpu, runtime_cycles);
 	mutex_unlock(&capsule->vcpu->mutex);
 
 	mutex_lock(&domain->lock);
@@ -2909,6 +2926,7 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 	for (;;) {
 		u64 kick_epoch = atomic64_read(&executor->kick_epoch);
 		struct kvm_exec_exit_state observed_exit;
+		u64 runtime_cycles = 0;
 		struct kvm_exec_pending_interrupt pending_interrupt = { };
 		struct kvm_exec_capsule *completed_capsule = NULL;
 		bool attempted_kvm_run = false;
@@ -3307,7 +3325,7 @@ command_done:
 			reported_exit_reason = KVM_EXIT_INTR;
 		} else {
 			attempted_kvm_run = true;
-			run_ret = kvm_exec_vcpu_run(executor, capsule);
+			run_ret = kvm_exec_vcpu_run(capsule, &runtime_cycles);
 			kvm_exec_refresh_interrupt(executor, capsule->vcpu);
 			reported_exit_reason = capsule->vcpu->run->exit_reason;
 			pending_after_run =
@@ -3321,6 +3339,9 @@ command_done:
 			reported_exit_reason == KVM_EXIT_IRQ_WINDOW_OPEN;
 		final_cpu = get_cpu();
 		put_cpu();
+		if (attempted_kvm_run)
+			kvm_exec_account_run(executor, capsule, final_cpu,
+					     runtime_cycles);
 		strict_migrated =
 			(executor->flags & KVM_EXECUTOR_F_STRICT_CPU) &&
 			final_cpu != executor->requested_cpu;
@@ -4738,7 +4759,7 @@ static long kvm_exec_query_executor(struct kvm_exec_executor *executor,
 	mutex_lock(&domain->lock);
 	query.executor_cookie = executor->cookie;
 	query.state = KVM_EXEC_EXECUTOR_STATE_IDLE;
-	query.current_cpu = atomic_read(&executor->last_cpu);
+	query.current_cpu = READ_ONCE(executor->last_cpu);
 	query.current_capsule_id = 0;
 	query.current_lifecycle_generation = 0;
 	capsule = executor->current_capsule;
@@ -4763,14 +4784,15 @@ static long kvm_exec_query_executor(struct kvm_exec_executor *executor,
 		else if (block_reason == KVM_EXEC_BLOCK_VMM_EXIT)
 			query.state = KVM_EXEC_EXECUTOR_STATE_BLOCKED_VMM;
 	}
-	query.run_count = atomic64_read(&executor->run_count);
+	query.run_count = READ_ONCE(executor->run_count);
 	query.switch_count = atomic64_read(&executor->switch_count);
 	query.release_count = atomic64_read(&executor->release_count);
 	query.rejected_count = atomic64_read(&executor->rejected_count);
 	query.cancelled_count = atomic64_read(&executor->cancelled_count);
 	query.exit_count = atomic64_read(&executor->exit_count);
 	query.failure_count = atomic64_read(&executor->failure_count);
-	query.runtime_ns = atomic64_read(&executor->runtime_ns);
+	query.runtime_ns = kvm_arch_exec_tsc_delta_to_ns(
+		READ_ONCE(executor->runtime_cycles));
 	spin_lock_irqsave(&executor->interrupt_lock, flags);
 	query.interrupt_queued_count = executor->interrupt_queued_count;
 	query.interrupt_applied_count = executor->interrupt_applied_count;

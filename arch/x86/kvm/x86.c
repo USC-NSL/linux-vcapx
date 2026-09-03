@@ -68,6 +68,7 @@
 
 #include <asm/debugreg.h>
 #include <asm/msr.h>
+#include <asm/tsc.h>
 #include <asm/desc.h>
 #include <asm/mce.h>
 #include <asm/pkru.h>
@@ -11334,6 +11335,14 @@ bool kvm_arch_vcpu_exec_domain_supported(struct kvm_vcpu *vcpu)
 u64 kvm_arch_exec_host_tsc(void)
 {
 	return rdtsc_ordered();
+}
+
+u64 kvm_arch_exec_tsc_delta_to_ns(u64 cycles)
+{
+	if (unlikely(!tsc_khz))
+		return 0;
+
+	return mul_u64_u32_div(cycles, NSEC_PER_MSEC, tsc_khz);
 }
 
 bool kvm_arch_vcpu_exec_completion_pending(struct kvm_vcpu *vcpu)
