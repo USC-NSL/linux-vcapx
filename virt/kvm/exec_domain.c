@@ -2647,6 +2647,39 @@ kvm_exec_dispatch_publish(struct kvm_exec_executor *executor,
 			  executor->completion_tail);
 }
 
+static int kvm_exec_try_handoff(struct kvm_exec_executor *executor,
+				struct kvm_exec_completion *completion,
+				bool completion_pending,
+				int *readiness,
+				bool *async_handoff_applied)
+{
+	int ret;
+
+	*async_handoff_applied = false;
+	*readiness = completion_pending ? KVM_EXEC_HANDOFF_NONE :
+		kvm_exec_async_handoff_ready(executor);
+	WRITE_ONCE(executor->gated_command_waiting,
+		   *readiness == KVM_EXEC_HANDOFF_ARMED);
+	if (*readiness < 0)
+		return *readiness;
+	if (*readiness != KVM_EXEC_HANDOFF_READY)
+		return 0;
+
+	memset(completion, 0, sizeof(*completion));
+	ret = kvm_exec_dispatch_consume(executor, completion);
+	if (ret <= 0)
+		return ret;
+	if (completion->status == KVM_EXEC_COMPLETE_APPLIED &&
+	    completion->owned_capsule_id) {
+		*async_handoff_applied =
+			completion->flags &
+			KVM_EXEC_COMPLETE_F_ASYNC_PIO_HANDOFF;
+	} else {
+		kvm_exec_dispatch_publish(executor, completion);
+	}
+	return ret;
+}
+
 static bool kvm_exec_ready(struct kvm_exec_executor *executor, u64 kick_epoch)
 {
 	struct kvm_exec_dispatch_header *header =
@@ -3165,10 +3198,10 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 		 * the old instruction-completion callback.
 		 */
 		command_ret = 0;
-		handoff_ready = completion_pending ? 0 :
-			kvm_exec_async_handoff_ready(executor);
-		WRITE_ONCE(executor->gated_command_waiting,
-			   handoff_ready == KVM_EXEC_HANDOFF_ARMED);
+		command_ret = kvm_exec_try_handoff(executor, &completion,
+						   completion_pending,
+						   &handoff_ready,
+						   &async_handoff_applied);
 		if (handoff_ready == -EPROTO) {
 			run.return_reason = KVM_EXEC_RETURN_DISPATCH_CORRUPT;
 			run.run_result = -EPROTO;
@@ -3179,31 +3212,17 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 			run.run_result = -ENOSPC;
 			break;
 		}
-		if (handoff_ready == KVM_EXEC_HANDOFF_READY) {
-			memset(&completion, 0, sizeof(completion));
-			command_ret =
-				kvm_exec_dispatch_consume(executor, &completion);
-			if (command_ret < 0) {
-				run.return_reason =
-					command_ret == -ENOSPC ?
-					KVM_EXEC_RETURN_COMPLETION_FULL :
-					KVM_EXEC_RETURN_DISPATCH_CORRUPT;
-				run.run_result = command_ret;
-				break;
-			}
-			if (command_ret > 0) {
-				if (completion.status == KVM_EXEC_COMPLETE_APPLIED &&
-				    completion.owned_capsule_id) {
-					completion_pending = true;
-					async_handoff_applied =
-						completion.flags &
-						KVM_EXEC_COMPLETE_F_ASYNC_PIO_HANDOFF;
-				} else {
-					kvm_exec_dispatch_publish(executor,
-								  &completion);
-				}
-			}
+		if (command_ret < 0) {
+			run.return_reason = command_ret == -ENOSPC ?
+				KVM_EXEC_RETURN_COMPLETION_FULL :
+				KVM_EXEC_RETURN_DISPATCH_CORRUPT;
+			run.run_result = command_ret;
+			break;
 		}
+		if (command_ret > 0 &&
+		    completion.status == KVM_EXEC_COMPLETE_APPLIED &&
+		    completion.owned_capsule_id)
+			completion_pending = true;
 
 		async_ret = 0;
 		if (!async_handoff_applied &&
@@ -3570,8 +3589,35 @@ command_done:
 			continue;
 		if (interrupt_window_exit)
 			continue;
-		if (async_published)
+		if (async_published) {
+			/*
+			 * A command or return kick published after this run must pass
+			 * through the ordinary loop checks.  Otherwise, offer the
+			 * just-published exact output to the same command validator and
+			 * apply path without restarting the dispatcher first.
+			 */
+			if (atomic64_read(&executor->kick_epoch) == kick_epoch &&
+			    atomic64_read(&executor->return_kick_epoch) ==
+				executor->mapped_boundary_return_kick_epoch) {
+				command_ret = kvm_exec_try_handoff(executor,
+								   &completion,
+								   completion_pending,
+								   &handoff_ready,
+								   &async_handoff_applied);
+				if (command_ret < 0) {
+					run.return_reason = command_ret == -ENOSPC ?
+						KVM_EXEC_RETURN_COMPLETION_FULL :
+						KVM_EXEC_RETURN_DISPATCH_CORRUPT;
+					run.run_result = command_ret;
+					break;
+				}
+				if (command_ret > 0 &&
+				    completion.status == KVM_EXEC_COMPLETE_APPLIED &&
+				    completion.owned_capsule_id)
+					completion_pending = true;
+			}
 			continue;
+		}
 		if (run_ret == -EINTR) {
 			if (atomic64_read(&executor->kick_epoch) !=
 					seen_kick_epoch)
