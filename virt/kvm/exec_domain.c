@@ -2744,14 +2744,11 @@ void kvm_exec_domain_apic_eoi(struct kvm_vcpu *vcpu, u32 vector)
 
 static void
 kvm_exec_refresh_direct_interrupt(struct kvm_exec_executor *executor,
-				  struct kvm_vcpu *vcpu)
+				  struct kvm_vcpu *vcpu,
+				  const struct kvm_exec_pending_interrupt *interrupt)
 {
-	struct kvm_exec_pending_interrupt interrupt = { };
-
-	if (!kvm_exec_interrupt_snapshot(executor, &interrupt) ||
-	    interrupt.delivery != KVM_EXEC_INTERRUPT_DELIVERY_DIRECT_KICK ||
-	    !kvm_exec_interrupt_arch_queued(executor, interrupt.sequence) ||
-	    kvm_arch_vcpu_exec_direct_pending(vcpu, interrupt.vector))
+	if (!kvm_exec_interrupt_arch_queued(executor, interrupt->sequence) ||
+	    kvm_arch_vcpu_exec_direct_pending(vcpu, interrupt->vector))
 		return;
 
 	/*
@@ -2761,18 +2758,15 @@ kvm_exec_refresh_direct_interrupt(struct kvm_exec_executor *executor,
 	 * command that wins before then can cancel the still-queued vector instead
 	 * of leaking it into a later re-entry of the old capsule.
 	 */
-	kvm_exec_interrupt_finish(executor, interrupt.sequence, true);
+	kvm_exec_interrupt_finish(executor, interrupt->sequence, true);
 }
 
 static void
 kvm_exec_refresh_posted_interrupt(struct kvm_exec_executor *executor,
-				  struct kvm_vcpu *vcpu)
+				  struct kvm_vcpu *vcpu,
+				  const struct kvm_exec_pending_interrupt *interrupt)
 {
-	struct kvm_exec_pending_interrupt interrupt = { };
-
-	if (!kvm_exec_interrupt_snapshot(executor, &interrupt) ||
-	    interrupt.delivery != KVM_EXEC_INTERRUPT_DELIVERY_POSTED ||
-	    kvm_arch_vcpu_exec_apic_interrupt_pending(vcpu, interrupt.vector))
+	if (kvm_arch_vcpu_exec_apic_interrupt_pending(vcpu, interrupt->vector))
 		return;
 
 	/*
@@ -2781,8 +2775,28 @@ kvm_exec_refresh_posted_interrupt(struct kvm_exec_executor *executor,
 	 * proof that hardware delivered the vector and the guest issued EOI.
 	 * Observe and retire that exact request without forcing a delivery exit.
 	 */
-	kvm_exec_domain_apic_interrupt_delivered(vcpu, interrupt.vector);
-	kvm_exec_domain_apic_eoi(vcpu, interrupt.vector);
+	kvm_exec_domain_apic_interrupt_delivered(vcpu, interrupt->vector);
+	kvm_exec_domain_apic_eoi(vcpu, interrupt->vector);
+}
+
+static void kvm_exec_refresh_interrupt(struct kvm_exec_executor *executor,
+				       struct kvm_vcpu *vcpu)
+{
+	struct kvm_exec_pending_interrupt interrupt = { };
+
+	if (!kvm_exec_interrupt_snapshot(executor, &interrupt))
+		return;
+
+	switch (interrupt.delivery) {
+	case KVM_EXEC_INTERRUPT_DELIVERY_DIRECT_KICK:
+		kvm_exec_refresh_direct_interrupt(executor, vcpu, &interrupt);
+		break;
+	case KVM_EXEC_INTERRUPT_DELIVERY_POSTED:
+		kvm_exec_refresh_posted_interrupt(executor, vcpu, &interrupt);
+		break;
+	default:
+		break;
+	}
 }
 
 static bool kvm_exec_dispatch_failed(const struct kvm_exec_run_dispatch *run)
@@ -3294,9 +3308,7 @@ command_done:
 		} else {
 			attempted_kvm_run = true;
 			run_ret = kvm_exec_vcpu_run(executor, capsule);
-			kvm_exec_refresh_direct_interrupt(executor, capsule->vcpu);
-			kvm_exec_refresh_posted_interrupt(executor,
-							  capsule->vcpu);
+			kvm_exec_refresh_interrupt(executor, capsule->vcpu);
 			reported_exit_reason = capsule->vcpu->run->exit_reason;
 			pending_after_run =
 				kvm_arch_vcpu_exec_completion_pending(capsule->vcpu);
