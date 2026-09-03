@@ -25,7 +25,8 @@
 	 KVM_EXEC_FEATURE_NOTIFICATION_RING | \
 	 KVM_EXEC_FEATURE_ASYNC_PIO_HANDOFF | \
 	 KVM_EXEC_FEATURE_PIO_WRITE_GATE | \
-	 KVM_EXEC_FEATURE_HANDOFF_ENTRY_OBSERVATION)
+	 KVM_EXEC_FEATURE_HANDOFF_ENTRY_OBSERVATION | \
+	 KVM_EXEC_FEATURE_TSC_TIMING)
 
 struct kvm_exec_domain;
 struct kvm_exec_executor;
@@ -140,10 +141,12 @@ struct kvm_exec_executor {
 	u64 pending_entry_sequence;
 	u64 pending_entry_capsule_id;
 	u64 pending_entry_lifecycle_generation;
+	u32 pending_entry_timing_slot;
 	/* Ownership-changing command awaiting its target's first entry. */
 	u64 pending_handoff_entry_sequence;
 	u64 pending_handoff_entry_capsule_id;
 	u64 pending_handoff_entry_lifecycle_generation;
+	u32 pending_handoff_entry_timing_slot;
 	u64 pending_interrupt_sequence;
 	u64 pending_interrupt_capsule_id;
 	u64 pending_interrupt_lifecycle_generation;
@@ -269,9 +272,28 @@ kvm_exec_dispatch_header(struct kvm_exec_executor *executor)
 	return executor->dispatch_region;
 }
 
+static bool kvm_exec_tsc_timing_enabled(struct kvm_exec_executor *executor)
+{
+	return executor->domain->negotiated_features &
+	       KVM_EXEC_FEATURE_TSC_TIMING;
+}
+
+static size_t kvm_exec_dispatch_region_size(struct kvm_exec_executor *executor)
+{
+	return kvm_exec_tsc_timing_enabled(executor) ?
+		KVM_EXEC_TSC_TIMING_MMAP_SIZE : KVM_EXEC_DISPATCH_MMAP_SIZE;
+}
+
+static struct kvm_exec_tsc_timing_header *
+kvm_exec_tsc_timing_header(struct kvm_exec_executor *executor)
+{
+	return executor->dispatch_region + KVM_EXEC_TSC_TIMING_OFFSET;
+}
+
 static void kvm_exec_dispatch_init(struct kvm_exec_executor *executor)
 {
 	struct kvm_exec_dispatch_header *header;
+	struct kvm_exec_tsc_timing_header *timing;
 
 	if (!executor->dispatch_region)
 		return;
@@ -291,6 +313,18 @@ static void kvm_exec_dispatch_init(struct kvm_exec_executor *executor)
 	header->exit_request_entry_size = sizeof(struct kvm_exec_exit_request);
 	header->exit_completion_entry_size =
 		sizeof(struct kvm_exec_exit_completion);
+	if (!kvm_exec_tsc_timing_enabled(executor))
+		return;
+
+	timing = kvm_exec_tsc_timing_header(executor);
+	timing->abi_version = KVM_EXEC_TSC_TIMING_ABI_VERSION;
+	timing->region_size = KVM_EXEC_TSC_TIMING_REGION_SIZE;
+	timing->command_timing_offset = KVM_EXEC_TSC_COMMAND_TIMING_OFFSET;
+	timing->exit_timing_offset = KVM_EXEC_TSC_EXIT_TIMING_OFFSET;
+	timing->command_entries = KVM_EXEC_DISPATCH_RING_ENTRIES;
+	timing->exit_entries = KVM_EXEC_DISPATCH_RING_ENTRIES;
+	timing->command_entry_size = sizeof(struct kvm_exec_command_timing);
+	timing->exit_entry_size = sizeof(struct kvm_exec_exit_timing);
 }
 
 bool __weak kvm_arch_vcpu_exec_domain_supported(struct kvm_vcpu *vcpu)
@@ -883,7 +917,7 @@ static void kvm_exec_executor_free(struct kref *kref)
 
 	if (executor->dispatch_region)
 		free_pages_exact(executor->dispatch_region,
-				 KVM_EXEC_DISPATCH_MMAP_SIZE);
+				 kvm_exec_dispatch_region_size(executor));
 	kref_put(&executor->domain->kref, kvm_exec_domain_free);
 	kfree(executor);
 }
@@ -987,7 +1021,7 @@ static int kvm_exec_create_executor(struct kvm_exec_domain *domain,
 	kref_get(&domain->kref);
 	if (domain->negotiated_features & KVM_EXEC_FEATURE_DYNAMIC_DISPATCH) {
 		executor->dispatch_region =
-			alloc_pages_exact(KVM_EXEC_DISPATCH_MMAP_SIZE,
+			alloc_pages_exact(kvm_exec_dispatch_region_size(executor),
 					  GFP_KERNEL_ACCOUNT | __GFP_ZERO);
 		if (!executor->dispatch_region) {
 			kref_put(&domain->kref, kvm_exec_domain_free);
@@ -1498,6 +1532,31 @@ kvm_exec_exit_completions(struct kvm_exec_executor *executor)
 	return executor->dispatch_region + KVM_EXEC_EXIT_COMPLETION_OFFSET;
 }
 
+static struct kvm_exec_command_timing *
+kvm_exec_command_timing(struct kvm_exec_executor *executor, u32 slot)
+{
+	struct kvm_exec_tsc_timing_header *header =
+		kvm_exec_tsc_timing_header(executor);
+
+	return (void *)header + KVM_EXEC_TSC_COMMAND_TIMING_OFFSET +
+	       slot * sizeof(struct kvm_exec_command_timing);
+}
+
+static struct kvm_exec_exit_timing *
+kvm_exec_exit_timing(struct kvm_exec_executor *executor, u32 slot)
+{
+	struct kvm_exec_tsc_timing_header *header =
+		kvm_exec_tsc_timing_header(executor);
+
+	return (void *)header + KVM_EXEC_TSC_EXIT_TIMING_OFFSET +
+	       slot * sizeof(struct kvm_exec_exit_timing);
+}
+
+static u64 kvm_exec_performance_ns(struct kvm_exec_executor *executor)
+{
+	return kvm_exec_tsc_timing_enabled(executor) ? 0 : ktime_get_ns();
+}
+
 static bool kvm_exec_dispatch_header_valid(struct kvm_exec_executor *executor)
 {
 	struct kvm_exec_dispatch_header *header =
@@ -1838,7 +1897,7 @@ kvm_exec_async_publish(struct kvm_exec_executor *executor,
 		.lifecycle_generation = capsule->lifecycle_generation,
 		.exit_sequence = capsule->exit.sequence,
 		.executor_return_count = executor->return_count,
-		.published_ns = ktime_get_ns(),
+		.published_ns = kvm_exec_performance_ns(executor),
 		.port = capsule->exit.address,
 		.width = capsule->exit.len,
 		.count = capsule->exit.count,
@@ -1873,6 +1932,17 @@ kvm_exec_async_publish(struct kvm_exec_executor *executor,
 	capsule->exit.async_entry_authorized = false;
 	capsule->exit.async_reentry_required = true;
 	capsule->exit.async_executor_generation = executor->generation;
+	if (kvm_exec_tsc_timing_enabled(executor)) {
+		struct kvm_exec_exit_timing *timing =
+			kvm_exec_exit_timing(
+				executor,
+				executor->exit_request_tail %
+					KVM_EXEC_DISPATCH_RING_ENTRIES);
+
+		memset(timing, 0, sizeof(*timing));
+		timing->exit_sequence = capsule->exit.sequence;
+		timing->published_tsc = kvm_arch_exec_host_tsc();
+	}
 	executor->exit_request_tail++;
 	/* The request and capsule state are visible before userspace sees tail. */
 	smp_store_release(&header->exit_request_tail,
@@ -2159,12 +2229,14 @@ static void kvm_exec_dispatch_owner(struct kvm_exec_executor *executor,
 static void
 kvm_exec_dispatch_expect_entry(struct kvm_exec_executor *executor,
 			       const struct kvm_exec_command *command,
-			       const struct kvm_exec_capsule *capsule)
+			       const struct kvm_exec_capsule *capsule,
+			       u32 timing_slot)
 {
 	if (!capsule) {
 		executor->pending_entry_sequence = 0;
 		executor->pending_entry_capsule_id = 0;
 		executor->pending_entry_lifecycle_generation = 0;
+		executor->pending_entry_timing_slot = 0;
 		return;
 	}
 
@@ -2172,18 +2244,21 @@ kvm_exec_dispatch_expect_entry(struct kvm_exec_executor *executor,
 	executor->pending_entry_capsule_id = capsule->capsule_id;
 	executor->pending_entry_lifecycle_generation =
 		capsule->lifecycle_generation;
+	executor->pending_entry_timing_slot = timing_slot;
 }
 
 static void
 kvm_exec_dispatch_expect_handoff_entry(
 	struct kvm_exec_executor *executor,
 	const struct kvm_exec_command *command,
-	const struct kvm_exec_capsule *capsule)
+	const struct kvm_exec_capsule *capsule,
+	u32 timing_slot)
 {
 	if (!capsule) {
 		executor->pending_handoff_entry_sequence = 0;
 		executor->pending_handoff_entry_capsule_id = 0;
 		executor->pending_handoff_entry_lifecycle_generation = 0;
+		executor->pending_handoff_entry_timing_slot = 0;
 		return;
 	}
 
@@ -2191,6 +2266,7 @@ kvm_exec_dispatch_expect_handoff_entry(
 	executor->pending_handoff_entry_capsule_id = capsule->capsule_id;
 	executor->pending_handoff_entry_lifecycle_generation =
 		capsule->lifecycle_generation;
+	executor->pending_handoff_entry_timing_slot = timing_slot;
 }
 
 static u64
@@ -2199,39 +2275,64 @@ kvm_exec_dispatch_record_entry(struct kvm_exec_executor *executor,
 			       struct kvm_exec_dispatch_header *header,
 			       u64 *request_sequence)
 {
+	struct kvm_exec_tsc_timing_header *timing_header = NULL;
+	struct kvm_exec_command_timing *timing;
 	u64 entry_ns, sequence = executor->pending_entry_sequence;
 	u64 handoff_sequence = executor->pending_handoff_entry_sequence;
+	u64 entry_tsc = 0;
 
 	if (!sequence && !handoff_sequence)
 		return 0;
-	entry_ns = ktime_get_ns();
+	entry_ns = kvm_exec_performance_ns(executor);
+	if (kvm_exec_tsc_timing_enabled(executor)) {
+		timing_header = kvm_exec_tsc_timing_header(executor);
+		entry_tsc = kvm_arch_exec_host_tsc();
+	}
 	if (sequence &&
 	    (executor->pending_entry_capsule_id != capsule->capsule_id ||
 	     executor->pending_entry_lifecycle_generation !=
 		     capsule->lifecycle_generation)) {
-		kvm_exec_dispatch_expect_entry(executor, NULL, NULL);
+		kvm_exec_dispatch_expect_entry(executor, NULL, NULL, 0);
 		sequence = 0;
 	}
 	if (sequence) {
+		if (timing_header) {
+			timing = kvm_exec_command_timing(
+				executor, executor->pending_entry_timing_slot);
+			if (READ_ONCE(timing->request_sequence) == sequence)
+				WRITE_ONCE(timing->entry_attempt_tsc, entry_tsc);
+			WRITE_ONCE(timing_header->last_entry_tsc, entry_tsc);
+			/* Pairs with userspace's acquire load of the sequence. */
+			smp_store_release(&timing_header->last_entry_sequence,
+					  sequence);
+		}
 		WRITE_ONCE(header->last_entry_ns, entry_ns);
 		/* Pairs with userspace's acquire load of the sequence. */
 		smp_store_release(&header->last_entry_sequence, sequence);
 		*request_sequence = sequence;
-		kvm_exec_dispatch_expect_entry(executor, NULL, NULL);
+		kvm_exec_dispatch_expect_entry(executor, NULL, NULL, 0);
 	}
 	if (handoff_sequence &&
 	    (executor->pending_handoff_entry_capsule_id != capsule->capsule_id ||
 	     executor->pending_handoff_entry_lifecycle_generation !=
 		     capsule->lifecycle_generation)) {
-		kvm_exec_dispatch_expect_handoff_entry(executor, NULL, NULL);
+		kvm_exec_dispatch_expect_handoff_entry(executor, NULL, NULL, 0);
 		handoff_sequence = 0;
 	}
 	if (handoff_sequence) {
+		if (timing_header) {
+			WRITE_ONCE(timing_header->last_handoff_entry_tsc,
+				   entry_tsc);
+			/* Pairs with userspace's acquire load of the sequence. */
+			smp_store_release(
+				&timing_header->last_handoff_entry_sequence,
+				handoff_sequence);
+		}
 		WRITE_ONCE(header->last_handoff_entry_ns, entry_ns);
 		/* Pairs with userspace's acquire load of the sequence. */
 		smp_store_release(&header->last_handoff_entry_sequence,
 				  handoff_sequence);
-		kvm_exec_dispatch_expect_handoff_entry(executor, NULL, NULL);
+		kvm_exec_dispatch_expect_handoff_entry(executor, NULL, NULL, 0);
 	}
 	return entry_ns;
 }
@@ -2255,12 +2356,15 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 	struct kvm_exec_domain *domain = executor->domain;
 	struct kvm_exec_dispatch_header *header =
 		kvm_exec_dispatch_header(executor);
+	struct kvm_exec_command_timing *timing = NULL;
 	struct kvm_exec_command command;
 	struct kvm_exec_capsule *current_capsule, *target = NULL;
 	struct kvm_exec_capsule *superseded_capsule = NULL;
 	bool async_pio_handoff = false, ownership_changed = false;
 	bool has_command, completion_full, supersede_interrupt = false;
 	unsigned long flags;
+	u32 timing_slot =
+		executor->command_head % KVM_EXEC_DISPATCH_RING_ENTRIES;
 	u16 status = KVM_EXEC_COMPLETE_REJECTED;
 	int ret;
 
@@ -2288,9 +2392,15 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 		.domain_generation = domain->generation,
 		.executor_generation = executor->generation,
 		.user_cookie = command.user_cookie,
-		.consumed_ns = ktime_get_ns(),
+		.consumed_ns = kvm_exec_performance_ns(executor),
 		.executor_return_count = executor->return_count,
 	};
+	if (kvm_exec_tsc_timing_enabled(executor)) {
+		timing = kvm_exec_command_timing(executor, timing_slot);
+		memset(timing, 0, sizeof(*timing));
+		timing->request_sequence = command.request_sequence;
+		timing->consumed_tsc = kvm_arch_exec_host_tsc();
+	}
 
 	if (!kvm_exec_dispatch_begin(executor, command.request_sequence,
 				     &status))
@@ -2382,7 +2492,11 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 	if (executor->cancel_sequence == command.request_sequence) {
 		status = KVM_EXEC_COMPLETE_CANCELLED_BEFORE_APPLY;
 	} else if (command.opcode == KVM_EXEC_CMD_RELEASE) {
-		completion->handoff_started_ns = ktime_get_ns();
+		completion->handoff_started_ns =
+			kvm_exec_performance_ns(executor);
+		if (timing)
+			timing->handoff_started_tsc =
+				kvm_arch_exec_host_tsc();
 		supersede_interrupt = true;
 		superseded_capsule = current_capsule;
 		if (current_capsule) {
@@ -2394,12 +2508,17 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 			current_capsule->owner = NULL;
 		}
 		executor->current_capsule = NULL;
-		kvm_exec_dispatch_expect_entry(executor, &command, NULL);
-		kvm_exec_dispatch_expect_handoff_entry(executor, &command, NULL);
+		kvm_exec_dispatch_expect_entry(executor, &command, NULL, 0);
+		kvm_exec_dispatch_expect_handoff_entry(
+			executor, &command, NULL, 0);
 		atomic64_inc(&executor->release_count);
 		status = KVM_EXEC_COMPLETE_RETURNED;
 	} else {
-		completion->handoff_started_ns = ktime_get_ns();
+		completion->handoff_started_ns =
+			kvm_exec_performance_ns(executor);
+		if (timing)
+			timing->handoff_started_tsc =
+				kvm_arch_exec_host_tsc();
 		ownership_changed = current_capsule != target;
 		if (current_capsule != target) {
 			supersede_interrupt = true;
@@ -2423,10 +2542,11 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 		if (target->exit.async_completion_ready)
 			target->exit.async_entry_authorized = true;
 		target->exit.async_reentry_required = false;
-		kvm_exec_dispatch_expect_entry(executor, &command, target);
+		kvm_exec_dispatch_expect_entry(executor, &command, target,
+					       timing_slot);
 		if (ownership_changed)
 			kvm_exec_dispatch_expect_handoff_entry(executor, &command,
-						       target);
+						       target, timing_slot);
 		status = KVM_EXEC_COMPLETE_APPLIED;
 	}
 	executor->inflight_sequence = 0;
@@ -2436,7 +2556,9 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 	executor->last_terminal_status = status;
 	spin_unlock_irqrestore(&executor->dispatch_lock, flags);
 	completion->status = status;
-	completion->applied_ns = ktime_get_ns();
+	completion->applied_ns = kvm_exec_performance_ns(executor);
+	if (timing)
+		timing->applied_tsc = kvm_arch_exec_host_tsc();
 	/*
 	 * Ownership is now installed and cancellation must reconcile as APPLIED.
 	 * Keep domain->lock across interrupt disarm so no new publication, capsule
@@ -3585,7 +3707,7 @@ kvm_exec_accept_interrupt_locked(struct kvm_exec_executor *executor,
 	} else if (executor->pending_interrupt_sequence) {
 		ret = -EBUSY;
 	} else {
-		*accepted_ns = ktime_get_ns();
+		*accepted_ns = kvm_exec_performance_ns(executor);
 		*accepted_tsc = kvm_arch_exec_host_tsc();
 		executor->last_interrupt_sequence = request->request_sequence;
 		executor->pending_interrupt_sequence = request->request_sequence;
@@ -3620,7 +3742,7 @@ kvm_exec_deliver_interrupt_direct_kick_locked(
 
 	lockdep_assert_held(&executor->domain->lock);
 	/* Record the causal start, before requests and the physical kick. */
-	delivered_ns = ktime_get_ns();
+	delivered_ns = kvm_exec_performance_ns(executor);
 	delivered_tsc = kvm_arch_exec_host_tsc();
 	epoch = atomic64_inc_return(&executor->kick_epoch);
 	header = kvm_exec_dispatch_header(executor);
@@ -3667,7 +3789,7 @@ kvm_exec_deliver_interrupt_local_apic_locked(
 	 * with posted interrupts, so a timestamp taken after the helper would not
 	 * be ordered before guest handler entry.
 	 */
-	delivered_ns = ktime_get_ns();
+	delivered_ns = kvm_exec_performance_ns(executor);
 	delivered_tsc = kvm_arch_exec_host_tsc();
 	/*
 	 * This ioctl intentionally runs concurrently with the persistent task's
@@ -3744,7 +3866,7 @@ kvm_exec_deliver_interrupt_posted_locked(
 	 * may accept the notification and enter its handler before the posting
 	 * helper returns to this CPU.
 	 */
-	delivered_ns = ktime_get_ns();
+	delivered_ns = kvm_exec_performance_ns(executor);
 	delivered_tsc = kvm_arch_exec_host_tsc();
 	ret = kvm_arch_vcpu_exec_queue_posted_interrupt(
 		capsule->vcpu, request->vector, &coalesced);
@@ -5021,7 +5143,8 @@ static int kvm_exec_executor_mmap(struct file *file,
 		return ret;
 	if (!executor->dispatch_region)
 		return -EOPNOTSUPP;
-	if (vma->vm_pgoff || size != KVM_EXEC_DISPATCH_MMAP_SIZE ||
+	if (vma->vm_pgoff ||
+	    size != kvm_exec_dispatch_region_size(executor) ||
 	    !(vma->vm_flags & VM_SHARED) || (vma->vm_flags & VM_EXEC))
 		return -EINVAL;
 
@@ -5234,6 +5357,8 @@ int kvm_dev_ioctl_create_exec_domain(void __user *argp)
 	     !(create.requested_features & KVM_EXEC_FEATURE_ASYNC_PIO_HANDOFF)) ||
 	    ((create.requested_features &
 	      KVM_EXEC_FEATURE_HANDOFF_ENTRY_OBSERVATION) &&
+	     !(create.requested_features & KVM_EXEC_FEATURE_DYNAMIC_DISPATCH)) ||
+	    ((create.requested_features & KVM_EXEC_FEATURE_TSC_TIMING) &&
 	     !(create.requested_features & KVM_EXEC_FEATURE_DYNAMIC_DISPATCH)) ||
 	    ((create.requested_features & KVM_EXEC_FEATURE_RETURN_KICK) &&
 	     !(create.requested_features & KVM_EXEC_FEATURE_DYNAMIC_DISPATCH)) ||

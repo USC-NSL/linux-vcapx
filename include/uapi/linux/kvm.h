@@ -896,6 +896,7 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_FEATURE_ASYNC_PIO_HANDOFF	(1ULL << 13)
 #define KVM_EXEC_FEATURE_PIO_WRITE_GATE		(1ULL << 14)
 #define KVM_EXEC_FEATURE_HANDOFF_ENTRY_OBSERVATION (1ULL << 15)
+#define KVM_EXEC_FEATURE_TSC_TIMING		(1ULL << 16)
 
 #define KVM_EXEC_INTERRUPT_DELIVERY_DIRECT_KICK	1U
 #define KVM_EXEC_INTERRUPT_DELIVERY_LOCAL_APIC_KICK 2U
@@ -930,6 +931,13 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_EXIT_REQUEST_OFFSET	8192U
 #define KVM_EXEC_EXIT_COMPLETION_OFFSET	12288U
 #define KVM_EXEC_DISPATCH_MMAP_SIZE	16384U
+
+#define KVM_EXEC_TSC_TIMING_ABI_VERSION	1U
+#define KVM_EXEC_TSC_TIMING_OFFSET	16384U
+#define KVM_EXEC_TSC_TIMING_REGION_SIZE	4096U
+#define KVM_EXEC_TSC_TIMING_MMAP_SIZE	20480U
+#define KVM_EXEC_TSC_COMMAND_TIMING_OFFSET 256U
+#define KVM_EXEC_TSC_EXIT_TIMING_OFFSET	2304U
 
 #define KVM_EXEC_DISPATCH_F_RETURN_IF_EMPTY (1U << 0)
 #define KVM_EXEC_COMPLETE_F_ASYNC_PIO_HANDOFF (1U << 0)
@@ -1223,6 +1231,43 @@ struct kvm_exec_exit_completion {
 	__u64 exit_sequence;
 	__u64 completed_ns;
 	__u64 reserved[9];
+};
+
+/*
+ * Optional fifth dispatch-mapping page negotiated with
+ * KVM_EXEC_FEATURE_TSC_TIMING.  The existing 16 KiB dispatch layout is
+ * unchanged.  Each timing entry is tagged with the exact sequence from the
+ * corresponding existing ring slot.
+ */
+struct kvm_exec_tsc_timing_header {
+	__u32 abi_version;
+	__u32 region_size;
+	__u32 command_timing_offset;
+	__u32 exit_timing_offset;
+	__u32 command_entries;
+	__u32 exit_entries;
+	__u32 command_entry_size;
+	__u32 exit_entry_size;
+	__u64 last_entry_sequence;
+	__u64 last_entry_tsc;
+	__u64 last_handoff_entry_sequence;
+	__u64 last_handoff_entry_tsc;
+	__u64 reserved[24];
+};
+
+struct kvm_exec_command_timing {
+	__u64 request_sequence;
+	__u64 consumed_tsc;
+	__u64 handoff_started_tsc;
+	__u64 applied_tsc;
+	__u64 entry_attempt_tsc;
+	__u64 reserved[3];
+};
+
+struct kvm_exec_exit_timing {
+	__u64 exit_sequence;
+	__u64 published_tsc;
+	__u64 reserved[2];
 };
 
 struct kvm_exec_run_dispatch {

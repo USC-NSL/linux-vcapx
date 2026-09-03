@@ -120,6 +120,9 @@ static void test_cross_vm_feature_dependencies(int kvm_fd)
 				    KVM_EXEC_FEATURE_HANDOFF_ENTRY_OBSERVATION;
 	assert_ioctl_errno(kvm_fd, KVM_CREATE_EXEC_DOMAIN, &create, EINVAL);
 	create.requested_features = KVM_EXEC_FEATURE_BASE_OBJECTS |
+				    KVM_EXEC_FEATURE_TSC_TIMING;
+	assert_ioctl_errno(kvm_fd, KVM_CREATE_EXEC_DOMAIN, &create, EINVAL);
+	create.requested_features = KVM_EXEC_FEATURE_BASE_OBJECTS |
 				    KVM_EXEC_FEATURE_RETURN_KICK;
 	assert_ioctl_errno(kvm_fd, KVM_CREATE_EXEC_DOMAIN, &create, EINVAL);
 	create.requested_features = KVM_EXEC_FEATURE_BASE_OBJECTS |
@@ -181,6 +184,13 @@ static void test_dynamic_dispatch_uapi_layout(void)
 	TEST_ASSERT_EQ(KVM_EXEC_EXIT_REQUEST_OFFSET, 8192);
 	TEST_ASSERT_EQ(KVM_EXEC_EXIT_COMPLETION_OFFSET, 12288);
 	TEST_ASSERT_EQ(KVM_EXEC_DISPATCH_MMAP_SIZE, 16384);
+	TEST_ASSERT_EQ(KVM_EXEC_TSC_TIMING_OFFSET, 16384);
+	TEST_ASSERT_EQ(KVM_EXEC_TSC_TIMING_MMAP_SIZE, 20480);
+	TEST_ASSERT_EQ(sizeof(struct kvm_exec_tsc_timing_header), 256);
+	TEST_ASSERT_EQ(sizeof(struct kvm_exec_command_timing), 64);
+	TEST_ASSERT_EQ(sizeof(struct kvm_exec_exit_timing), 32);
+	TEST_ASSERT_EQ(KVM_EXEC_TSC_COMMAND_TIMING_OFFSET, 256);
+	TEST_ASSERT_EQ(KVM_EXEC_TSC_EXIT_TIMING_OFFSET, 2304);
 	TEST_ASSERT_EQ(offsetof(struct kvm_exec_run_dispatch, exit_sequence), 88);
 	TEST_ASSERT_EQ(offsetof(struct kvm_exec_run_dispatch, exit_flags), 96);
 }
@@ -296,6 +306,12 @@ static void test_dynamic_dispatch_mapping(int kvm_fd)
 	TEST_ASSERT_EQ(header->command_tail, 0);
 	TEST_ASSERT_EQ(header->completion_head, 0);
 	TEST_ASSERT_EQ(header->completion_tail, 0);
+	errno = 0;
+	TEST_ASSERT(mmap(NULL, KVM_EXEC_TSC_TIMING_MMAP_SIZE,
+			 PROT_READ | PROT_WRITE, MAP_SHARED, executor_fd, 0) ==
+			    MAP_FAILED &&
+		    errno == EINVAL,
+		    "legacy dispatch domain accepted the extended timing mapping");
 	child = fork();
 	TEST_ASSERT(child >= 0, "fork failed, errno %d", errno);
 	if (!child) {
@@ -312,6 +328,56 @@ static void test_dynamic_dispatch_mapping(int kvm_fd)
 	close(executor_fd);
 	TEST_ASSERT_EQ(header->abi_version, KVM_EXEC_DISPATCH_ABI_VERSION);
 	munmap(header, KVM_EXEC_DISPATCH_MMAP_SIZE);
+	close(domain_fd);
+}
+
+static void test_tsc_dispatch_mapping(int kvm_fd)
+{
+	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
+				  KVM_EXEC_FEATURE_DYNAMIC_DISPATCH |
+				  KVM_EXEC_FEATURE_TSC_TIMING;
+	struct kvm_exec_dispatch_header *dispatch;
+	struct kvm_exec_tsc_timing_header *timing;
+	uint64_t domain_generation, executor_generation;
+	int domain_fd, executor_fd;
+	void *region;
+
+	domain_fd = create_domain_with_features(kvm_fd, 1, 1, features,
+						&domain_generation);
+	executor_fd = create_executor(domain_fd, 0x702, &executor_generation);
+
+	errno = 0;
+	TEST_ASSERT(mmap(NULL, KVM_EXEC_DISPATCH_MMAP_SIZE,
+			 PROT_READ | PROT_WRITE, MAP_SHARED, executor_fd, 0) ==
+			    MAP_FAILED &&
+		    errno == EINVAL,
+		    "TSC timing domain accepted the legacy mapping size");
+	region = mmap(NULL, KVM_EXEC_TSC_TIMING_MMAP_SIZE,
+		      PROT_READ | PROT_WRITE, MAP_SHARED, executor_fd, 0);
+	TEST_ASSERT(region != MAP_FAILED,
+		    "TSC timing executor mmap failed, errno: %d", errno);
+	dispatch = region;
+	timing = region + KVM_EXEC_TSC_TIMING_OFFSET;
+
+	TEST_ASSERT_EQ(dispatch->abi_version, KVM_EXEC_DISPATCH_ABI_VERSION);
+	TEST_ASSERT_EQ(dispatch->region_size, KVM_EXEC_DISPATCH_MMAP_SIZE);
+	TEST_ASSERT_EQ(timing->abi_version, KVM_EXEC_TSC_TIMING_ABI_VERSION);
+	TEST_ASSERT_EQ(timing->region_size, KVM_EXEC_TSC_TIMING_REGION_SIZE);
+	TEST_ASSERT_EQ(timing->command_timing_offset,
+		       KVM_EXEC_TSC_COMMAND_TIMING_OFFSET);
+	TEST_ASSERT_EQ(timing->exit_timing_offset,
+		       KVM_EXEC_TSC_EXIT_TIMING_OFFSET);
+	TEST_ASSERT_EQ(timing->command_entries,
+		       KVM_EXEC_DISPATCH_RING_ENTRIES);
+	TEST_ASSERT_EQ(timing->exit_entries, KVM_EXEC_DISPATCH_RING_ENTRIES);
+	TEST_ASSERT_EQ(timing->command_entry_size,
+		       sizeof(struct kvm_exec_command_timing));
+	TEST_ASSERT_EQ(timing->exit_entry_size,
+		       sizeof(struct kvm_exec_exit_timing));
+
+	close(executor_fd);
+	TEST_ASSERT_EQ(timing->abi_version, KVM_EXEC_TSC_TIMING_ABI_VERSION);
+	munmap(region, KVM_EXEC_TSC_TIMING_MMAP_SIZE);
 	close(domain_fd);
 }
 
@@ -7435,7 +7501,8 @@ int main(int argc, char **argv)
 				    KVM_EXEC_FEATURE_INTERRUPT_PUBLICATION |
 				    KVM_EXEC_FEATURE_LOCAL_APIC_DELIVERY |
 				    KVM_EXEC_FEATURE_NOTIFICATION_RING |
-				    KVM_EXEC_FEATURE_ASYNC_PIO_HANDOFF)) ==
+				    KVM_EXEC_FEATURE_ASYNC_PIO_HANDOFF |
+				    KVM_EXEC_FEATURE_TSC_TIMING)) ==
 		     (KVM_EXEC_FEATURE_BASE_OBJECTS |
 		      KVM_EXEC_FEATURE_INTRA_VM_CHAIN |
 		      KVM_EXEC_FEATURE_CROSS_VM_CHAIN |
@@ -7448,7 +7515,8 @@ int main(int argc, char **argv)
 		      KVM_EXEC_FEATURE_INTERRUPT_PUBLICATION |
 		      KVM_EXEC_FEATURE_LOCAL_APIC_DELIVERY |
 		      KVM_EXEC_FEATURE_NOTIFICATION_RING |
-		      KVM_EXEC_FEATURE_ASYNC_PIO_HANDOFF));
+		      KVM_EXEC_FEATURE_ASYNC_PIO_HANDOFF |
+		      KVM_EXEC_FEATURE_TSC_TIMING));
 	if (argc == 2 && !strcmp(argv[1], "--dynamic-kick-cancel-only")) {
 		test_dynamic_return_kick(kvm_fd);
 		test_dynamic_kick_and_cancel(kvm_fd);
@@ -7545,6 +7613,7 @@ int main(int argc, char **argv)
 	test_dynamic_dispatch_uapi_layout();
 	test_posted_interrupt_capability_contract(kvm_fd);
 	test_dynamic_dispatch_mapping(kvm_fd);
+	test_tsc_dispatch_mapping(kvm_fd);
 	test_create_empty_domain(kvm_fd);
 	test_one_capsule_run_and_legacy_restore(kvm_fd);
 	test_strict_cpu_placement(kvm_fd);
