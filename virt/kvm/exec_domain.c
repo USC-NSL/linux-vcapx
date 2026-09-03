@@ -3993,7 +3993,6 @@ kvm_exec_submit_interrupt(struct kvm_exec_executor *executor,
 	u64 accepted_ns = 0;
 	u64 accepted_tsc = 0;
 	bool boundary_state_rejection = false;
-	bool wake_dispatcher = true;
 	int ret;
 
 	memset(outcome, 0, sizeof(*outcome));
@@ -4046,16 +4045,6 @@ kvm_exec_submit_interrupt(struct kvm_exec_executor *executor,
 		   KVM_EXEC_INTERRUPT_DELIVERY_POSTED) {
 		ret = kvm_exec_deliver_interrupt_posted_locked(
 			executor, request, capsule, outcome);
-		/*
-		 * A successful strict post proves the exact current capsule is
-		 * running in guest mode.  The dispatcher is therefore either still
-		 * running that vCPU or returning from it; while domain->lock is held
-		 * here, it cannot pass the return path and commit to dispatch_wait.
-		 * A later command, pause, drain, stop, or completion owns its normal
-		 * wake.  Failed posts retain the conservative path below.
-		 */
-		if (!ret)
-			wake_dispatcher = false;
 	} else {
 		ret = -EOPNOTSUPP;
 	}
@@ -4082,7 +4071,7 @@ out:
 		outcome->retain_halt_armed =
 			request->flags & KVM_EXEC_INTERRUPT_F_RETAIN_HLT;
 	mutex_unlock(&domain->lock);
-	if (!ret && wake_dispatcher)
+	if (!ret)
 		wake_up_interruptible(&executor->dispatch_wait);
 	kvm_exec_interrupt_outcome_finish(outcome, ret);
 	return ret;
