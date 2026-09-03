@@ -5425,6 +5425,9 @@ static int handle_io(struct kvm_vcpu *vcpu)
 	port = exit_qualification >> 16;
 	size = (exit_qualification & 7) + 1;
 	in = (exit_qualification & 8) != 0;
+	if (unlikely(READ_ONCE(vcpu->exec_mapped_exit_profile_boundary) ==
+		     KVM_EXEC_PROFILE_VMX_IO_DISPATCH))
+		WRITE_ONCE(vcpu->exec_mapped_exit_profile_tsc, rdtsc_ordered());
 
 	return kvm_fast_pio(vcpu, size, port, in);
 }
