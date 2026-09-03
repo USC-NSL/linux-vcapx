@@ -26,7 +26,8 @@
 	 KVM_EXEC_FEATURE_ASYNC_PIO_HANDOFF | \
 	 KVM_EXEC_FEATURE_PIO_WRITE_GATE | \
 	 KVM_EXEC_FEATURE_HANDOFF_ENTRY_OBSERVATION | \
-	 KVM_EXEC_FEATURE_TSC_TIMING)
+	 KVM_EXEC_FEATURE_TSC_TIMING | \
+	 KVM_EXEC_FEATURE_INTERRUPT_RESULT)
 
 struct kvm_exec_domain;
 struct kvm_exec_executor;
@@ -52,6 +53,43 @@ struct kvm_exec_interrupt_request {
 	u32 flags;
 	u32 requested_delivery;
 };
+
+struct kvm_exec_interrupt_outcome {
+	int result;
+	u32 status;
+	u32 actual_delivery;
+	bool retain_halt_armed;
+	u64 accepted_tsc;
+	u64 publication_started_tsc;
+};
+
+static void
+kvm_exec_interrupt_outcome_finish(struct kvm_exec_interrupt_outcome *outcome,
+				  int result)
+{
+	outcome->result = result;
+	if (outcome->status)
+		return;
+
+	switch (result) {
+	case 0:
+		outcome->status = KVM_EXEC_INTERRUPT_RESULT_ACCEPTED;
+		break;
+	case -EAGAIN:
+		outcome->status = KVM_EXEC_INTERRUPT_RESULT_RETRY_BOUNDARY;
+		break;
+	case -ESTALE:
+	case -ENOENT:
+		outcome->status = KVM_EXEC_INTERRUPT_RESULT_STALE;
+		break;
+	case -EBUSY:
+		outcome->status = KVM_EXEC_INTERRUPT_RESULT_BUSY;
+		break;
+	default:
+		outcome->status = KVM_EXEC_INTERRUPT_RESULT_FAILED;
+		break;
+	}
+}
 
 static bool kvm_exec_delivery_uses_local_apic(u32 delivery)
 {
@@ -3668,7 +3706,8 @@ static long kvm_exec_kick(struct kvm_exec_executor *executor,
 static int
 kvm_exec_validate_interrupt_locked(struct kvm_exec_executor *executor,
 				   const struct kvm_exec_interrupt_request *request,
-				   struct kvm_exec_capsule **target)
+				   struct kvm_exec_capsule **target,
+				   struct kvm_exec_interrupt_outcome *outcome)
 {
 	struct kvm_exec_domain *domain = executor->domain;
 	struct kvm_exec_capsule *capsule;
@@ -3680,11 +3719,18 @@ kvm_exec_validate_interrupt_locked(struct kvm_exec_executor *executor,
 		return -EBUSY;
 
 	capsule = executor->current_capsule;
-	if (!capsule ||
-	    capsule->capsule_id != request->capsule_id ||
+	if (!capsule) {
+		outcome->status = KVM_EXEC_INTERRUPT_RESULT_NOT_RUNNING;
+		return -EAGAIN;
+	}
+	if (capsule->capsule_id != request->capsule_id ||
 	    capsule->lifecycle_generation != request->lifecycle_generation)
 		return -ESTALE;
-	if (!capsule->running || capsule->exit.async_request_pending ||
+	if (!capsule->running) {
+		outcome->status = KVM_EXEC_INTERRUPT_RESULT_NOT_RUNNING;
+		return -EAGAIN;
+	}
+	if (capsule->exit.async_request_pending ||
 	    (capsule->exit.completion_pending &&
 	     !kvm_exec_async_completion_inflight(executor, capsule)))
 		return -EAGAIN;
@@ -3732,7 +3778,8 @@ static void
 kvm_exec_deliver_interrupt_direct_kick_locked(
 	struct kvm_exec_executor *executor,
 	const struct kvm_exec_interrupt_request *request,
-	struct kvm_exec_capsule *capsule)
+	struct kvm_exec_capsule *capsule,
+	struct kvm_exec_interrupt_outcome *outcome)
 {
 	struct kvm_exec_dispatch_header *header;
 	unsigned long flags;
@@ -3744,6 +3791,8 @@ kvm_exec_deliver_interrupt_direct_kick_locked(
 	/* Record the causal start, before requests and the physical kick. */
 	delivered_ns = kvm_exec_performance_ns(executor);
 	delivered_tsc = kvm_arch_exec_host_tsc();
+	outcome->publication_started_tsc = delivered_tsc;
+	outcome->actual_delivery = KVM_EXEC_INTERRUPT_DELIVERY_DIRECT_KICK;
 	epoch = atomic64_inc_return(&executor->kick_epoch);
 	header = kvm_exec_dispatch_header(executor);
 	WRITE_ONCE(header->kernel_kick_count, epoch);
@@ -3774,7 +3823,8 @@ static int
 kvm_exec_deliver_interrupt_local_apic_locked(
 	struct kvm_exec_executor *executor,
 	const struct kvm_exec_interrupt_request *request,
-	struct kvm_exec_capsule *capsule)
+	struct kvm_exec_capsule *capsule,
+	struct kvm_exec_interrupt_outcome *outcome)
 {
 	unsigned long flags;
 	u64 delivered_ns;
@@ -3800,8 +3850,14 @@ kvm_exec_deliver_interrupt_local_apic_locked(
 	 */
 	ret = kvm_arch_vcpu_exec_queue_local_apic_interrupt(
 		capsule->vcpu, request->vector, &coalesced);
-	if (ret)
+	if (ret) {
+		outcome->publication_started_tsc = delivered_tsc;
 		return ret;
+	}
+	outcome->publication_started_tsc = delivered_tsc;
+	outcome->actual_delivery = coalesced ?
+		KVM_EXEC_INTERRUPT_DELIVERY_COALESCED :
+		KVM_EXEC_INTERRUPT_DELIVERY_LOCAL_APIC_KICK;
 	if (atomic_cmpxchg(&capsule->block_reason, KVM_EXEC_BLOCK_HLT,
 			   KVM_EXEC_BLOCK_NONE) == KVM_EXEC_BLOCK_HLT)
 		atomic64_inc(&capsule->wake_count);
@@ -3842,7 +3898,8 @@ static int
 kvm_exec_deliver_interrupt_posted_locked(
 	struct kvm_exec_executor *executor,
 	const struct kvm_exec_interrupt_request *request,
-	struct kvm_exec_capsule *capsule)
+	struct kvm_exec_capsule *capsule,
+	struct kvm_exec_interrupt_outcome *outcome)
 {
 	unsigned long flags;
 	u64 delivered_ns;
@@ -3871,6 +3928,7 @@ kvm_exec_deliver_interrupt_posted_locked(
 	ret = kvm_arch_vcpu_exec_queue_posted_interrupt(
 		capsule->vcpu, request->vector, &coalesced);
 	if (ret) {
+		outcome->publication_started_tsc = delivered_tsc;
 		spin_lock_irqsave(&executor->interrupt_lock, flags);
 		if (ret == -EAGAIN)
 			executor->interrupt_posted_root_rejection_count++;
@@ -3879,6 +3937,10 @@ kvm_exec_deliver_interrupt_posted_locked(
 		spin_unlock_irqrestore(&executor->interrupt_lock, flags);
 		return ret;
 	}
+	outcome->publication_started_tsc = delivered_tsc;
+	outcome->actual_delivery = coalesced ?
+		KVM_EXEC_INTERRUPT_DELIVERY_COALESCED :
+		KVM_EXEC_INTERRUPT_DELIVERY_POSTED;
 
 	if (atomic_cmpxchg(&capsule->block_reason, KVM_EXEC_BLOCK_HLT,
 			   KVM_EXEC_BLOCK_NONE) == KVM_EXEC_BLOCK_HLT)
@@ -3923,7 +3985,8 @@ kvm_exec_deliver_interrupt_posted_locked(
 
 static int
 kvm_exec_submit_interrupt(struct kvm_exec_executor *executor,
-			  const struct kvm_exec_interrupt_request *request)
+			  const struct kvm_exec_interrupt_request *request,
+			  struct kvm_exec_interrupt_outcome *outcome)
 {
 	struct kvm_exec_domain *domain = executor->domain;
 	struct kvm_exec_capsule *capsule;
@@ -3932,19 +3995,29 @@ kvm_exec_submit_interrupt(struct kvm_exec_executor *executor,
 	bool boundary_state_rejection = false;
 	int ret;
 
+	memset(outcome, 0, sizeof(*outcome));
 	ret = kvm_exec_domain_access(domain);
-	if (ret)
+	if (ret) {
+		kvm_exec_interrupt_outcome_finish(outcome, ret);
 		return ret;
-	if (!(domain->negotiated_features & KVM_EXEC_FEATURE_EXACT_INTERRUPT))
+	}
+	if (!(domain->negotiated_features & KVM_EXEC_FEATURE_EXACT_INTERRUPT)) {
+		kvm_exec_interrupt_outcome_finish(outcome, -EOPNOTSUPP);
 		return -EOPNOTSUPP;
+	}
 	if (request->domain_generation != domain->generation ||
-	    request->executor_generation != executor->generation)
+	    request->executor_generation != executor->generation) {
+		kvm_exec_interrupt_outcome_finish(outcome, -ESTALE);
 		return -ESTALE;
-	if (request->requested_delivery != domain->interrupt_delivery)
+	}
+	if (request->requested_delivery != domain->interrupt_delivery) {
+		kvm_exec_interrupt_outcome_finish(outcome, -EINVAL);
 		return -EINVAL;
+	}
 
 	mutex_lock(&domain->lock);
-	ret = kvm_exec_validate_interrupt_locked(executor, request, &capsule);
+	ret = kvm_exec_validate_interrupt_locked(executor, request, &capsule,
+						 outcome);
 	if (ret) {
 		boundary_state_rejection = ret == -EAGAIN;
 		goto out;
@@ -3953,6 +4026,7 @@ kvm_exec_submit_interrupt(struct kvm_exec_executor *executor,
 					       &accepted_tsc);
 	if (ret)
 		goto out;
+	outcome->accepted_tsc = accepted_tsc;
 
 	trace_kvm_exec_interrupt_publication(
 		domain->generation, executor->generation, executor->cookie,
@@ -3962,15 +4036,15 @@ kvm_exec_submit_interrupt(struct kvm_exec_executor *executor,
 	if (request->requested_delivery ==
 	    KVM_EXEC_INTERRUPT_DELIVERY_DIRECT_KICK) {
 		kvm_exec_deliver_interrupt_direct_kick_locked(
-			executor, request, capsule);
+			executor, request, capsule, outcome);
 	} else if (request->requested_delivery ==
 		   KVM_EXEC_INTERRUPT_DELIVERY_LOCAL_APIC_KICK) {
 		ret = kvm_exec_deliver_interrupt_local_apic_locked(
-			executor, request, capsule);
+			executor, request, capsule, outcome);
 	} else if (request->requested_delivery ==
 		   KVM_EXEC_INTERRUPT_DELIVERY_POSTED) {
 		ret = kvm_exec_deliver_interrupt_posted_locked(
-			executor, request, capsule);
+			executor, request, capsule, outcome);
 	} else {
 		ret = -EOPNOTSUPP;
 	}
@@ -3993,9 +4067,13 @@ out:
 			executor->interrupt_posted_boundary_state_rejection_count++;
 		spin_unlock_irqrestore(&executor->interrupt_lock, flags);
 	}
+	if (!ret)
+		outcome->retain_halt_armed =
+			request->flags & KVM_EXEC_INTERRUPT_F_RETAIN_HLT;
 	mutex_unlock(&domain->lock);
 	if (!ret)
 		wake_up_interruptible(&executor->dispatch_wait);
+	kvm_exec_interrupt_outcome_finish(outcome, ret);
 	return ret;
 }
 
@@ -4142,8 +4220,8 @@ kvm_exec_notification_process(struct kvm_exec_notification_runner *runner,
 			      bool stopped)
 {
 	struct kvm_exec_interrupt_request request;
+	struct kvm_exec_interrupt_outcome outcome;
 	struct kvm_exec_executor *executor;
-	unsigned long flags;
 	u64 executor_generation;
 	u64 executor_cookie;
 	int ret;
@@ -4185,15 +4263,11 @@ kvm_exec_notification_process(struct kvm_exec_notification_runner *runner,
 		.flags = command->flags,
 		.requested_delivery = command->requested_delivery,
 	};
-	ret = kvm_exec_submit_interrupt(executor, &request);
+	ret = kvm_exec_submit_interrupt(executor, &request, &outcome);
 	if (!ret) {
-		spin_lock_irqsave(&executor->interrupt_lock, flags);
-		completion->actual_delivery = executor->last_interrupt_delivery;
-		completion->accepted_tsc =
-			executor->last_interrupt_accepted_tsc;
-		completion->delivered_tsc =
-			executor->last_interrupt_delivered_tsc;
-		spin_unlock_irqrestore(&executor->interrupt_lock, flags);
+		completion->actual_delivery = outcome.actual_delivery;
+		completion->accepted_tsc = outcome.accepted_tsc;
+		completion->delivered_tsc = outcome.publication_started_tsc;
 	}
 	kref_put(&executor->kref, kvm_exec_executor_free);
 
@@ -4763,6 +4837,7 @@ static long kvm_exec_interrupt(struct kvm_exec_executor *executor,
 {
 	struct kvm_exec_interrupt interrupt;
 	struct kvm_exec_interrupt_request request;
+	struct kvm_exec_interrupt_outcome outcome;
 
 	if (copy_from_user(&interrupt, argp, sizeof(interrupt)))
 		return -EFAULT;
@@ -4783,7 +4858,50 @@ static long kvm_exec_interrupt(struct kvm_exec_executor *executor,
 		.flags = interrupt.flags,
 		.requested_delivery = READ_ONCE(executor->domain->interrupt_delivery),
 	};
-	return kvm_exec_submit_interrupt(executor, &request);
+	return kvm_exec_submit_interrupt(executor, &request, &outcome);
+}
+
+static long kvm_exec_interrupt_result(struct kvm_exec_executor *executor,
+				      void __user *argp)
+{
+	struct kvm_exec_interrupt_result result;
+	struct kvm_exec_interrupt_request request;
+	struct kvm_exec_interrupt_outcome outcome;
+
+	if (copy_from_user(&result, argp, sizeof(result)))
+		return -EFAULT;
+	if (result.size != sizeof(result) ||
+	    result.flags & ~KVM_EXEC_INTERRUPT_F_RETAIN_HLT ||
+	    !result.request_sequence || !result.capsule_id ||
+	    !result.lifecycle_generation || result.vector > U8_MAX ||
+	    !result.requested_delivery || result.result || result.status ||
+	    result.actual_delivery || result.retain_halt_armed ||
+	    result.accepted_tsc || result.publication_started_tsc ||
+	    memchr_inv(result.reserved, 0, sizeof(result.reserved)))
+		return -EINVAL;
+	if (!(executor->domain->negotiated_features &
+	      KVM_EXEC_FEATURE_INTERRUPT_RESULT))
+		return -EOPNOTSUPP;
+
+	request = (struct kvm_exec_interrupt_request) {
+		.domain_generation = result.domain_generation,
+		.executor_generation = result.executor_generation,
+		.request_sequence = result.request_sequence,
+		.capsule_id = result.capsule_id,
+		.lifecycle_generation = result.lifecycle_generation,
+		.vector = result.vector,
+		.flags = result.flags,
+		.requested_delivery = result.requested_delivery,
+	};
+	kvm_exec_submit_interrupt(executor, &request, &outcome);
+	result.result = outcome.result;
+	result.status = outcome.status;
+	result.actual_delivery = outcome.actual_delivery;
+	result.retain_halt_armed = outcome.retain_halt_armed;
+	result.accepted_tsc = outcome.accepted_tsc;
+	result.publication_started_tsc = outcome.publication_started_tsc;
+
+	return copy_to_user(argp, &result, sizeof(result)) ? -EFAULT : 0;
 }
 
 static long kvm_exec_cancel(struct kvm_exec_executor *executor,
@@ -5095,6 +5213,8 @@ static long kvm_exec_executor_ioctl(struct file *file, unsigned int ioctl,
 		return kvm_exec_kick(executor, (void __user *)arg);
 	if (ioctl == KVM_EXEC_INTERRUPT)
 		return kvm_exec_interrupt(executor, (void __user *)arg);
+	if (ioctl == KVM_EXEC_INTERRUPT_RESULT)
+		return kvm_exec_interrupt_result(executor, (void __user *)arg);
 	if (ioctl == KVM_EXEC_CANCEL)
 		return kvm_exec_cancel(executor, (void __user *)arg);
 	if (ioctl == KVM_EXEC_QUERY_EXECUTOR)
@@ -5364,6 +5484,8 @@ int kvm_dev_ioctl_create_exec_domain(void __user *argp)
 	     !(create.requested_features & KVM_EXEC_FEATURE_DYNAMIC_DISPATCH)) ||
 	    ((create.requested_features & KVM_EXEC_FEATURE_EXACT_INTERRUPT) &&
 	     !(create.requested_features & KVM_EXEC_FEATURE_DYNAMIC_DISPATCH)) ||
+	    ((create.requested_features & KVM_EXEC_FEATURE_INTERRUPT_RESULT) &&
+	     !(create.requested_features & KVM_EXEC_FEATURE_EXACT_INTERRUPT)) ||
 	    ((create.requested_features &
 	      KVM_EXEC_FEATURE_INTERRUPT_PUBLICATION) &&
 	     !(create.requested_features & KVM_EXEC_FEATURE_EXACT_INTERRUPT)) ||

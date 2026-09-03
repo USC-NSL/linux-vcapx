@@ -897,6 +897,7 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_FEATURE_PIO_WRITE_GATE		(1ULL << 14)
 #define KVM_EXEC_FEATURE_HANDOFF_ENTRY_OBSERVATION (1ULL << 15)
 #define KVM_EXEC_FEATURE_TSC_TIMING		(1ULL << 16)
+#define KVM_EXEC_FEATURE_INTERRUPT_RESULT	(1ULL << 17)
 
 #define KVM_EXEC_INTERRUPT_DELIVERY_DIRECT_KICK	1U
 #define KVM_EXEC_INTERRUPT_DELIVERY_LOCAL_APIC_KICK 2U
@@ -1317,6 +1318,38 @@ struct kvm_exec_interrupt {
 
 #define KVM_EXEC_INTERRUPT_F_RETAIN_HLT	(1U << 0)
 
+#define KVM_EXEC_INTERRUPT_RESULT_ACCEPTED	1U
+#define KVM_EXEC_INTERRUPT_RESULT_RETRY_BOUNDARY	2U
+#define KVM_EXEC_INTERRUPT_RESULT_STALE		3U
+#define KVM_EXEC_INTERRUPT_RESULT_NOT_RUNNING	4U
+#define KVM_EXEC_INTERRUPT_RESULT_BUSY		5U
+#define KVM_EXEC_INTERRUPT_RESULT_FAILED		6U
+
+/*
+ * Exact result for one interrupt request.  Semantic rejection is returned in
+ * result/status so the complete request identity is copied back atomically
+ * with its delivery classification and timestamps.  The ioctl itself fails
+ * only when the request/result record cannot be exchanged.
+ */
+struct kvm_exec_interrupt_result {
+	__u32 size;
+	__u32 flags;
+	__u64 domain_generation;
+	__u64 executor_generation;
+	__u64 request_sequence;
+	__u64 capsule_id;
+	__u64 lifecycle_generation;
+	__u32 vector;
+	__u32 requested_delivery;
+	__s32 result;
+	__u32 status;
+	__u32 actual_delivery;
+	__u32 retain_halt_armed;
+	__u64 accepted_tsc;
+	__u64 publication_started_tsc;
+	__u64 reserved[5];
+};
+
 struct kvm_exec_interrupt_delivery_config {
 	__u32 size;
 	__u32 flags;
@@ -1634,6 +1667,9 @@ struct kvm_exec_query_interrupt_publication {
 #define KVM_EXEC_QUERY_NOTIFICATION_RUNNER \
 				_IOWR(KVMIO, 0xec, \
 				      struct kvm_exec_query_notification_runner)
+#define KVM_EXEC_INTERRUPT_RESULT \
+				_IOWR(KVMIO, 0xed, \
+				      struct kvm_exec_interrupt_result)
 
 /*
  * Extension capability list.
