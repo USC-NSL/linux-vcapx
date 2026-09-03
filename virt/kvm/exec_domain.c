@@ -1706,16 +1706,16 @@ static int kvm_exec_async_handoff_ready(struct kvm_exec_executor *executor)
 	return readiness;
 }
 
-static void kvm_exec_snapshot_exit(struct kvm_vcpu *vcpu,
+static void kvm_exec_snapshot_exit(struct kvm_vcpu *vcpu, u32 reason,
+				   bool completion_pending,
 				   struct kvm_exec_exit_state *exit)
 {
 	struct kvm_run *run = vcpu->run;
 
 	memset(exit, 0, sizeof(*exit));
-	exit->reason = run->exit_reason;
-	exit->completion_pending =
-		kvm_arch_vcpu_exec_completion_pending(vcpu);
-	if (run->exit_reason == KVM_EXIT_IO) {
+	exit->reason = reason;
+	exit->completion_pending = completion_pending;
+	if (reason == KVM_EXIT_IO) {
 		u64 bytes = (u64)run->io.count * run->io.size;
 
 		exit->address = run->io.port;
@@ -1730,7 +1730,7 @@ static void kvm_exec_snapshot_exit(struct kvm_vcpu *vcpu,
 			exit->payload_valid =
 				kvm_arch_vcpu_exec_copy_pio_data(vcpu,
 								 exit->data, bytes);
-	} else if (run->exit_reason == KVM_EXIT_MMIO) {
+	} else if (reason == KVM_EXIT_MMIO) {
 		exit->address = run->mmio.phys_addr;
 		exit->len = run->mmio.len;
 		exit->direction = run->mmio.is_write;
@@ -3321,6 +3321,7 @@ command_done:
 				kvm_arch_vcpu_exec_completion_pending(capsule->vcpu);
 			if (!run_ret)
 				kvm_exec_snapshot_exit(capsule->vcpu,
+						       reported_exit_reason, pending_after_run,
 						       &observed_exit);
 		}
 		interrupt_window_exit =
