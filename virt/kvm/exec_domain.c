@@ -2061,6 +2061,20 @@ kvm_exec_async_consume(struct kvm_exec_executor *executor,
 	return 1;
 }
 
+static int
+kvm_exec_async_consume_detached(struct kvm_exec_executor *executor)
+{
+	struct kvm_exec_capsule *completed_capsule;
+	int ret;
+
+	do {
+		completed_capsule = NULL;
+		ret = kvm_exec_async_consume(executor, &completed_capsule, true);
+	} while (ret > 0);
+
+	return ret;
+}
+
 static void
 kvm_exec_async_finish_completion_locked(struct kvm_exec_capsule *capsule)
 {
@@ -3173,12 +3187,7 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 		 * capsule stays queued: an output-gated command must install its
 		 * recipient before the current instruction-completion callback runs.
 		 */
-		do {
-			completed_capsule = NULL;
-			async_ret = kvm_exec_async_consume(executor,
-							   &completed_capsule,
-							   true);
-		} while (async_ret > 0);
+		async_ret = kvm_exec_async_consume_detached(executor);
 		if (async_ret == -EPROTO) {
 			run.return_reason = KVM_EXEC_RETURN_DISPATCH_CORRUPT;
 			run.run_result = -EPROTO;
@@ -3596,6 +3605,29 @@ command_done:
 			 * just-published exact output to the same command validator and
 			 * apply path without restarting the dispatcher first.
 			 */
+			if (atomic64_read(&executor->kick_epoch) == kick_epoch &&
+			    atomic64_read(&executor->return_kick_epoch) ==
+				executor->mapped_boundary_return_kick_epoch) {
+				/*
+				 * A capsule used earlier by this executor can be the
+				 * recipient of this handoff.  Apply any response queued
+				 * while it was detached before checking target readiness.
+				 */
+				async_ret =
+					kvm_exec_async_consume_detached(executor);
+				if (async_ret == -EPROTO) {
+					run.return_reason =
+						KVM_EXEC_RETURN_DISPATCH_CORRUPT;
+					run.run_result = -EPROTO;
+					break;
+				}
+				if (async_ret < 0) {
+					run.return_reason =
+						KVM_EXEC_RETURN_INVALID_COMPLETION;
+					run.run_result = async_ret;
+					break;
+				}
+			}
 			if (atomic64_read(&executor->kick_epoch) == kick_epoch &&
 			    atomic64_read(&executor->return_kick_epoch) ==
 				executor->mapped_boundary_return_kick_epoch) {

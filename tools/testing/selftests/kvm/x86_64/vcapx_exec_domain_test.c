@@ -3560,8 +3560,8 @@ static void test_output_gated_handoff_with_completion_backlog(int kvm_fd)
 			.request_sequence = 3,
 			.expected_current_id = 102,
 			.expected_current_generation = 62,
-			.target_capsule_id = 103,
-			.target_lifecycle_generation = 63,
+			.target_capsule_id = 101,
+			.target_lifecycle_generation = 61,
 			.gate_port = ASYNC_PIO_TEST_PORT,
 			.gate_width = 2,
 			.gate_value = 0xb6d4,
@@ -3571,9 +3571,9 @@ static void test_output_gated_handoff_with_completion_backlog(int kvm_fd)
 	struct kvm_exec_exit_request first_request, second_request;
 	struct kvm_exec_completion completion;
 	struct dispatch_mapping mapping;
-	struct kvm_vcpu *first_vcpu, *second_vcpu, *third_vcpu;
-	struct kvm_vm *first_vm, *second_vm, *third_vm;
-	uint64_t *release;
+	struct kvm_vcpu *first_vcpu, *second_vcpu;
+	struct kvm_vm *first_vm, *second_vm;
+	uint64_t *first_progress, *release;
 	uint64_t domain_generation, executor_generation;
 	pthread_t thread;
 	size_t i;
@@ -3582,18 +3582,18 @@ static void test_output_gated_handoff_with_completion_backlog(int kvm_fd)
 	first_vm = vm_create_with_one_vcpu(&first_vcpu, guest_async_pio_write);
 	second_vm = vm_create_with_one_vcpu(&second_vcpu,
 					 guest_async_pio_after_release);
-	third_vm = vm_create_with_one_vcpu(&third_vcpu, guest_async_recipient);
 	disable_nested_cpuid(first_vcpu);
 	disable_nested_cpuid(second_vcpu);
-	disable_nested_cpuid(third_vcpu);
+	first_progress = addr_gva2hva(first_vm,
+				      (vm_vaddr_t)&async_pio_progress);
 	release = addr_gva2hva(second_vm,
 				(vm_vaddr_t)&async_handoff_release);
+	WRITE_ONCE(*first_progress, 0);
 	WRITE_ONCE(*release, 0);
-	domain_fd = create_domain_with_features(kvm_fd, 3, 1, features,
+	domain_fd = create_domain_with_features(kvm_fd, 2, 1, features,
 						&domain_generation);
 	attach_vcpu(domain_fd, first_vcpu->fd, 101, 61);
 	attach_vcpu(domain_fd, second_vcpu->fd, 102, 62);
-	attach_vcpu(domain_fd, third_vcpu->fd, 103, 63);
 	run_arg.executor_fd = create_executor(domain_fd, 0x815,
 					      &executor_generation);
 	mapping = map_dispatch(run_arg.executor_fd);
@@ -3639,12 +3639,12 @@ static void test_output_gated_handoff_with_completion_backlog(int kvm_fd)
 		    "completion-backlog runner failed, ret %d errno %d",
 		    run_arg.ret, run_arg.error);
 	TEST_ASSERT_EQ(run_arg.run.return_reason, KVM_EXEC_RETURN_VCPU_EXIT);
-	TEST_ASSERT_EQ(run_arg.run.owned_capsule_id, 103);
+	TEST_ASSERT_EQ(run_arg.run.owned_capsule_id, 101);
+	TEST_ASSERT_EQ(READ_ONCE(*first_progress), 1);
 
 	munmap(mapping.header, KVM_EXEC_DISPATCH_MMAP_SIZE);
 	close(run_arg.executor_fd);
 	close(domain_fd);
-	kvm_vm_free(third_vm);
 	kvm_vm_free(second_vm);
 	kvm_vm_free(first_vm);
 }
