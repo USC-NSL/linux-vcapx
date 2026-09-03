@@ -323,6 +323,25 @@ struct kvm_mmio_fragment {
 
 struct kvm_exec_capsule;
 
+enum kvm_exec_mapped_exit_profile_boundary {
+	KVM_EXEC_PROFILE_NORMAL = 0,
+	KVM_EXEC_PROFILE_AFTER_VMX_EXIT = 1,
+	KVM_EXEC_PROFILE_AFTER_X86_EXIT = 2,
+	KVM_EXEC_PROFILE_AFTER_GUEST_FPU = 3,
+	KVM_EXEC_PROFILE_AFTER_RUN_STATE = 4,
+	KVM_EXEC_PROFILE_AFTER_SRCU = 5,
+	KVM_EXEC_PROFILE_AFTER_SIGNAL_MASK = 6,
+	KVM_EXEC_PROFILE_AFTER_VCPU_PUT = 7,
+	KVM_EXEC_PROFILE_AFTER_KVM_VCPU_RUN = 8,
+	KVM_EXEC_PROFILE_AFTER_INTERRUPT_REFRESH = 9,
+	KVM_EXEC_PROFILE_AFTER_EXIT_SNAPSHOT = 10,
+	KVM_EXEC_PROFILE_AFTER_VCPU_UNLOCK = 11,
+	KVM_EXEC_PROFILE_AFTER_DOMAIN_LOCK = 12,
+	KVM_EXEC_PROFILE_AFTER_EXIT_RECORD = 13,
+	KVM_EXEC_PROFILE_BEFORE_ASYNC_PUBLISH = 14,
+	KVM_EXEC_PROFILE_BOUNDARY_MAX,
+};
+
 struct kvm_vcpu {
 	struct kvm *kvm;
 #ifdef CONFIG_PREEMPT_NOTIFIERS
@@ -342,6 +361,8 @@ struct kvm_vcpu {
 	struct mutex mutex;
 	struct kvm_run *run;
 	struct kvm_exec_capsule *exec_capsule;
+	u32 exec_mapped_exit_profile_boundary;
+	u64 exec_mapped_exit_profile_tsc;
 
 #ifndef __KVM_HAVE_ARCH_WQP
 	struct rcuwait wait;

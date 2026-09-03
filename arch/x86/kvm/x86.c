@@ -11093,6 +11093,9 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
 		kvm_lapic_sync_from_vapic(vcpu);
 
 	r = static_call(kvm_x86_handle_exit)(vcpu, exit_fastpath);
+	if (unlikely(READ_ONCE(vcpu->exec_mapped_exit_profile_boundary) ==
+		     KVM_EXEC_PROFILE_AFTER_X86_EXIT))
+		WRITE_ONCE(vcpu->exec_mapped_exit_profile_tsc, rdtsc_ordered());
 	return r;
 
 cancel_injection:
@@ -11629,13 +11632,28 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
 
 out:
 	kvm_put_guest_fpu(vcpu);
+	if (unlikely(READ_ONCE(vcpu->exec_mapped_exit_profile_boundary) ==
+		     KVM_EXEC_PROFILE_AFTER_GUEST_FPU))
+		WRITE_ONCE(vcpu->exec_mapped_exit_profile_tsc, rdtsc_ordered());
 	if (kvm_run->kvm_valid_regs)
 		store_regs(vcpu);
 	post_kvm_run_save(vcpu);
+	if (unlikely(READ_ONCE(vcpu->exec_mapped_exit_profile_boundary) ==
+		     KVM_EXEC_PROFILE_AFTER_RUN_STATE))
+		WRITE_ONCE(vcpu->exec_mapped_exit_profile_tsc, rdtsc_ordered());
 	kvm_vcpu_srcu_read_unlock(vcpu);
+	if (unlikely(READ_ONCE(vcpu->exec_mapped_exit_profile_boundary) ==
+		     KVM_EXEC_PROFILE_AFTER_SRCU))
+		WRITE_ONCE(vcpu->exec_mapped_exit_profile_tsc, rdtsc_ordered());
 
 	kvm_sigset_deactivate(vcpu);
+	if (unlikely(READ_ONCE(vcpu->exec_mapped_exit_profile_boundary) ==
+		     KVM_EXEC_PROFILE_AFTER_SIGNAL_MASK))
+		WRITE_ONCE(vcpu->exec_mapped_exit_profile_tsc, rdtsc_ordered());
 	vcpu_put(vcpu);
+	if (unlikely(READ_ONCE(vcpu->exec_mapped_exit_profile_boundary) ==
+		     KVM_EXEC_PROFILE_AFTER_VCPU_PUT))
+		WRITE_ONCE(vcpu->exec_mapped_exit_profile_tsc, rdtsc_ordered());
 	return r;
 }
 

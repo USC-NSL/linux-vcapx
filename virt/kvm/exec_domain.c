@@ -29,6 +29,21 @@
 	 KVM_EXEC_FEATURE_TSC_TIMING | \
 	 KVM_EXEC_FEATURE_INTERRUPT_RESULT)
 
+/*
+ * Diagnostic-only selector for attributing the mapped PIO exit path.  Zero
+ * preserves the normal release-publication marker.  A nonzero value moves
+ * that one marker to an earlier semantic boundary; it does not add a UAPI
+ * field or an additional timestamp read to the selected exit.
+ *
+ * Profiling kernels are not performance candidates.  The profiling commit is
+ * reverted before measuring any implementation selected from the result.
+ */
+static uint kvm_exec_mapped_exit_profile_boundary;
+module_param_named(mapped_exit_profile_boundary,
+		   kvm_exec_mapped_exit_profile_boundary, uint, 0644);
+MODULE_PARM_DESC(mapped_exit_profile_boundary,
+		 "diagnostic TSC boundary for mapped-exit attribution (0 disables)");
+
 struct kvm_exec_domain;
 struct kvm_exec_executor;
 struct kvm_exec_notification_runner;
@@ -522,11 +537,33 @@ static int kvm_exec_vcpu_run(struct kvm_exec_capsule *capsule,
 			     u64 *runtime_cycles)
 {
 	u64 start_tsc = kvm_arch_exec_host_tsc();
+	u64 end_tsc;
+	u32 profile_boundary =
+		READ_ONCE(kvm_exec_mapped_exit_profile_boundary);
 	int ret;
 
+	if (profile_boundary >= KVM_EXEC_PROFILE_BOUNDARY_MAX)
+		profile_boundary = KVM_EXEC_PROFILE_NORMAL;
+	WRITE_ONCE(capsule->vcpu->exec_mapped_exit_profile_tsc, 0);
+	WRITE_ONCE(capsule->vcpu->exec_mapped_exit_profile_boundary,
+		   profile_boundary);
 	ret = kvm_vcpu_run(capsule->vcpu);
-	*runtime_cycles = kvm_arch_exec_host_tsc() - start_tsc;
+	end_tsc = kvm_arch_exec_host_tsc();
+	*runtime_cycles = end_tsc - start_tsc;
+	if (unlikely(profile_boundary ==
+		     KVM_EXEC_PROFILE_AFTER_KVM_VCPU_RUN))
+		WRITE_ONCE(capsule->vcpu->exec_mapped_exit_profile_tsc,
+			   end_tsc);
 	return ret;
+}
+
+static __always_inline void
+kvm_exec_profile_mark(struct kvm_vcpu *vcpu, u32 boundary)
+{
+	if (unlikely(READ_ONCE(vcpu->exec_mapped_exit_profile_boundary) ==
+		     boundary))
+		WRITE_ONCE(vcpu->exec_mapped_exit_profile_tsc,
+			   kvm_arch_exec_host_tsc());
 }
 
 static void kvm_exec_account_run(struct kvm_exec_executor *executor,
@@ -1979,7 +2016,10 @@ kvm_exec_async_publish(struct kvm_exec_executor *executor,
 
 		memset(timing, 0, sizeof(*timing));
 		timing->exit_sequence = capsule->exit.sequence;
-		timing->published_tsc = kvm_arch_exec_host_tsc();
+		timing->published_tsc =
+			READ_ONCE(capsule->vcpu->exec_mapped_exit_profile_tsc);
+		if (!timing->published_tsc)
+			timing->published_tsc = kvm_arch_exec_host_tsc();
 	}
 	executor->exit_request_tail++;
 	/* The request and capsule state are visible before userspace sees tail. */
@@ -3504,6 +3544,8 @@ command_done:
 			attempted_kvm_run = true;
 			run_ret = kvm_exec_vcpu_run(capsule, &runtime_cycles);
 			kvm_exec_refresh_interrupt(executor, capsule->vcpu);
+			kvm_exec_profile_mark(capsule->vcpu,
+					      KVM_EXEC_PROFILE_AFTER_INTERRUPT_REFRESH);
 			reported_exit_reason = capsule->vcpu->run->exit_reason;
 			pending_after_run =
 				kvm_arch_vcpu_exec_completion_pending(capsule->vcpu);
@@ -3511,6 +3553,9 @@ command_done:
 				kvm_exec_snapshot_exit(capsule->vcpu,
 						       reported_exit_reason, pending_after_run,
 						       &observed_exit);
+			if (!run_ret)
+				kvm_exec_profile_mark(capsule->vcpu,
+						      KVM_EXEC_PROFILE_AFTER_EXIT_SNAPSHOT);
 		}
 		interrupt_window_exit =
 			attempted_kvm_run && !run_ret && interrupt_waiting &&
@@ -3527,8 +3572,12 @@ command_done:
 		run.vcpu_exit_reason = reported_exit_reason;
 		run.current_cpu = final_cpu;
 		mutex_unlock(&capsule->vcpu->mutex);
+		kvm_exec_profile_mark(capsule->vcpu,
+				      KVM_EXEC_PROFILE_AFTER_VCPU_UNLOCK);
 
 		mutex_lock(&domain->lock);
+		kvm_exec_profile_mark(capsule->vcpu,
+				      KVM_EXEC_PROFILE_AFTER_DOMAIN_LOCK);
 		capsule->running = false;
 		if (invalid_completion) {
 			run.return_reason =
@@ -3547,10 +3596,15 @@ command_done:
 			kvm_exec_account_exit(executor, capsule,
 					      observed_exit.reason);
 			kvm_exec_record_exit_locked(capsule, &observed_exit);
+			kvm_exec_profile_mark(capsule->vcpu,
+					      KVM_EXEC_PROFILE_AFTER_EXIT_RECORD);
 			if (!strict_migrated && !domain->stopping && !domain->paused &&
-			    kvm_exec_async_pio_write(domain, &capsule->exit))
+			    kvm_exec_async_pio_write(domain, &capsule->exit)) {
+				kvm_exec_profile_mark(capsule->vcpu,
+						      KVM_EXEC_PROFILE_BEFORE_ASYNC_PUBLISH);
 				async_published =
 					kvm_exec_async_publish(executor, capsule);
+			}
 			if (observed_exit.reason == KVM_EXIT_HLT)
 				retained_halt_exit =
 					kvm_exec_interrupt_consume_retained_halt(
