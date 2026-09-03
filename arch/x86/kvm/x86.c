@@ -8064,9 +8064,6 @@ static int emulator_pio_in_out(struct kvm_vcpu *vcpu, int size,
 	return 1;
 
 userspace_io:
-	if (unlikely(READ_ONCE(vcpu->exec_mapped_exit_profile_boundary) ==
-		     KVM_EXEC_PROFILE_PIO_BUS_MISS))
-		WRITE_ONCE(vcpu->exec_mapped_exit_profile_tsc, rdtsc_ordered());
 	vcpu->arch.pio.port = port;
 	vcpu->arch.pio.in = in;
 	vcpu->arch.pio.count = count;
@@ -8083,9 +8080,6 @@ userspace_io:
 	vcpu->run->io.data_offset = KVM_PIO_PAGE_OFFSET * PAGE_SIZE;
 	vcpu->run->io.count = count;
 	vcpu->run->io.port = port;
-	if (unlikely(READ_ONCE(vcpu->exec_mapped_exit_profile_boundary) ==
-		     KVM_EXEC_PROFILE_PIO_EXIT_READY))
-		WRITE_ONCE(vcpu->exec_mapped_exit_profile_tsc, rdtsc_ordered());
 	return 0;
 }
 
@@ -9296,14 +9290,8 @@ static int complete_fast_pio_out(struct kvm_vcpu *vcpu)
 static int kvm_fast_pio_out(struct kvm_vcpu *vcpu, int size,
 			    unsigned short port)
 {
-	unsigned long val;
-	int ret;
-
-	if (unlikely(READ_ONCE(vcpu->exec_mapped_exit_profile_boundary) ==
-		     KVM_EXEC_PROFILE_FAST_PIO_OUT))
-		WRITE_ONCE(vcpu->exec_mapped_exit_profile_tsc, rdtsc_ordered());
-	val = kvm_rax_read(vcpu);
-	ret = emulator_pio_out(vcpu, size, port, &val, 1);
+	unsigned long val = kvm_rax_read(vcpu);
+	int ret = emulator_pio_out(vcpu, size, port, &val, 1);
 
 	if (ret)
 		return ret;
@@ -9321,9 +9309,6 @@ static int kvm_fast_pio_out(struct kvm_vcpu *vcpu, int size,
 		vcpu->arch.pio.linear_rip = kvm_get_linear_rip(vcpu);
 		vcpu->arch.complete_userspace_io = complete_fast_pio_out;
 	}
-	if (unlikely(READ_ONCE(vcpu->exec_mapped_exit_profile_boundary) ==
-		     KVM_EXEC_PROFILE_FAST_PIO_OUT_READY))
-		WRITE_ONCE(vcpu->exec_mapped_exit_profile_tsc, rdtsc_ordered());
 	return 0;
 }
 
@@ -11108,9 +11093,6 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
 		kvm_lapic_sync_from_vapic(vcpu);
 
 	r = static_call(kvm_x86_handle_exit)(vcpu, exit_fastpath);
-	if (unlikely(READ_ONCE(vcpu->exec_mapped_exit_profile_boundary) ==
-		     KVM_EXEC_PROFILE_AFTER_X86_EXIT))
-		WRITE_ONCE(vcpu->exec_mapped_exit_profile_tsc, rdtsc_ordered());
 	return r;
 
 cancel_injection:
@@ -11647,28 +11629,13 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
 
 out:
 	kvm_put_guest_fpu(vcpu);
-	if (unlikely(READ_ONCE(vcpu->exec_mapped_exit_profile_boundary) ==
-		     KVM_EXEC_PROFILE_AFTER_GUEST_FPU))
-		WRITE_ONCE(vcpu->exec_mapped_exit_profile_tsc, rdtsc_ordered());
 	if (kvm_run->kvm_valid_regs)
 		store_regs(vcpu);
 	post_kvm_run_save(vcpu);
-	if (unlikely(READ_ONCE(vcpu->exec_mapped_exit_profile_boundary) ==
-		     KVM_EXEC_PROFILE_AFTER_RUN_STATE))
-		WRITE_ONCE(vcpu->exec_mapped_exit_profile_tsc, rdtsc_ordered());
 	kvm_vcpu_srcu_read_unlock(vcpu);
-	if (unlikely(READ_ONCE(vcpu->exec_mapped_exit_profile_boundary) ==
-		     KVM_EXEC_PROFILE_AFTER_SRCU))
-		WRITE_ONCE(vcpu->exec_mapped_exit_profile_tsc, rdtsc_ordered());
 
 	kvm_sigset_deactivate(vcpu);
-	if (unlikely(READ_ONCE(vcpu->exec_mapped_exit_profile_boundary) ==
-		     KVM_EXEC_PROFILE_AFTER_SIGNAL_MASK))
-		WRITE_ONCE(vcpu->exec_mapped_exit_profile_tsc, rdtsc_ordered());
 	vcpu_put(vcpu);
-	if (unlikely(READ_ONCE(vcpu->exec_mapped_exit_profile_boundary) ==
-		     KVM_EXEC_PROFILE_AFTER_VCPU_PUT))
-		WRITE_ONCE(vcpu->exec_mapped_exit_profile_tsc, rdtsc_ordered());
 	return r;
 }
 

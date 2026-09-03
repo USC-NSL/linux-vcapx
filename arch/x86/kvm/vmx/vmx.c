@@ -5425,9 +5425,6 @@ static int handle_io(struct kvm_vcpu *vcpu)
 	port = exit_qualification >> 16;
 	size = (exit_qualification & 7) + 1;
 	in = (exit_qualification & 8) != 0;
-	if (unlikely(READ_ONCE(vcpu->exec_mapped_exit_profile_boundary) ==
-		     KVM_EXEC_PROFILE_VMX_IO_DISPATCH))
-		WRITE_ONCE(vcpu->exec_mapped_exit_profile_tsc, rdtsc_ordered());
 
 	return kvm_fast_pio(vcpu, size, port, in);
 }
@@ -7433,9 +7430,6 @@ static fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu)
 
 	/* The actual VMENTER/EXIT is in the .noinstr.text section. */
 	vmx_vcpu_enter_exit(vcpu, __vmx_vcpu_run_flags(vmx));
-	if (unlikely(READ_ONCE(vcpu->exec_mapped_exit_profile_boundary) ==
-		     KVM_EXEC_PROFILE_AFTER_VMX_EXIT))
-		WRITE_ONCE(vcpu->exec_mapped_exit_profile_tsc, rdtsc_ordered());
 
 	/* All fields are clean at this point */
 	if (kvm_is_using_evmcs()) {
