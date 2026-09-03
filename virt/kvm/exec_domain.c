@@ -2538,24 +2538,31 @@ kvm_exec_interrupt_snapshot(struct kvm_exec_executor *executor,
 }
 
 static void
+kvm_exec_interrupt_clear_locked(struct kvm_exec_executor *executor,
+				bool applied)
+{
+	lockdep_assert_held(&executor->interrupt_lock);
+	executor->pending_interrupt_sequence = 0;
+	executor->pending_interrupt_capsule_id = 0;
+	executor->pending_interrupt_lifecycle_generation = 0;
+	executor->pending_interrupt_vector = 0;
+	executor->pending_interrupt_flags = 0;
+	executor->pending_interrupt_delivery = 0;
+	executor->pending_interrupt_arch_queued = false;
+	executor->pending_interrupt_handler_observed = false;
+	if (applied)
+		executor->interrupt_applied_count++;
+}
+
+static void
 kvm_exec_interrupt_finish(struct kvm_exec_executor *executor, u64 sequence,
 			  bool applied)
 {
 	unsigned long flags;
 
 	spin_lock_irqsave(&executor->interrupt_lock, flags);
-	if (executor->pending_interrupt_sequence == sequence) {
-		executor->pending_interrupt_sequence = 0;
-		executor->pending_interrupt_capsule_id = 0;
-		executor->pending_interrupt_lifecycle_generation = 0;
-		executor->pending_interrupt_vector = 0;
-		executor->pending_interrupt_flags = 0;
-		executor->pending_interrupt_delivery = 0;
-		executor->pending_interrupt_arch_queued = false;
-		executor->pending_interrupt_handler_observed = false;
-		if (applied)
-			executor->interrupt_applied_count++;
-	}
+	if (executor->pending_interrupt_sequence == sequence)
+		kvm_exec_interrupt_clear_locked(executor, applied);
 	spin_unlock_irqrestore(&executor->interrupt_lock, flags);
 }
 
@@ -2568,19 +2575,6 @@ static void kvm_exec_interrupt_set_queued(struct kvm_exec_executor *executor,
 	if (executor->pending_interrupt_sequence == sequence)
 		executor->pending_interrupt_arch_queued = true;
 	spin_unlock_irqrestore(&executor->interrupt_lock, flags);
-}
-
-static bool
-kvm_exec_interrupt_arch_queued(struct kvm_exec_executor *executor, u64 sequence)
-{
-	unsigned long flags;
-	bool queued;
-
-	spin_lock_irqsave(&executor->interrupt_lock, flags);
-	queued = executor->pending_interrupt_sequence == sequence &&
-		 executor->pending_interrupt_arch_queued;
-	spin_unlock_irqrestore(&executor->interrupt_lock, flags);
-	return queued;
 }
 
 static void
@@ -2743,14 +2737,7 @@ void kvm_exec_domain_apic_eoi(struct kvm_vcpu *vcpu, u32 vector)
 				executor->interrupt_posted_target_exit_baseline;
 			executor->interrupt_posted_target_exit_baseline = exits;
 		}
-		executor->pending_interrupt_sequence = 0;
-		executor->pending_interrupt_capsule_id = 0;
-		executor->pending_interrupt_lifecycle_generation = 0;
-		executor->pending_interrupt_vector = 0;
-		executor->pending_interrupt_flags = 0;
-		executor->pending_interrupt_delivery = 0;
-		executor->pending_interrupt_handler_observed = false;
-		executor->interrupt_applied_count++;
+		kvm_exec_interrupt_clear_locked(executor, true);
 		executor->interrupt_eoi_count++;
 		retired = true;
 	}
@@ -2759,61 +2746,63 @@ void kvm_exec_domain_apic_eoi(struct kvm_vcpu *vcpu, u32 vector)
 		wake_up_interruptible(&executor->dispatch_wait);
 }
 
-static void
-kvm_exec_refresh_direct_interrupt(struct kvm_exec_executor *executor,
-				  struct kvm_vcpu *vcpu,
-				  const struct kvm_exec_pending_interrupt *interrupt)
-{
-	if (!kvm_exec_interrupt_arch_queued(executor, interrupt->sequence) ||
-	    kvm_arch_vcpu_exec_direct_pending(vcpu, interrupt->vector))
-		return;
-
-	/*
-	 * Direct delivery first queues the exact vector in KVM's ordinary
-	 * interrupt state.  Keep ownership of that vector until a run boundary
-	 * proves that KVM no longer needs to inject or reinject it.  An ownership
-	 * command that wins before then can cancel the still-queued vector instead
-	 * of leaking it into a later re-entry of the old capsule.
-	 */
-	kvm_exec_interrupt_finish(executor, interrupt->sequence, true);
-}
-
-static void
-kvm_exec_refresh_posted_interrupt(struct kvm_exec_executor *executor,
-				  struct kvm_vcpu *vcpu,
-				  const struct kvm_exec_pending_interrupt *interrupt)
-{
-	if (kvm_arch_vcpu_exec_apic_interrupt_pending(vcpu, interrupt->vector))
-		return;
-
-	/*
-	 * APICv delivers a posted vector without traversing the software LAPIC
-	 * acceptance hook.  At a later VM boundary, an empty PIR/IRR/ISR set is
-	 * proof that hardware delivered the vector and the guest issued EOI.
-	 * Observe and retire that exact request without forcing a delivery exit.
-	 */
-	kvm_exec_domain_apic_interrupt_delivered(vcpu, interrupt->vector);
-	kvm_exec_domain_apic_eoi(vcpu, interrupt->vector);
-}
-
 static void kvm_exec_refresh_interrupt(struct kvm_exec_executor *executor,
 				       struct kvm_vcpu *vcpu)
 {
-	struct kvm_exec_pending_interrupt interrupt = { };
+	struct kvm_exec_capsule *capsule;
+	unsigned long flags;
+	u32 delivery;
+	u32 vector;
+	u64 exits;
 
-	if (!kvm_exec_interrupt_snapshot(executor, &interrupt))
-		return;
-
-	switch (interrupt.delivery) {
+	spin_lock_irqsave(&executor->interrupt_lock, flags);
+	if (!executor->pending_interrupt_sequence)
+		goto out;
+	delivery = executor->pending_interrupt_delivery;
+	vector = executor->pending_interrupt_vector;
+	switch (delivery) {
 	case KVM_EXEC_INTERRUPT_DELIVERY_DIRECT_KICK:
-		kvm_exec_refresh_direct_interrupt(executor, vcpu, &interrupt);
+		if (!executor->pending_interrupt_arch_queued ||
+		    kvm_arch_vcpu_exec_direct_pending(vcpu, vector))
+			break;
+		/*
+		 * Keep the exact vector owned until this run boundary proves KVM no
+		 * longer needs to inject or reinject it.  A replacement command can
+		 * otherwise leak the vector into a later entry of the old capsule.
+		 */
+		kvm_exec_interrupt_clear_locked(executor, true);
 		break;
 	case KVM_EXEC_INTERRUPT_DELIVERY_POSTED:
-		kvm_exec_refresh_posted_interrupt(executor, vcpu, &interrupt);
+		capsule = READ_ONCE(vcpu->exec_capsule);
+		if (!capsule || READ_ONCE(capsule->owner) != executor ||
+		    executor->pending_interrupt_capsule_id != capsule->capsule_id ||
+		    executor->pending_interrupt_lifecycle_generation !=
+			capsule->lifecycle_generation ||
+		    kvm_arch_vcpu_exec_apic_interrupt_pending(vcpu, vector))
+			break;
+
+		/*
+		 * Empty PIR/IRR/ISR state at this owned run boundary proves that APICv
+		 * delivered the exact vector and the guest issued EOI.  Retire it in
+		 * the same locked transaction that performs that revalidation.
+		 */
+		if (!executor->pending_interrupt_handler_observed) {
+			executor->pending_interrupt_handler_observed = true;
+			executor->interrupt_handler_delivery_count++;
+		}
+		exits = kvm_arch_vcpu_exec_posted_notification_exits(vcpu);
+		executor->interrupt_posted_target_exit_count +=
+			exits - executor->interrupt_posted_target_exit_baseline;
+		executor->interrupt_posted_target_exit_baseline = exits;
+		kvm_exec_interrupt_clear_locked(executor, true);
+		executor->interrupt_eoi_count++;
+		/* This function runs on the sole dispatcher; it cannot wake itself. */
 		break;
 	default:
 		break;
 	}
+out:
+	spin_unlock_irqrestore(&executor->interrupt_lock, flags);
 }
 
 static bool kvm_exec_dispatch_failed(const struct kvm_exec_run_dispatch *run)
