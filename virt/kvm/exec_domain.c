@@ -2401,9 +2401,54 @@ static void kvm_exec_dispatch_previous(struct kvm_exec_executor *executor,
 		current_capsule->lifecycle_generation;
 }
 
+/*
+ * A gated command may only be applied at its source's matching output.  The
+ * readiness check in kvm_exec_try_handoff() arms such a command and skips the
+ * ordinary consumer, but a command can become visible after that check ran,
+ * and the dispatcher iterates for unrelated reasons (kicks, interrupts,
+ * signals) while the source keeps running.  Report whether the head command is
+ * a valid gated command whose source is current and whose gate has not fired,
+ * so the consumer leaves it at the head instead of applying it early.  Invalid,
+ * cancelled, and mismatched commands still reach their terminal completions
+ * exactly as before.
+ */
+static bool
+kvm_exec_dispatch_gate_unsatisfied(struct kvm_exec_executor *executor,
+				   struct kvm_exec_command *command)
+{
+	struct kvm_exec_domain *domain = executor->domain;
+	struct kvm_exec_capsule *current_capsule;
+	const u64 gate_features = KVM_EXEC_FEATURE_PIO_WRITE_GATE |
+				  KVM_EXEC_FEATURE_ASYNC_PIO_HANDOFF;
+	bool unsatisfied;
+
+	if (!(command->flags & KVM_EXEC_CMD_F_PIO_WRITE_GATE))
+		return false;
+	if ((domain->negotiated_features & gate_features) != gate_features)
+		return false;
+	if (!kvm_exec_dispatch_command_shape_valid(command) ||
+	    command->domain_generation != domain->generation ||
+	    command->executor_generation != executor->generation ||
+	    kvm_exec_dispatch_cancelled(executor, command->request_sequence))
+		return false;
+
+	mutex_lock(&domain->lock);
+	current_capsule = executor->current_capsule;
+	unsatisfied = current_capsule &&
+		      current_capsule->capsule_id ==
+			      command->expected_current_id &&
+		      current_capsule->lifecycle_generation ==
+			      command->expected_current_generation &&
+		      !kvm_exec_async_handoff_command(executor, current_capsule,
+						      command);
+	mutex_unlock(&domain->lock);
+	return unsatisfied;
+}
+
 static int
 kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
-			  struct kvm_exec_completion *completion)
+			  struct kvm_exec_completion *completion,
+			  bool gate_checked)
 {
 	struct kvm_exec_domain *domain = executor->domain;
 	struct kvm_exec_dispatch_header *header =
@@ -2433,6 +2478,11 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 	       &kvm_exec_dispatch_commands(executor)
 		[executor->command_head % KVM_EXEC_DISPATCH_RING_ENTRIES],
 	       sizeof(command));
+	if (!gate_checked &&
+	    kvm_exec_dispatch_gate_unsatisfied(executor, &command)) {
+		WRITE_ONCE(executor->gated_command_waiting, true);
+		return 0;
+	}
 	executor->command_head++;
 	/* Pairs with userspace's acquire load before reusing this slot. */
 	smp_store_release(&header->command_head, executor->command_head);
@@ -2680,7 +2730,7 @@ static int kvm_exec_try_handoff(struct kvm_exec_executor *executor,
 		return 0;
 
 	memset(completion, 0, sizeof(*completion));
-	ret = kvm_exec_dispatch_consume(executor, completion);
+	ret = kvm_exec_dispatch_consume(executor, completion, true);
 	if (ret <= 0)
 		return ret;
 	if (completion->status == KVM_EXEC_COMPLETE_APPLIED &&
@@ -3280,7 +3330,9 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 			if (command_blocked)
 				goto command_done;
 			memset(&completion, 0, sizeof(completion));
-			command_ret = kvm_exec_dispatch_consume(executor, &completion);
+			command_ret = kvm_exec_dispatch_consume(executor,
+								&completion,
+								false);
 			if (command_ret == -EPROTO) {
 				run.return_reason =
 					KVM_EXEC_RETURN_DISPATCH_CORRUPT;
