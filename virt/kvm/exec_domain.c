@@ -153,6 +153,13 @@ struct kvm_exec_executor {
 	atomic64_t kick_epoch;
 	atomic64_t return_kick_epoch;
 	u64 consumed_return_kick_epoch;
+	/*
+	 * Written under domain->lock by mapped-exit publication and by a return
+	 * kick that lands behind that publication; read with READ_ONCE() outside
+	 * the lock by the immediate handoff check.  A stale read there only makes
+	 * the dispatcher decline the immediate path and reach the same coalescing
+	 * decision under the lock at the top of its loop.
+	 */
 	u64 mapped_boundary_return_kick_epoch;
 	bool gated_command_waiting;
 	u64 command_head;
@@ -1996,8 +2003,8 @@ kvm_exec_async_publish(struct kvm_exec_executor *executor,
 	slot = &kvm_exec_exit_requests(executor)
 		[executor->exit_request_tail % KVM_EXEC_DISPATCH_RING_ENTRIES];
 	memcpy(slot, &request, sizeof(request));
-	executor->mapped_boundary_return_kick_epoch =
-		atomic64_read(&executor->return_kick_epoch);
+	WRITE_ONCE(executor->mapped_boundary_return_kick_epoch,
+		   atomic64_read(&executor->return_kick_epoch));
 	capsule->exit.async_request_pending = true;
 	capsule->exit.async_completion_ready = false;
 	capsule->exit.async_entry_authorized = false;
@@ -2802,7 +2809,7 @@ static bool kvm_exec_consume_return_kick(struct kvm_exec_executor *executor)
 	if (epoch == executor->consumed_return_kick_epoch)
 		return false;
 	executor->consumed_return_kick_epoch = epoch;
-	return executor->mapped_boundary_return_kick_epoch < epoch;
+	return READ_ONCE(executor->mapped_boundary_return_kick_epoch) < epoch;
 }
 
 static bool
@@ -3692,7 +3699,7 @@ command_done:
 			 */
 			if (atomic64_read(&executor->kick_epoch) == kick_epoch &&
 			    atomic64_read(&executor->return_kick_epoch) ==
-				executor->mapped_boundary_return_kick_epoch) {
+				READ_ONCE(executor->mapped_boundary_return_kick_epoch)) {
 				/*
 				 * A capsule used earlier by this executor can be the
 				 * recipient of this handoff.  Apply any response queued
@@ -3715,7 +3722,7 @@ command_done:
 			}
 			if (atomic64_read(&executor->kick_epoch) == kick_epoch &&
 			    atomic64_read(&executor->return_kick_epoch) ==
-				executor->mapped_boundary_return_kick_epoch) {
+				READ_ONCE(executor->mapped_boundary_return_kick_epoch)) {
 				command_ret = kvm_exec_try_handoff(executor,
 								   &completion,
 								   completion_pending,
@@ -3845,8 +3852,8 @@ static long kvm_exec_kick(struct kvm_exec_executor *executor,
 		 * return before the next exact command.
 		 */
 		if (capsule && capsule->exit.async_request_pending)
-			executor->mapped_boundary_return_kick_epoch =
-				return_epoch;
+			WRITE_ONCE(executor->mapped_boundary_return_kick_epoch,
+				   return_epoch);
 	}
 	header = kvm_exec_dispatch_header(executor);
 	WRITE_ONCE(header->kernel_kick_count, epoch);
