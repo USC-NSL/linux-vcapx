@@ -925,9 +925,9 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_RETURN_INVALID_COMPLETION 11
 #define KVM_EXEC_RETURN_INTERRUPT_FAILED 12
 
-#define KVM_EXEC_DISPATCH_ABI_VERSION	2U
+#define KVM_EXEC_DISPATCH_ABI_VERSION	3U
 #define KVM_EXEC_DISPATCH_RING_ENTRIES	32U
-#define KVM_EXEC_DISPATCH_COMMAND_OFFSET	256U
+#define KVM_EXEC_DISPATCH_COMMAND_OFFSET	512U
 #define KVM_EXEC_DISPATCH_COMPLETION_OFFSET 4096U
 #define KVM_EXEC_EXIT_REQUEST_OFFSET	8192U
 #define KVM_EXEC_EXIT_COMPLETION_OFFSET	12288U
@@ -1120,6 +1120,22 @@ struct kvm_exec_run_trace {
  * Producers fill an entry and release-store the corresponding tail; consumers
  * acquire-load the tail before reading the entry and release-store the head
  * after consuming it.
+ *
+ * The header occupies eight 64-byte lines grouped by writer, so a store on
+ * one side never invalidates a line the other side polls or reads on its own
+ * hot path:
+ *
+ *   line 0   layout description, written once when the executor is created
+ *   line 1   tails KVM publishes and userspace polls
+ *   line 2   heads KVM consumes and KVM's per-command progress record
+ *   line 3   KVM counters
+ *   line 4   KVM monotonic entry timestamps
+ *   line 5   command tail and completion head userspace publishes
+ *   line 6   exit-request head and exit-completion tail userspace publishes
+ *   line 7   reserved
+ *
+ * Only the ring indices carry ordering semantics; every other field is a
+ * diagnostic that the owner may update without a barrier.
  */
 struct kvm_exec_dispatch_header {
 	__u32 abi_version;
@@ -1137,31 +1153,43 @@ struct kvm_exec_dispatch_header {
 	__u32 exit_request_entry_size;
 	__u32 exit_completion_entry_size;
 	__u32 reserved0[2];
-	__u64 command_head;
-	__u64 command_tail;
-	__u64 completion_head;
+	/* line 1: KVM-published tails polled by userspace */
 	__u64 completion_tail;
-	__u64 exit_request_head;
 	__u64 exit_request_tail;
+	__u64 reserved1[6];
+	/* line 2: KVM-consumed heads and per-command progress */
+	__u64 command_head;
 	__u64 exit_completion_head;
-	__u64 exit_completion_tail;
+	__u64 last_consumed_sequence;
+	__u64 last_applied_sequence;
+	__u64 last_async_exit_sequence;
+	__u64 last_entry_sequence;
+	/* Stable until the next ownership-changing command reaches entry. */
+	__u64 last_handoff_entry_sequence;
+	__u64 reserved2;
+	/* line 3: KVM counters */
 	__u64 kernel_corruption_count;
 	__u64 kernel_kick_count;
 	__u64 last_kick_sequence;
 	__u64 last_kick_ns;
-	__u64 last_consumed_sequence;
-	__u64 last_applied_sequence;
-	__u64 last_entry_sequence;
-	__u64 last_entry_ns;
 	__u64 executor_return_count;
 	__u64 async_exit_request_count;
 	__u64 async_exit_completion_count;
 	__u64 async_exit_fallback_count;
-	__u64 last_async_exit_sequence;
-	/* Stable until the next ownership-changing command reaches entry. */
-	__u64 last_handoff_entry_sequence;
+	/* line 4: KVM monotonic entry timestamps */
+	__u64 last_entry_ns;
 	__u64 last_handoff_entry_ns;
-	__u64 reserved[1];
+	__u64 reserved3[6];
+	/* line 5: userspace-published command tail and completion head */
+	__u64 command_tail;
+	__u64 completion_head;
+	__u64 reserved4[6];
+	/* line 6: userspace-published exit-request head and exit-completion tail */
+	__u64 exit_request_head;
+	__u64 exit_completion_tail;
+	__u64 reserved5[6];
+	/* line 7 */
+	__u64 reserved6[8];
 };
 
 struct kvm_exec_command {

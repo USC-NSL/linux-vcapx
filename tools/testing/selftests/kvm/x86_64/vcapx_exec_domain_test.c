@@ -162,7 +162,17 @@ static void test_cross_vm_feature_dependencies(int kvm_fd)
 
 static void test_dynamic_dispatch_uapi_layout(void)
 {
-	TEST_ASSERT_EQ(sizeof(struct kvm_exec_dispatch_header), 256);
+	TEST_ASSERT_EQ(sizeof(struct kvm_exec_dispatch_header), 512);
+	TEST_ASSERT_EQ(offsetof(struct kvm_exec_dispatch_header, completion_tail), 64);
+	TEST_ASSERT_EQ(offsetof(struct kvm_exec_dispatch_header, exit_request_tail), 72);
+	TEST_ASSERT_EQ(offsetof(struct kvm_exec_dispatch_header, command_head), 128);
+	TEST_ASSERT_EQ(offsetof(struct kvm_exec_dispatch_header, exit_completion_head), 136);
+	TEST_ASSERT_EQ(offsetof(struct kvm_exec_dispatch_header, kernel_corruption_count), 192);
+	TEST_ASSERT_EQ(offsetof(struct kvm_exec_dispatch_header, last_entry_ns), 256);
+	TEST_ASSERT_EQ(offsetof(struct kvm_exec_dispatch_header, command_tail), 320);
+	TEST_ASSERT_EQ(offsetof(struct kvm_exec_dispatch_header, completion_head), 328);
+	TEST_ASSERT_EQ(offsetof(struct kvm_exec_dispatch_header, exit_request_head), 384);
+	TEST_ASSERT_EQ(offsetof(struct kvm_exec_dispatch_header, exit_completion_tail), 392);
 	TEST_ASSERT_EQ(sizeof(struct kvm_exec_command), 96);
 	TEST_ASSERT_EQ(sizeof(struct kvm_exec_completion), 112);
 	TEST_ASSERT_EQ(sizeof(struct kvm_exec_exit_request), 128);
@@ -184,7 +194,7 @@ static void test_dynamic_dispatch_uapi_layout(void)
 	TEST_ASSERT_EQ(sizeof(struct kvm_exec_cancel), 56);
 	TEST_ASSERT_EQ(sizeof(struct kvm_exec_query_capsule), 144);
 	TEST_ASSERT_EQ(sizeof(struct kvm_exec_query_executor), 152);
-	TEST_ASSERT_EQ(KVM_EXEC_DISPATCH_COMMAND_OFFSET, 256);
+	TEST_ASSERT_EQ(KVM_EXEC_DISPATCH_COMMAND_OFFSET, 512);
 	TEST_ASSERT_EQ(KVM_EXEC_DISPATCH_COMPLETION_OFFSET, 4096);
 	TEST_ASSERT_EQ(KVM_EXEC_EXIT_REQUEST_OFFSET, 8192);
 	TEST_ASSERT_EQ(KVM_EXEC_EXIT_COMPLETION_OFFSET, 12288);

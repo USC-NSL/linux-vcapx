@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include <linux/anon_inodes.h>
+#include <linux/build_bug.h>
 #include <linux/cred.h>
 #include <linux/file.h>
 #include <linux/kref.h>
@@ -327,6 +328,38 @@ kvm_exec_tsc_timing_header(struct kvm_exec_executor *executor)
 {
 	return executor->dispatch_region + KVM_EXEC_TSC_TIMING_OFFSET;
 }
+
+/*
+ * The dispatch header keeps KVM-written and userspace-written ring state on
+ * separate 64-byte lines so that neither side's stores invalidate a line the
+ * other side polls.  Pin the placement so that a field added to the wrong line
+ * fails the build instead of reappearing as cross-core coherence traffic.
+ */
+#define KVM_EXEC_DISPATCH_LINE(index) ((index) * 64UL)
+static_assert(sizeof(struct kvm_exec_dispatch_header) ==
+	      KVM_EXEC_DISPATCH_LINE(8));
+static_assert(sizeof(struct kvm_exec_dispatch_header) <=
+	      KVM_EXEC_DISPATCH_COMMAND_OFFSET);
+static_assert(offsetof(struct kvm_exec_dispatch_header, completion_tail) ==
+	      KVM_EXEC_DISPATCH_LINE(1));
+static_assert(offsetof(struct kvm_exec_dispatch_header, exit_request_tail) ==
+	      KVM_EXEC_DISPATCH_LINE(1) + 8);
+static_assert(offsetof(struct kvm_exec_dispatch_header, command_head) ==
+	      KVM_EXEC_DISPATCH_LINE(2));
+static_assert(offsetof(struct kvm_exec_dispatch_header, exit_completion_head) ==
+	      KVM_EXEC_DISPATCH_LINE(2) + 8);
+static_assert(offsetof(struct kvm_exec_dispatch_header,
+		       kernel_corruption_count) == KVM_EXEC_DISPATCH_LINE(3));
+static_assert(offsetof(struct kvm_exec_dispatch_header, last_entry_ns) ==
+	      KVM_EXEC_DISPATCH_LINE(4));
+static_assert(offsetof(struct kvm_exec_dispatch_header, command_tail) ==
+	      KVM_EXEC_DISPATCH_LINE(5));
+static_assert(offsetof(struct kvm_exec_dispatch_header, completion_head) ==
+	      KVM_EXEC_DISPATCH_LINE(5) + 8);
+static_assert(offsetof(struct kvm_exec_dispatch_header, exit_request_head) ==
+	      KVM_EXEC_DISPATCH_LINE(6));
+static_assert(offsetof(struct kvm_exec_dispatch_header, exit_completion_tail) ==
+	      KVM_EXEC_DISPATCH_LINE(6) + 8);
 
 static void kvm_exec_dispatch_init(struct kvm_exec_executor *executor)
 {
