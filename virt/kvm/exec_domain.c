@@ -3469,6 +3469,18 @@ command_done:
 			}
 			continue;
 		}
+		/*
+		 * An armed gate keeps its exact source selected until the matching
+		 * output.  Retiring a nonmatching output must let that still-owned
+		 * source continue, including when the gate appeared after the ACK.
+		 * Detached sources and unretired outputs retain the exact-command
+		 * reentry requirement.  Both gate readers validated the source and
+		 * left the command at the head before setting the waiting flag.
+		 */
+		if (READ_ONCE(executor->gated_command_waiting) &&
+		    capsule->owner == executor &&
+		    !capsule->exit.completion_pending)
+			capsule->exit.async_reentry_required = false;
 		if (kvm_exec_async_blocks_entry(capsule)) {
 			mutex_unlock(&domain->lock);
 			ret = wait_event_interruptible(executor->dispatch_wait,
