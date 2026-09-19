@@ -415,6 +415,11 @@ u64 __weak kvm_arch_exec_host_tsc(void)
 	return 0;
 }
 
+u64 __weak kvm_arch_exec_host_tsc_accounting(void)
+{
+	return 0;
+}
+
 u64 __weak kvm_arch_exec_tsc_delta_to_ns(u64 cycles)
 {
 	return 0;
@@ -561,11 +566,11 @@ bool kvm_exec_domain_vcpu_exit_on_hlt(struct kvm_vcpu *vcpu)
 static int kvm_exec_vcpu_run(struct kvm_exec_capsule *capsule,
 			     u64 *runtime_cycles)
 {
-	u64 start_tsc = kvm_arch_exec_host_tsc();
+	u64 start_tsc = kvm_arch_exec_host_tsc_accounting();
 	int ret;
 
 	ret = kvm_vcpu_run(capsule->vcpu);
-	*runtime_cycles = kvm_arch_exec_host_tsc() - start_tsc;
+	*runtime_cycles = kvm_arch_exec_host_tsc_accounting() - start_tsc;
 	return ret;
 }
 

@@ -11337,6 +11337,19 @@ u64 kvm_arch_exec_host_tsc(void)
 	return rdtsc_ordered();
 }
 
+/*
+ * Accounting-only host TSC. The exec domain sums the difference of a pair of
+ * these into capsule->runtime_cycles and executor->runtime_cycles, which are
+ * converted to nanoseconds on the query path and are never published as a
+ * timing stamp nor used as an ownership predicate. A duration summed over runs
+ * of microseconds does not need the LFENCE that orders a published stamp
+ * against the store it dates, so this is a plain read.
+ */
+u64 kvm_arch_exec_host_tsc_accounting(void)
+{
+	return rdtsc();
+}
+
 u64 kvm_arch_exec_tsc_delta_to_ns(u64 cycles)
 {
 	if (unlikely(!tsc_khz))
