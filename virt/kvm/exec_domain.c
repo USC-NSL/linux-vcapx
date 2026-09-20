@@ -140,7 +140,8 @@ struct kvm_exec_capsule {
 struct kvm_exec_executor {
 	struct kref kref;
 	struct kvm_exec_domain *domain;
-	struct kvm_exec_capsule *current_capsule;
+	/* Published with rcu_assign_pointer() under domain->lock. */
+	struct kvm_exec_capsule __rcu *current_capsule;
 	void *dispatch_region;
 	struct list_head node;
 	/* Serializes commands submitted through this executor fd. */
@@ -291,6 +292,33 @@ struct kvm_exec_domain {
 	bool paused;
 	bool stopping;
 };
+
+/*
+ * executor->current_capsule is published under domain->lock and read either
+ * under that mutex through kvm_exec_current_capsule(), which asserts it, or,
+ * in kvm_exec_run_trace()'s per-step loop, against executor->run_lock, which
+ * excludes the writer there and is named at the site.
+ *
+ * No grace period is needed before freeing a capsule.  Capsule memory is
+ * released at exactly two places: the attach error path, which frees a capsule
+ * that was never published, and kvm_exec_domain_free(), the domain's final
+ * kref drop.  Detach clears vcpu and vcpu_file but leaves the object in
+ * domain->capsules.  Every reader reaches the field through an executor that
+ * holds a domain reference, so a published capsule outlives all of them.
+ */
+static struct kvm_exec_capsule *
+kvm_exec_current_capsule(struct kvm_exec_executor *executor)
+{
+	return rcu_dereference_protected(executor->current_capsule,
+					 lockdep_is_held(&executor->domain->lock));
+}
+
+static void kvm_exec_set_current_capsule(struct kvm_exec_executor *executor,
+					 struct kvm_exec_capsule *capsule)
+{
+	lockdep_assert_held(&executor->domain->lock);
+	rcu_assign_pointer(executor->current_capsule, capsule);
+}
 
 static atomic64_t kvm_exec_domain_generation = ATOMIC64_INIT(0);
 static atomic64_t kvm_exec_executor_generation = ATOMIC64_INIT(0);
@@ -650,7 +678,7 @@ static void kvm_exec_release_ownership_locked(struct kvm_exec_domain *domain)
 
 	list_for_each_entry(executor, &domain->executors, node) {
 		kvm_exec_interrupt_abort(executor, false);
-		executor->current_capsule = NULL;
+		kvm_exec_set_current_capsule(executor, NULL);
 	}
 	xa_for_each(&domain->capsules, index, capsule) {
 		if (!capsule->running) {
@@ -1009,7 +1037,7 @@ static int kvm_exec_executor_release(struct inode *inode, struct file *file)
 {
 	struct kvm_exec_executor *executor = file->private_data;
 	struct kvm_exec_domain *domain = executor->domain;
-	struct kvm_exec_capsule *capsule;
+	struct kvm_exec_capsule *capsule, *current_capsule;
 	unsigned long index;
 
 	mutex_lock(&domain->lock);
@@ -1027,15 +1055,16 @@ static int kvm_exec_executor_release(struct inode *inode, struct file *file)
 			break;
 		}
 	}
-	if (executor->current_capsule && !executor->current_capsule->running) {
+	current_capsule = kvm_exec_current_capsule(executor);
+	if (current_capsule && !current_capsule->running) {
 		struct kvm_exec_pending_interrupt interrupt;
 
 		if (kvm_exec_interrupt_snapshot(executor, &interrupt) &&
 		    interrupt.delivery == KVM_EXEC_INTERRUPT_DELIVERY_POSTED)
 			domain->stopping = true;
 		kvm_exec_interrupt_abort(executor, false);
-		executor->current_capsule->owner = NULL;
-		executor->current_capsule = NULL;
+		current_capsule->owner = NULL;
+		kvm_exec_set_current_capsule(executor, NULL);
 	}
 	if (executor->listed) {
 		list_del(&executor->node);
@@ -1164,7 +1193,7 @@ static void kvm_exec_abort_run(struct kvm_exec_executor *executor,
 	capsule->running = false;
 	if (release_claim && capsule->owner == executor) {
 		capsule->owner = NULL;
-		executor->current_capsule = NULL;
+		kvm_exec_set_current_capsule(executor, NULL);
 	}
 	atomic_dec(&domain->active_runs);
 	mutex_unlock(&domain->lock);
@@ -1229,14 +1258,15 @@ static long kvm_exec_run(struct kvm_exec_executor *executor, void __user *argp)
 		ret = -ESTALE;
 		goto out_domain;
 	}
-	if ((executor->current_capsule && executor->current_capsule != capsule) ||
+	if ((kvm_exec_current_capsule(executor) &&
+	     kvm_exec_current_capsule(executor) != capsule) ||
 	    (capsule->owner && capsule->owner != executor) || capsule->running) {
 		ret = -EBUSY;
 		goto out_domain;
 	}
 	if (!capsule->owner) {
 		capsule->owner = executor;
-		executor->current_capsule = capsule;
+		kvm_exec_set_current_capsule(executor, capsule);
 		new_claim = true;
 	}
 	capsule->running = true;
@@ -1422,7 +1452,7 @@ static long kvm_exec_run_trace(struct kvm_exec_executor *executor,
 		}
 		if ((capsule->owner &&
 		     (capsule->owner != executor ||
-		      executor->current_capsule != capsule)) ||
+		      kvm_exec_current_capsule(executor) != capsule)) ||
 		    capsule->running) {
 			ret = -EBUSY;
 			goto out_domain;
@@ -1431,8 +1461,8 @@ static long kvm_exec_run_trace(struct kvm_exec_executor *executor,
 	}
 
 	capsule = capsules[0];
-	if ((executor->current_capsule &&
-	     executor->current_capsule != capsule) ||
+	if ((kvm_exec_current_capsule(executor) &&
+	     kvm_exec_current_capsule(executor) != capsule) ||
 	    (capsule->owner && capsule->owner != executor)) {
 		ret = -EBUSY;
 		goto out_domain;
@@ -1441,7 +1471,7 @@ static long kvm_exec_run_trace(struct kvm_exec_executor *executor,
 		capsules[i]->trace_refs++;
 	if (!capsule->owner) {
 		capsule->owner = executor;
-		executor->current_capsule = capsule;
+		kvm_exec_set_current_capsule(executor, capsule);
 	}
 	capsule->running = true;
 	atomic_inc(&domain->active_runs);
@@ -1472,7 +1502,14 @@ static long kvm_exec_run_trace(struct kvm_exec_executor *executor,
 			goto finish_run;
 		}
 
-		capsule = executor->current_capsule;
+		/*
+		 * Read outside domain->lock: the trace loop drops it to run
+		 * the guest.  executor->run_lock, held across the whole loop,
+		 * excludes the dispatcher, which is the only writer that runs
+		 * for this executor while a trace is in flight.
+		 */
+		capsule = rcu_dereference_check(executor->current_capsule,
+				lockdep_is_held(&executor->run_lock));
 		if (mutex_lock_killable(&capsule->vcpu->mutex)) {
 			trace.return_reason = KVM_EXEC_RETURN_SIGNAL;
 			trace.run_result = -EINTR;
@@ -1547,7 +1584,7 @@ static long kvm_exec_run_trace(struct kvm_exec_executor *executor,
 		}
 		capsule->owner = NULL;
 		next->owner = executor;
-		executor->current_capsule = next;
+		kvm_exec_set_current_capsule(executor, next);
 		next->running = true;
 		handoff_end = ktime_get_ns();
 		trace.switch_count++;
@@ -1560,11 +1597,11 @@ static long kvm_exec_run_trace(struct kvm_exec_executor *executor,
 
 finish_run:
 	mutex_lock(&domain->lock);
-	capsule = executor->current_capsule;
+	capsule = kvm_exec_current_capsule(executor);
 	if (capsule && capsule->running)
 		capsule->running = false;
 finish_locked:
-	capsule = executor->current_capsule;
+	capsule = kvm_exec_current_capsule(executor);
 	if (capsule) {
 		trace.owned_capsule_id = capsule->capsule_id;
 		trace.owned_lifecycle_generation =
@@ -1834,7 +1871,7 @@ static int kvm_exec_async_handoff_ready(struct kvm_exec_executor *executor)
 		return KVM_EXEC_HANDOFF_READY;
 
 	mutex_lock(&domain->lock);
-	source = executor->current_capsule;
+	source = kvm_exec_current_capsule(executor);
 	if (kvm_exec_async_handoff_command(executor, source, &command))
 		readiness = KVM_EXEC_HANDOFF_READY;
 	else if ((command.flags & KVM_EXEC_CMD_F_PIO_WRITE_GATE) && source &&
@@ -2076,7 +2113,7 @@ kvm_exec_async_consume(struct kvm_exec_executor *executor,
 	valid = valid && capsule && capsule->vcpu &&
 		(!capsule->owner ||
 		 (capsule->owner == executor &&
-		  executor->current_capsule == capsule)) &&
+		  kvm_exec_current_capsule(executor) == capsule)) &&
 		capsule->exit.async_executor_generation == executor->generation &&
 		capsule->lifecycle_generation == response.lifecycle_generation &&
 		capsule->exit.sequence == response.exit_sequence &&
@@ -2157,7 +2194,7 @@ kvm_exec_async_apply_completion(struct kvm_exec_executor *executor,
 	if (!capsule || !capsule->vcpu || capsule->running ||
 	    (capsule->owner &&
 	     (capsule->owner != executor ||
-	      executor->current_capsule != capsule)) ||
+	      kvm_exec_current_capsule(executor) != capsule)) ||
 	    capsule->exit.async_executor_generation != executor->generation ||
 	    !capsule->exit.completion_pending ||
 	    !capsule->exit.async_completion_ready) {
@@ -2314,7 +2351,8 @@ static bool kvm_exec_dispatch_cancelled(struct kvm_exec_executor *executor,
 static void kvm_exec_dispatch_owner(struct kvm_exec_executor *executor,
 				    struct kvm_exec_completion *completion)
 {
-	struct kvm_exec_capsule *current_capsule = executor->current_capsule;
+	struct kvm_exec_capsule *current_capsule =
+		kvm_exec_current_capsule(executor);
 
 	if (!current_capsule)
 		return;
@@ -2437,7 +2475,8 @@ kvm_exec_dispatch_record_entry(struct kvm_exec_executor *executor,
 static void kvm_exec_dispatch_previous(struct kvm_exec_executor *executor,
 				       struct kvm_exec_completion *completion)
 {
-	struct kvm_exec_capsule *current_capsule = executor->current_capsule;
+	struct kvm_exec_capsule *current_capsule =
+		kvm_exec_current_capsule(executor);
 
 	if (!current_capsule)
 		return;
@@ -2478,7 +2517,7 @@ kvm_exec_dispatch_gate_unsatisfied(struct kvm_exec_executor *executor,
 		return false;
 
 	mutex_lock(&domain->lock);
-	current_capsule = executor->current_capsule;
+	current_capsule = kvm_exec_current_capsule(executor);
 	unsatisfied = current_capsule &&
 		      current_capsule->capsule_id ==
 			      command->expected_current_id &&
@@ -2560,7 +2599,7 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 		goto terminal;
 
 	mutex_lock(&domain->lock);
-	current_capsule = executor->current_capsule;
+	current_capsule = kvm_exec_current_capsule(executor);
 	kvm_exec_dispatch_previous(executor, completion);
 	async_pio_handoff =
 		kvm_exec_async_handoff_command(executor, current_capsule, &command);
@@ -2654,7 +2693,7 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 				       KVM_EXEC_BLOCK_NONE);
 			current_capsule->owner = NULL;
 		}
-		executor->current_capsule = NULL;
+		kvm_exec_set_current_capsule(executor, NULL);
 		kvm_exec_dispatch_expect_entry(executor, &command, NULL, 0);
 		kvm_exec_dispatch_expect_handoff_entry(
 			executor, &command, NULL, 0);
@@ -2678,7 +2717,7 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 				current_capsule->owner = NULL;
 			}
 			target->owner = executor;
-			executor->current_capsule = target;
+			kvm_exec_set_current_capsule(executor, target);
 			atomic64_inc(&executor->switch_count);
 		}
 		if (async_pio_handoff)
@@ -2975,7 +3014,8 @@ kvm_exec_interrupt_abort_capsule(struct kvm_exec_executor *executor,
 static void kvm_exec_interrupt_abort(struct kvm_exec_executor *executor,
 				     bool superseded)
 {
-	kvm_exec_interrupt_abort_capsule(executor, executor->current_capsule,
+	kvm_exec_interrupt_abort_capsule(executor,
+					 kvm_exec_current_capsule(executor),
 					 superseded);
 }
 
@@ -3121,7 +3161,7 @@ static bool kvm_exec_dispatch_failed(const struct kvm_exec_run_dispatch *run)
 static void kvm_exec_dispatch_run_owner(struct kvm_exec_executor *executor,
 					struct kvm_exec_run_dispatch *run)
 {
-	struct kvm_exec_capsule *capsule = executor->current_capsule;
+	struct kvm_exec_capsule *capsule = kvm_exec_current_capsule(executor);
 
 	if (!capsule)
 		return;
@@ -3257,7 +3297,7 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 
 		if (kick_epoch != seen_kick_epoch) {
 			mutex_lock(&domain->lock);
-			capsule = executor->current_capsule;
+			capsule = kvm_exec_current_capsule(executor);
 			if (capsule && !capsule->running)
 				kvm_clear_request(KVM_REQ_EXEC_DOMAIN_EXIT,
 						  capsule->vcpu);
@@ -3266,7 +3306,7 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 		}
 
 		mutex_lock(&domain->lock);
-		capsule = executor->current_capsule;
+		capsule = kvm_exec_current_capsule(executor);
 		return_to_vmm = kvm_exec_consume_return_kick(executor);
 		if (return_to_vmm) {
 			run.return_reason = KVM_EXEC_RETURN_SIGNAL;
@@ -3368,7 +3408,7 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 			bool command_blocked;
 
 			mutex_lock(&domain->lock);
-			capsule = executor->current_capsule;
+			capsule = kvm_exec_current_capsule(executor);
 			command_blocked = capsule &&
 				capsule->exit.async_request_pending;
 			mutex_unlock(&domain->lock);
@@ -3426,7 +3466,7 @@ command_done:
 			mutex_unlock(&domain->lock);
 			break;
 		}
-		capsule = executor->current_capsule;
+		capsule = kvm_exec_current_capsule(executor);
 		if (!capsule) {
 			mutex_unlock(&domain->lock);
 			/*
@@ -3857,7 +3897,7 @@ static long kvm_exec_kick(struct kvm_exec_executor *executor,
 		return 0;
 	}
 	epoch = atomic64_inc_return(&executor->kick_epoch);
-	capsule = executor->current_capsule;
+	capsule = kvm_exec_current_capsule(executor);
 	if (kick.flags & KVM_EXEC_KICK_F_RETURN_TO_VMM) {
 		u64 return_epoch =
 			atomic64_inc_return(&executor->return_kick_epoch);
@@ -3905,7 +3945,7 @@ kvm_exec_validate_interrupt_locked(struct kvm_exec_executor *executor,
 	if (domain->paused)
 		return -EBUSY;
 
-	capsule = executor->current_capsule;
+	capsule = kvm_exec_current_capsule(executor);
 	if (!capsule) {
 		outcome->status = KVM_EXEC_INTERRUPT_RESULT_NOT_RUNNING;
 		return -EAGAIN;
@@ -5179,7 +5219,7 @@ static long kvm_exec_query_executor(struct kvm_exec_executor *executor,
 	query.current_cpu = READ_ONCE(executor->last_cpu);
 	query.current_capsule_id = 0;
 	query.current_lifecycle_generation = 0;
-	capsule = executor->current_capsule;
+	capsule = kvm_exec_current_capsule(executor);
 	if (capsule) {
 		query.current_capsule_id = capsule->capsule_id;
 		query.current_lifecycle_generation =
@@ -5346,7 +5386,7 @@ kvm_exec_query_posted_interrupt(struct kvm_exec_executor *executor,
 
 	mutex_lock(&domain->lock);
 	spin_lock_irqsave(&executor->interrupt_lock, flags);
-	capsule = executor->current_capsule;
+	capsule = kvm_exec_current_capsule(executor);
 	query.posted_count = executor->interrupt_posted_count;
 	query.notification_coalesced_count =
 		executor->interrupt_posted_coalesced_count;
