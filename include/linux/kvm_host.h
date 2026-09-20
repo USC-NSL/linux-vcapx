@@ -342,14 +342,6 @@ struct kvm_vcpu {
 	struct mutex mutex;
 	struct kvm_run *run;
 	struct kvm_exec_capsule *exec_capsule;
-	/*
-	 * The task holding this vCPU loaded across more than one exec-domain
-	 * entry, or NULL.  Only kvm_arch_vcpu_exec_load()/unload() write it, and
-	 * kvm_arch_vcpu_ioctl_run() skips its prologue and epilogue only when
-	 * the *current* task is that one, so a second task entering the same
-	 * vCPU takes the ordinary path and pays for its own load.
-	 */
-	struct task_struct *exec_loaded_by;
 
 #ifndef __KVM_HAVE_ARCH_WQP
 	struct rcuwait wait;
@@ -1528,8 +1520,6 @@ void kvm_exec_domain_vcpu_ioctl_complete(struct kvm_vcpu *vcpu,
 bool kvm_exec_domain_vcpu_exit_on_hlt(struct kvm_vcpu *vcpu);
 struct kvm_vcpu *kvm_vcpu_from_fd(int fd, struct file **filep);
 int kvm_vcpu_run(struct kvm_vcpu *vcpu);
-void kvm_arch_vcpu_exec_load(struct kvm_vcpu *vcpu);
-void kvm_arch_vcpu_exec_unload(struct kvm_vcpu *vcpu);
 
 void kvm_arch_sched_in(struct kvm_vcpu *vcpu, int cpu);
 
