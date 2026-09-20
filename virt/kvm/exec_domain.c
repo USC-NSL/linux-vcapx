@@ -2531,15 +2531,15 @@ static void kvm_exec_dispatch_previous(struct kvm_exec_executor *executor,
  * exactly as before.
  */
 static bool
-kvm_exec_dispatch_gate_unsatisfied_locked(struct kvm_exec_executor *executor,
-					  struct kvm_exec_capsule *current_capsule,
-					  struct kvm_exec_command *command)
+kvm_exec_dispatch_gate_unsatisfied(struct kvm_exec_executor *executor,
+				   struct kvm_exec_command *command)
 {
 	struct kvm_exec_domain *domain = executor->domain;
+	struct kvm_exec_capsule *current_capsule;
 	const u64 gate_features = KVM_EXEC_FEATURE_PIO_WRITE_GATE |
 				  KVM_EXEC_FEATURE_ASYNC_PIO_HANDOFF;
+	bool unsatisfied;
 
-	lockdep_assert_held(&domain->lock);
 	if (!(command->flags & KVM_EXEC_CMD_F_PIO_WRITE_GATE))
 		return false;
 	if ((domain->negotiated_features & gate_features) != gate_features)
@@ -2550,12 +2550,17 @@ kvm_exec_dispatch_gate_unsatisfied_locked(struct kvm_exec_executor *executor,
 	    kvm_exec_dispatch_cancelled(executor, command->request_sequence))
 		return false;
 
-	return current_capsule &&
-	       current_capsule->capsule_id == command->expected_current_id &&
-	       current_capsule->lifecycle_generation ==
-		       command->expected_current_generation &&
-	       !kvm_exec_async_handoff_command(executor, current_capsule,
-					       command);
+	mutex_lock(&domain->lock);
+	current_capsule = kvm_exec_current_capsule(executor);
+	unsatisfied = current_capsule &&
+		      current_capsule->capsule_id ==
+			      command->expected_current_id &&
+		      current_capsule->lifecycle_generation ==
+			      command->expected_current_generation &&
+		      !kvm_exec_async_handoff_command(executor, current_capsule,
+						      command);
+	mutex_unlock(&domain->lock);
+	return unsatisfied;
 }
 
 static int
@@ -2591,38 +2596,10 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 	       &kvm_exec_dispatch_commands(executor)
 		[executor->command_head % KVM_EXEC_DISPATCH_RING_ENTRIES],
 	       sizeof(command));
-	/*
-	 * One locked section from here to the apply point.  The gate decision
-	 * and the source's pending-exit test used to be two separate
-	 * domain->lock acquisitions -- one here, one in the caller -- taken and
-	 * dropped immediately before the section below reread the same state.
-	 * Both decide whether to leave the command in the ring, and neither is
-	 * recoverable once the command is consumed, so they are made on the
-	 * same held lock as the validation that follows rather than on a
-	 * dropped-lock snapshot.
-	 */
-	mutex_lock(&domain->lock);
-	current_capsule = kvm_exec_current_capsule(executor);
-	if (!gate_checked) {
-		if (kvm_exec_dispatch_gate_unsatisfied_locked(executor,
-							      current_capsule,
-							      &command)) {
-			mutex_unlock(&domain->lock);
-			WRITE_ONCE(executor->gated_command_waiting, true);
-			return 0;
-		}
-		/*
-		 * Was the caller's command_blocked pre-check: a source with an
-		 * unserviced asynchronous request keeps its command in the ring
-		 * unless this command is the matching handoff.
-		 */
-		if (current_capsule &&
-		    current_capsule->exit.async_request_pending &&
-		    !kvm_exec_async_handoff_command(executor, current_capsule,
-						    &command)) {
-			mutex_unlock(&domain->lock);
-			return 0;
-		}
+	if (!gate_checked &&
+	    kvm_exec_dispatch_gate_unsatisfied(executor, &command)) {
+		WRITE_ONCE(executor->gated_command_waiting, true);
+		return 0;
 	}
 	executor->command_head++;
 	/* Pairs with userspace's acquire load before reusing this slot. */
@@ -2647,14 +2624,16 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 
 	if (!kvm_exec_dispatch_begin(executor, command.request_sequence,
 				     &status))
-		goto terminal_locked;
+		goto terminal;
 	if (!kvm_exec_dispatch_command_shape_valid(&command) ||
 	    command.domain_generation != domain->generation ||
 	    command.executor_generation != executor->generation ||
 	    ((command.flags & KVM_EXEC_CMD_F_PIO_WRITE_GATE) &&
 	     !(domain->negotiated_features & KVM_EXEC_FEATURE_PIO_WRITE_GATE)))
-		goto terminal_locked;
+		goto terminal;
 
+	mutex_lock(&domain->lock);
+	current_capsule = kvm_exec_current_capsule(executor);
 	kvm_exec_dispatch_previous(executor, completion);
 	async_pio_handoff =
 		kvm_exec_async_handoff_command(executor, current_capsule, &command);
@@ -2818,6 +2797,7 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 
 terminal_locked:
 	mutex_unlock(&domain->lock);
+terminal:
 	completion->status = status;
 	if (status == KVM_EXEC_COMPLETE_CANCELLED_BEFORE_APPLY)
 		atomic64_inc(&executor->cancelled_count);
@@ -3459,15 +3439,15 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 		 */
 		if (!completion_pending && !command_ret &&
 		    handoff_ready != KVM_EXEC_HANDOFF_ARMED) {
-			/*
-			 * The pending-exit test that used to stand here, in its
-			 * own domain->lock section immediately before the
-			 * consumer took the same mutex, is made inside the
-			 * consumer's single locked section.  A source with an
-			 * unserviced asynchronous request still leaves its
-			 * command in the ring: the consumer returns 0 without
-			 * advancing command_head, exactly as this goto did.
-			 */
+			bool command_blocked;
+
+			mutex_lock(&domain->lock);
+			capsule = kvm_exec_current_capsule(executor);
+			command_blocked = capsule &&
+				capsule->exit.async_request_pending;
+			mutex_unlock(&domain->lock);
+			if (command_blocked)
+				goto command_done;
 			memset(&completion, 0, sizeof(completion));
 			command_ret = kvm_exec_dispatch_consume(executor,
 								&completion,
@@ -3493,6 +3473,7 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 								  &completion);
 			}
 		}
+command_done:
 		interrupt_pending =
 			kvm_exec_interrupt_snapshot(executor,
 						    &pending_interrupt);
