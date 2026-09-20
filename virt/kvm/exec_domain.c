@@ -140,6 +140,12 @@ struct kvm_exec_capsule {
 struct kvm_exec_executor {
 	struct kref kref;
 	struct kvm_exec_domain *domain;
+	/*
+	 * The vCPU this dispatcher holds loaded across consecutive entries, or
+	 * NULL.  Written only by kvm_exec_hold_vcpu()/kvm_exec_drain_vcpu(),
+	 * both of which run on the dispatcher thread under run_lock.
+	 */
+	struct kvm_vcpu *loaded_vcpu;
 	/* Published with rcu_assign_pointer() under domain->lock. */
 	struct kvm_exec_capsule __rcu *current_capsule;
 	void *dispatch_region;
@@ -623,6 +629,38 @@ bool kvm_exec_domain_vcpu_exit_on_hlt(struct kvm_vcpu *vcpu)
 	       READ_ONCE(capsule->exit.async_completion_ready) &&
 	       READ_ONCE(capsule->exit.async_entry_authorized) &&
 	       !READ_ONCE(capsule->exit.async_reentry_required);
+}
+
+/*
+ * Hold one vCPU loaded across consecutive dispatcher entries.  Every entry
+ * otherwise pays a complete vcpu_load()/vcpu_put() round trip inside
+ * kvm_arch_vcpu_ioctl_run(), with its guest FPU swap, sigset activation and
+ * SRCU read section; the dispatcher re-enters the same capsule many times
+ * between ownership switches, so that round trip is repeated work.
+ *
+ * The obligations, which the call sites discharge: drain before any wait,
+ * drain before entering a different vCPU, and drain on every exit from the
+ * dispatcher loop.  All thirty of that loop's exits are `break` statements
+ * falling into one epilogue, which is where the last of those drains lives.
+ */
+static void kvm_exec_drain_vcpu(struct kvm_exec_executor *executor)
+{
+	struct kvm_vcpu *vcpu = executor->loaded_vcpu;
+
+	if (!vcpu)
+		return;
+	executor->loaded_vcpu = NULL;
+	kvm_arch_vcpu_exec_unload(vcpu);
+}
+
+static void kvm_exec_hold_vcpu(struct kvm_exec_executor *executor,
+			       struct kvm_vcpu *vcpu)
+{
+	if (executor->loaded_vcpu == vcpu)
+		return;
+	kvm_exec_drain_vcpu(executor);
+	kvm_arch_vcpu_exec_load(vcpu);
+	executor->loaded_vcpu = vcpu;
 }
 
 static int kvm_exec_vcpu_run(struct kvm_exec_capsule *capsule,
@@ -3516,6 +3554,7 @@ command_done:
 					KVM_EXEC_RETURN_DISPATCH_EMPTY;
 				break;
 			}
+			kvm_exec_drain_vcpu(executor);
 			ret = wait_event_interruptible(executor->dispatch_wait,
 						       kvm_exec_ready(executor,
 								      seen_kick_epoch));
@@ -3538,6 +3577,7 @@ command_done:
 					KVM_EXEC_RETURN_DISPATCH_EMPTY;
 				break;
 			}
+			kvm_exec_drain_vcpu(executor);
 			ret = wait_event_interruptible(executor->dispatch_wait,
 						       kvm_exec_ready(executor,
 								      seen_kick_epoch));
@@ -3562,6 +3602,7 @@ command_done:
 			capsule->exit.async_reentry_required = false;
 		if (kvm_exec_async_blocks_entry(capsule)) {
 			mutex_unlock(&domain->lock);
+			kvm_exec_drain_vcpu(executor);
 			ret = wait_event_interruptible(executor->dispatch_wait,
 						       kvm_exec_ready(executor,
 								      seen_kick_epoch));
@@ -3685,6 +3726,7 @@ command_done:
 			reported_exit_reason = KVM_EXIT_INTR;
 		} else {
 			attempted_kvm_run = true;
+			kvm_exec_hold_vcpu(executor, capsule->vcpu);
 			run_ret = kvm_exec_vcpu_run(capsule, &runtime_cycles);
 			kvm_exec_refresh_interrupt(executor, capsule->vcpu);
 			reported_exit_reason = capsule->vcpu->run->exit_reason;
@@ -3853,6 +3895,7 @@ command_done:
 	 * userspace can observe last_applied_sequence without any corresponding
 	 * completion and cannot reconcile the exact command after re-entry.
 	 */
+	kvm_exec_drain_vcpu(executor);
 	if (completion_pending) {
 		kvm_exec_dispatch_publish(executor, &completion);
 		completion_pending = false;

@@ -11544,12 +11544,19 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
 	struct kvm_run *kvm_run = vcpu->run;
 	int r;
 
-	vcpu_load(vcpu);
-	kvm_sigset_activate(vcpu);
+	/*
+	 * The exec domain may already hold this vCPU loaded across consecutive
+	 * entries; skip the prologue that task has already paid.  The test is on
+	 * the current task, so an ordinary KVM_RUN -- and any other task
+	 * entering this vCPU -- takes exactly the path it took before.
+	 */
+	if (vcpu->exec_loaded_by != current) {
+		vcpu_load(vcpu);
+		kvm_sigset_activate(vcpu);
+		kvm_load_guest_fpu(vcpu);
+		kvm_vcpu_srcu_read_lock(vcpu);
+	}
 	kvm_run->flags = 0;
-	kvm_load_guest_fpu(vcpu);
-
-	kvm_vcpu_srcu_read_lock(vcpu);
 	if (unlikely(vcpu->arch.mp_state == KVM_MP_STATE_UNINITIALIZED)) {
 		if (kvm_run->immediate_exit) {
 			r = -EINTR;
@@ -11641,16 +11648,51 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
 	r = vcpu_run(vcpu);
 
 out:
-	kvm_put_guest_fpu(vcpu);
+	if (vcpu->exec_loaded_by != current)
+		kvm_put_guest_fpu(vcpu);
 	if (kvm_run->kvm_valid_regs)
 		store_regs(vcpu);
 	post_kvm_run_save(vcpu);
-	kvm_vcpu_srcu_read_unlock(vcpu);
-
-	kvm_sigset_deactivate(vcpu);
-	vcpu_put(vcpu);
+	if (vcpu->exec_loaded_by != current) {
+		kvm_vcpu_srcu_read_unlock(vcpu);
+		kvm_sigset_deactivate(vcpu);
+		vcpu_put(vcpu);
+	}
 	return r;
 }
+
+/*
+ * Hold a vCPU loaded across more than one entry.  The exec domain's dispatcher
+ * enters the same capsule repeatedly between ownership switches, and each entry
+ * otherwise pays a complete vcpu_load()/vcpu_put() round trip with its guest
+ * FPU swap, sigset activation and SRCU read section.  These two helpers move
+ * that cost from per-entry to per-load; the dispatcher must unload before any
+ * wait, before entering a different vCPU, and on every exit from its loop.
+ */
+void kvm_arch_vcpu_exec_load(struct kvm_vcpu *vcpu)
+{
+	if (vcpu->exec_loaded_by == current)
+		return;
+	WARN_ON_ONCE(vcpu->exec_loaded_by);
+	vcpu_load(vcpu);
+	kvm_sigset_activate(vcpu);
+	kvm_load_guest_fpu(vcpu);
+	kvm_vcpu_srcu_read_lock(vcpu);
+	vcpu->exec_loaded_by = current;
+}
+EXPORT_SYMBOL_GPL(kvm_arch_vcpu_exec_load);
+
+void kvm_arch_vcpu_exec_unload(struct kvm_vcpu *vcpu)
+{
+	if (vcpu->exec_loaded_by != current)
+		return;
+	vcpu->exec_loaded_by = NULL;
+	kvm_put_guest_fpu(vcpu);
+	kvm_vcpu_srcu_read_unlock(vcpu);
+	kvm_sigset_deactivate(vcpu);
+	vcpu_put(vcpu);
+}
+EXPORT_SYMBOL_GPL(kvm_arch_vcpu_exec_unload);
 
 static void __get_regs(struct kvm_vcpu *vcpu, struct kvm_regs *regs)
 {
