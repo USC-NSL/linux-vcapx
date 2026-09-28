@@ -945,6 +945,8 @@ struct kvm_ppc_resize_hpt {
 
 #define KVM_EXEC_DISPATCH_F_RETURN_IF_EMPTY (1U << 0)
 #define KVM_EXEC_DISPATCH_F_RESUME_SERVICED_EXIT (1U << 1)
+/* Portable domains: native continuation only, without entering guest code. */
+#define KVM_EXEC_DISPATCH_F_COMPLETION_ONLY (1U << 2)
 #define KVM_EXEC_COMPLETE_F_ASYNC_PIO_HANDOFF (1U << 0)
 
 #define KVM_EXEC_NOTIFICATION_ABI_VERSION	1U

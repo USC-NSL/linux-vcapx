@@ -748,6 +748,22 @@ static int kvm_exec_vcpu_run(struct kvm_exec_capsule *capsule,
 	return ret;
 }
 
+static int kvm_exec_vcpu_complete_only(struct kvm_exec_capsule *capsule,
+				       u64 *runtime_cycles)
+{
+	struct kvm_vcpu *vcpu = capsule->vcpu;
+	u8 immediate_exit;
+	int ret;
+
+	lockdep_assert_held(&vcpu->mutex);
+	/* x86 finishes userspace I/O before checking immediate_exit. */
+	immediate_exit = READ_ONCE(vcpu->run->immediate_exit);
+	WRITE_ONCE(vcpu->run->immediate_exit, 1);
+	ret = kvm_exec_vcpu_run(capsule, runtime_cycles);
+	WRITE_ONCE(vcpu->run->immediate_exit, immediate_exit);
+	return ret;
+}
+
 int kvm_exec_vcpu_apply_entry(struct kvm_vcpu *vcpu)
 {
 	struct kvm_exec_capsule *capsule = vcpu->exec_capsule;
@@ -3962,7 +3978,8 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 		return -EFAULT;
 	if (run.size != sizeof(run) ||
 	    run.flags & ~(KVM_EXEC_DISPATCH_F_RETURN_IF_EMPTY |
-			  KVM_EXEC_DISPATCH_F_RESUME_SERVICED_EXIT) ||
+			  KVM_EXEC_DISPATCH_F_RESUME_SERVICED_EXIT |
+			  KVM_EXEC_DISPATCH_F_COMPLETION_ONLY) ||
 	    (!(run.flags & KVM_EXEC_DISPATCH_F_RESUME_SERVICED_EXIT) &&
 	     run.exit_sequence) || run.exit_flags || run.reserved0)
 		return -EINVAL;
@@ -3970,6 +3987,9 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 	if (ret)
 		return ret;
 	if (!(domain->negotiated_features & KVM_EXEC_FEATURE_DYNAMIC_DISPATCH))
+		return -EOPNOTSUPP;
+	if ((run.flags & KVM_EXEC_DISPATCH_F_COMPLETION_ONLY) &&
+	    !(domain->negotiated_features & KVM_EXEC_FEATURE_PORTABLE_EXITS))
 		return -EOPNOTSUPP;
 	if (run.domain_generation != domain->generation ||
 	    run.executor_generation != executor->generation)
@@ -4433,7 +4453,10 @@ command_done:
 			reported_exit_reason = KVM_EXIT_INTR;
 		} else {
 			attempted_kvm_run = true;
-			run_ret = kvm_exec_vcpu_run(capsule, &runtime_cycles);
+			if (unlikely(run.flags & KVM_EXEC_DISPATCH_F_COMPLETION_ONLY))
+				run_ret = kvm_exec_vcpu_complete_only(capsule, &runtime_cycles);
+			else
+				run_ret = kvm_exec_vcpu_run(capsule, &runtime_cycles);
 			kvm_exec_refresh_interrupt(executor, capsule->vcpu);
 			reported_exit_reason = capsule->vcpu->run->exit_reason;
 			pending_after_run =
