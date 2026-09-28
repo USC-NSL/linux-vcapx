@@ -414,7 +414,7 @@ static void kvm_exec_free_capsule(struct kvm_exec_capsule *capsule)
 	kfree(capsule);
 }
 
-static void kvm_exec_portable_release(struct kvm_exec_capsule *capsule, bool observe)
+static void kvm_exec_portable_release(struct kvm_exec_capsule *capsule)
 {
 	if (!capsule->portable)
 		return;
@@ -423,9 +423,8 @@ static void kvm_exec_portable_release(struct kvm_exec_capsule *capsule, bool obs
 		capsule->portable->entry->authorized = false;
 		kvm_exec_publish_entry(capsule);
 	}
-	if (observe || capsule->portable->service_pending ||
-	    capsule->exit.completion_pending)
-		kvm_exec_publish_capsule_status(capsule);
+	/* A later guarded selection needs this epoch even without pending I/O. */
+	kvm_exec_publish_capsule_status(capsule);
 }
 
 static void kvm_exec_set_current_capsule(struct kvm_exec_executor *executor,
@@ -908,7 +907,7 @@ static void kvm_exec_release_ownership_locked(struct kvm_exec_domain *domain)
 	xa_for_each(&domain->capsules, index, capsule) {
 		if (!capsule->running) {
 			capsule->owner = NULL;
-			kvm_exec_portable_release(capsule, true);
+			kvm_exec_portable_release(capsule);
 			atomic_cmpxchg(&capsule->block_reason,
 				       KVM_EXEC_BLOCK_VMM_EXIT,
 				       KVM_EXEC_BLOCK_NONE);
@@ -1002,7 +1001,7 @@ static int kvm_exec_domain_resume(struct kvm_exec_domain *domain)
 	return ret;
 }
 
-/* Call only at stopped/service transitions, never for an internal switch. */
+/* Publish stopped/service transitions, including portable ownership release. */
 static void kvm_exec_publish_capsule_status(struct kvm_exec_capsule *capsule)
 {
 	struct kvm_exec_portable_state *portable = capsule->portable;
@@ -1420,7 +1419,7 @@ static int kvm_exec_executor_release(struct inode *inode, struct file *file)
 			domain->stopping = true;
 		kvm_exec_interrupt_abort(executor, false);
 		current_capsule->owner = NULL;
-		kvm_exec_portable_release(current_capsule, true);
+		kvm_exec_portable_release(current_capsule);
 		kvm_exec_set_current_capsule(executor, NULL);
 	}
 	if (executor->listed) {
@@ -3447,7 +3446,7 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 				       KVM_EXEC_BLOCK_VMM_EXIT,
 				       KVM_EXEC_BLOCK_NONE);
 			current_capsule->owner = NULL;
-			kvm_exec_portable_release(current_capsule, true);
+			kvm_exec_portable_release(current_capsule);
 		}
 		kvm_exec_set_current_capsule(executor, NULL);
 		kvm_exec_dispatch_expect_entry(executor, &command, NULL, 0);
@@ -3471,7 +3470,7 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 					current_capsule->exit.async_reentry_required =
 						false;
 				current_capsule->owner = NULL;
-				kvm_exec_portable_release(current_capsule, false);
+				kvm_exec_portable_release(current_capsule);
 			}
 			target->owner = executor;
 			kvm_exec_set_current_capsule(executor, target);
