@@ -898,6 +898,9 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_FEATURE_HANDOFF_ENTRY_OBSERVATION (1ULL << 15)
 #define KVM_EXEC_FEATURE_TSC_TIMING		(1ULL << 16)
 #define KVM_EXEC_FEATURE_INTERRUPT_RESULT	(1ULL << 17)
+/* Negotiation requires the corresponding execution-path implementation. */
+#define KVM_EXEC_FEATURE_PORTABLE_EXITS		(1ULL << 18)
+#define KVM_EXEC_FEATURE_ENTRY_STATE_X86		(1ULL << 19)
 
 #define KVM_EXEC_INTERRUPT_DELIVERY_DIRECT_KICK	1U
 #define KVM_EXEC_INTERRUPT_DELIVERY_LOCAL_APIC_KICK 2U
@@ -941,6 +944,7 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_TSC_EXIT_TIMING_OFFSET	2304U
 
 #define KVM_EXEC_DISPATCH_F_RETURN_IF_EMPTY (1U << 0)
+#define KVM_EXEC_DISPATCH_F_RESUME_SERVICED_EXIT (1U << 1)
 #define KVM_EXEC_COMPLETE_F_ASYNC_PIO_HANDOFF (1U << 0)
 
 #define KVM_EXEC_NOTIFICATION_ABI_VERSION	1U
@@ -976,6 +980,41 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_CMD_RELEASE		2U
 
 #define KVM_EXEC_CMD_F_PIO_WRITE_GATE	(1U << 0)
+/* GUARDED_TARGET interprets command.reserved as the expected boundary epoch. */
+#define KVM_EXEC_CMD_F_GUARDED_TARGET	(1U << 1)
+#define KVM_EXEC_CMD_F_SET_ENTRY		(1U << 2)
+#define KVM_EXEC_CMD_F_CONTINUE_ENTRY	(1U << 3)
+
+#define KVM_EXEC_PORTABLE_ABI_VERSION	1U
+#define KVM_EXEC_CAPSULE_CONTROL_SIZE	128U
+#define KVM_EXEC_CAPSULE_ENTRY_CONTROL_SIZE 256U
+#define KVM_EXEC_ENTRY_STATE_SIZE	640U
+#define KVM_EXEC_ENTRY_STATE_OFFSET	20480U
+#define KVM_EXEC_ENTRY_STATE_REGION_SIZE	20480U
+#define KVM_EXEC_ENTRY_STATE_MMAP_SIZE	40960U
+
+#define KVM_EXEC_ENTRY_GROUP_GPRS	(1ULL << 0)
+#define KVM_EXEC_ENTRY_GROUP_LEGACY_FPU	(1ULL << 1)
+
+#define KVM_EXEC_ENTRY_PHASE_NONE	0U
+#define KVM_EXEC_ENTRY_PHASE_PENDING	1U
+#define KVM_EXEC_ENTRY_PHASE_NEEDS_SERVICE 2U
+#define KVM_EXEC_ENTRY_PHASE_INTERRUPTED	3U
+#define KVM_EXEC_ENTRY_PHASE_APPLIED	4U
+#define KVM_EXEC_ENTRY_PHASE_BLOCKED	5U
+#define KVM_EXEC_ENTRY_PHASE_CANCELLED	6U
+#define KVM_EXEC_ENTRY_PHASE_FAILED	7U
+
+#define KVM_EXEC_CAPSULE_F_SERVICE_PENDING (1ULL << 0)
+#define KVM_EXEC_CAPSULE_F_CONTINUATION_PENDING (1ULL << 1)
+#define KVM_EXEC_CAPSULE_F_STOPPED	(1ULL << 2)
+#define KVM_EXEC_CAPSULE_F_BLOCKED	(1ULL << 3)
+#define KVM_EXEC_CAPSULE_F_ENTRY_PENDING	(1ULL << 4)
+
+/* Read bytes are in the retained run/PIO buffer instead of inline data. */
+#define KVM_EXEC_RESPONSE_F_RUN_BUFFER	(1U << 0)
+/* Native response error, currently the userspace MSR #GP disposition. */
+#define KVM_EXEC_RESPONSE_F_ERROR	(1U << 1)
 
 #define KVM_EXEC_COMPLETE_APPLIED	1U
 #define KVM_EXEC_COMPLETE_RETURNED	2U
@@ -1018,6 +1057,91 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_CANCEL_APPLIED		2U
 #define KVM_EXEC_CANCEL_ALREADY_CANCELLED 3U
 #define KVM_EXEC_CANCEL_STALE		4U
+
+/*
+ * Portable control records occupy separate 64-byte writer-owned lines.  The
+ * mapping geometry, not C structure alignment, supplies cache-line alignment.
+ * Mutable mapped words require atomic accesses.  KVM publishes status/progress
+ * under an odd/even revision; readers retry a changed or odd revision.  Kernel
+ * private state, never a writable mapping, remains ownership authority.
+ */
+struct kvm_exec_capsule_status {
+	__u64 revision;
+	__u64 lifecycle_generation;
+	__u64 boundary_epoch;
+	__u64 exit_sequence;
+	__u64 accepted_sequence;
+	__u64 resolved_sequence;
+	__u64 owner_generation;
+	__u64 flags;
+};
+
+/*
+ * One unique service owner fills the response, then release-stores sequence.
+ * KVM acquire-loads sequence only during explicit execution admission.  The
+ * request epoch is immutable across source release and ownership changes; it
+ * is distinct from the current target boundary in kvm_exec_capsule_status.
+ * reason echoes the captured KVM_EXIT_* value.  Flags, length and data must
+ * satisfy that exit's native response schema.  Reserved bytes are zero.
+ */
+struct kvm_exec_capsule_response {
+	__u64 sequence;
+	__u64 lifecycle_generation;
+	__u64 request_epoch;
+	__u32 reason;
+	__u32 flags;
+	__u32 len;
+	__u32 reserved0;
+	__u64 data[2];
+	__u64 reserved;
+};
+
+/* APPLIED records state mutation, not evidence of guest execution. */
+struct kvm_exec_entry_progress {
+	__u64 revision;
+	__u64 executor_generation;
+	__u64 command_sequence;
+	__u64 lifecycle_generation;
+	__u64 boundary_epoch;
+	__u64 exit_sequence;
+	__u32 phase;
+	__s32 error;
+	__u64 applied_groups;
+};
+
+/* Release-store command_sequence last, after observing the exact terminal ID. */
+struct kvm_exec_entry_observation {
+	__u64 command_sequence;
+	__u64 executor_generation;
+	__u64 lifecycle_generation;
+	__u64 reserved[5];
+};
+
+/*
+ * One sidecar per command-ring slot.  Publish before command_tail; KVM copies
+ * present groups before releasing command_head.  SET_ENTRY derives its intent
+ * ID from the command, with zero origin fields.  CONTINUE_ENTRY supplies that
+ * origin ID, with zero groups and no image access.  Ordinary commands never
+ * access sidecars.  Reserved fields in the header and supplied groups must be zero;
+ * omitted images are not read or validated.
+ *
+ * gprs uses the x86 kvm_regs field order.  legacy_fpu uses kvm_fpu byte offsets,
+ * but MXCSR and padding are reserved zero: only x87/MMX and XMM are supplied.
+ * Neither omitted groups nor extended XSAVE components are reset.
+ */
+struct kvm_exec_entry_state {
+	__u64 command_sequence;
+	__u64 capsule_id;
+	__u64 lifecycle_generation;
+	__u64 boundary_epoch;
+	__u64 groups;
+	__u64 origin_executor_generation;
+	__u64 origin_command_sequence;
+	__u64 reserved0;
+	__u64 gprs[18];
+	__u8 legacy_fpu[416];
+	__u64 reserved[2];
+};
 
 struct kvm_exec_domain_create {
 	__u32 size;
