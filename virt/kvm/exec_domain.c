@@ -4656,8 +4656,15 @@ command_done:
 		}
 		if (run_ret == -EINTR) {
 			if (atomic64_read(&executor->kick_epoch) !=
-					seen_kick_epoch)
+					seen_kick_epoch &&
+			    !kvm_exec_entry_pending(capsule))
 				continue;
+			/*
+			 * Entry interruption revokes its authorization.  Return the
+			 * retained intent for explicit continuation even if a command
+			 * kick caused the interruption; looping would wait forever on
+			 * that intent without exposing the stop to its caller.
+			 */
 			run.return_reason = KVM_EXEC_RETURN_SIGNAL;
 			break;
 		}
