@@ -11,6 +11,7 @@
 #include <linux/string.h>
 #include <linux/timekeeping.h>
 #include <linux/uaccess.h>
+#include <linux/vmalloc.h>
 #include <linux/xarray.h>
 
 #include <trace/events/kvm.h>
@@ -116,6 +117,18 @@ struct kvm_exec_exit_state {
 	bool async_reentry_required;
 };
 
+/* Allocated at attachment only for the negotiated portable protocol. */
+struct kvm_exec_portable_state {
+	struct kvm_exec_capsule_status *control;
+	u64 revision;
+	u64 boundary_epoch;
+	u64 request_epoch;
+	u64 accepted_sequence;
+	u64 resolved_sequence;
+	bool service_pending;
+	bool blocked;
+};
+
 struct kvm_exec_capsule {
 	struct kvm_exec_domain *domain;
 	struct file *vcpu_file;
@@ -135,6 +148,7 @@ struct kvm_exec_capsule {
 	u64 runtime_cycles;
 	u32 trace_refs;
 	bool running;
+	struct kvm_exec_portable_state *portable;
 };
 
 struct kvm_exec_executor {
@@ -291,6 +305,9 @@ struct kvm_exec_domain {
 	bool interrupt_delivery_configured;
 	bool paused;
 	bool stopping;
+	void *control_region;
+	size_t control_region_size;
+	u32 control_stride;
 };
 
 /*
@@ -770,6 +787,39 @@ static int kvm_exec_domain_resume(struct kvm_exec_domain *domain)
 	return ret;
 }
 
+/* Call only at stopped/service transitions, never for an internal switch. */
+static void kvm_exec_publish_capsule_status(struct kvm_exec_capsule *capsule)
+{
+	struct kvm_exec_portable_state *portable = capsule->portable;
+	struct kvm_exec_capsule_status *status = portable->control;
+	u64 flags = 0;
+
+	lockdep_assert_held(&capsule->domain->lock);
+	if (portable->service_pending)
+		flags |= KVM_EXEC_CAPSULE_F_SERVICE_PENDING;
+	if (capsule->exit.completion_pending)
+		flags |= KVM_EXEC_CAPSULE_F_CONTINUATION_PENDING;
+	if (!capsule->running)
+		flags |= KVM_EXEC_CAPSULE_F_STOPPED;
+	if (portable->blocked || !capsule->vcpu)
+		flags |= KVM_EXEC_CAPSULE_F_BLOCKED;
+
+	WRITE_ONCE(status->revision, portable->revision + 1);
+	/* Invalidate old snapshots before changing any of their words. */
+	smp_wmb();
+	WRITE_ONCE(status->lifecycle_generation, capsule->lifecycle_generation);
+	WRITE_ONCE(status->boundary_epoch, portable->boundary_epoch);
+	WRITE_ONCE(status->exit_sequence, capsule->exit.sequence);
+	WRITE_ONCE(status->accepted_sequence, portable->accepted_sequence);
+	WRITE_ONCE(status->resolved_sequence, portable->resolved_sequence);
+	WRITE_ONCE(status->owner_generation,
+		   capsule->owner ? capsule->owner->generation : 0);
+	WRITE_ONCE(status->flags, flags);
+	portable->revision += 2;
+	/* Readers acquire the even revision after all snapshot words are visible. */
+	smp_store_release(&status->revision, portable->revision);
+}
+
 static int kvm_exec_attach_vcpu(struct kvm_exec_domain *domain,
 				void __user *argp)
 {
@@ -812,6 +862,11 @@ static int kvm_exec_attach_vcpu(struct kvm_exec_domain *domain,
 		ret = -ESTALE;
 		goto out_unlock;
 	}
+	if (capsule && capsule->portable &&
+	    capsule->portable->revision > U64_MAX - 2) {
+		ret = -EOVERFLOW;
+		goto out_unlock;
+	}
 	if (!capsule) {
 		if (domain->nr_capsule_slots == domain->max_capsules) {
 			ret = -ENOSPC;
@@ -824,6 +879,16 @@ static int kvm_exec_attach_vcpu(struct kvm_exec_domain *domain,
 		}
 		new_capsule->domain = domain;
 		new_capsule->capsule_id = attach.capsule_id;
+		if (domain->control_region) {
+			new_capsule->portable = kzalloc(
+				sizeof(*new_capsule->portable), GFP_KERNEL_ACCOUNT);
+			if (!new_capsule->portable) {
+				ret = -ENOMEM;
+				goto out_unlock;
+			}
+			new_capsule->portable->control = domain->control_region +
+				domain->nr_capsule_slots * domain->control_stride;
+		}
 		ret = xa_err(xa_store(&domain->capsules, attach.capsule_id,
 				      new_capsule, GFP_KERNEL_ACCOUNT));
 		if (ret)
@@ -864,6 +929,15 @@ static int kvm_exec_attach_vcpu(struct kvm_exec_domain *domain,
 		WRITE_ONCE(capsule->runtime_cycles, 0);
 		vcpu->exec_capsule = capsule;
 		domain->nr_attached++;
+		if (capsule->portable) {
+			capsule->portable->boundary_epoch = 1;
+			capsule->portable->request_epoch = 0;
+			capsule->portable->accepted_sequence = 0;
+			capsule->portable->resolved_sequence = 0;
+			capsule->portable->service_pending = false;
+			capsule->portable->blocked = false;
+			kvm_exec_publish_capsule_status(capsule);
+		}
 		ret = 0;
 	}
 out_vcpu:
@@ -875,9 +949,12 @@ out_unlock:
 	if (ret && inserted_slot) {
 		xa_erase(&domain->capsules, attach.capsule_id);
 		domain->nr_capsule_slots--;
+		kfree(capsule->portable);
 		kfree(capsule);
 	}
 	mutex_unlock(&domain->lock);
+	if (new_capsule)
+		kfree(new_capsule->portable);
 	kfree(new_capsule);
 out_file:
 	if (vcpu_file)
@@ -916,8 +993,13 @@ static int kvm_exec_detach_vcpu(struct kvm_exec_domain *domain,
 		goto out;
 	}
 	if (capsule->owner || capsule->running || capsule->trace_refs ||
-	    capsule->exit.completion_pending) {
+	    capsule->exit.completion_pending ||
+	    (capsule->portable && capsule->portable->service_pending)) {
 		ret = -EBUSY;
+		goto out;
+	}
+	if (capsule->portable && capsule->portable->revision > U64_MAX - 2) {
+		ret = -EOVERFLOW;
 		goto out;
 	}
 
@@ -936,6 +1018,8 @@ static int kvm_exec_detach_vcpu(struct kvm_exec_domain *domain,
 	capsule->vcpu_file = NULL;
 	capsule->vcpu = NULL;
 	domain->nr_attached--;
+	if (capsule->portable)
+		kvm_exec_publish_capsule_status(capsule);
 out:
 	mutex_unlock(&domain->lock);
 	if (vcpu_file)
@@ -957,6 +1041,7 @@ static long kvm_exec_query_capsule(struct kvm_exec_domain *domain,
 		return -EFAULT;
 	if (query.size != sizeof(query) || query.flags || !query.capsule_id ||
 	    !query.lifecycle_generation || query.capsule_id > ULONG_MAX ||
+	    query.control_offset ||
 	    memchr_inv(query.reserved, 0, sizeof(query.reserved)))
 		return -EINVAL;
 	if (query.domain_generation != domain->generation)
@@ -998,6 +1083,8 @@ static long kvm_exec_query_capsule(struct kvm_exec_domain *domain,
 		READ_ONCE(capsule->runtime_cycles));
 	query.last_cpu = READ_ONCE(capsule->last_cpu);
 	query.reserved0 = 0;
+	query.control_offset = capsule->portable ?
+		(void *)capsule->portable->control - domain->control_region : 0;
 	memset(query.reserved, 0, sizeof(query.reserved));
 out:
 	mutex_unlock(&domain->lock);
@@ -1013,9 +1100,12 @@ static void kvm_exec_domain_free(struct kref *kref)
 	struct kvm_exec_capsule *capsule;
 	unsigned long index;
 
-	xa_for_each(&domain->capsules, index, capsule)
+	xa_for_each(&domain->capsules, index, capsule) {
+		kfree(capsule->portable);
 		kfree(capsule);
+	}
 	xa_destroy(&domain->capsules);
+	vfree(domain->control_region);
 	put_cred(domain->cred);
 	mmdrop(domain->mm);
 	kfree(domain);
@@ -5660,10 +5750,56 @@ static long kvm_exec_domain_ioctl(struct file *file, unsigned int ioctl,
 	}
 }
 
+static void kvm_exec_domain_vma_open(struct vm_area_struct *vma)
+{
+	struct kvm_exec_domain *domain = vma->vm_private_data;
+
+	kref_get(&domain->kref);
+}
+
+static void kvm_exec_domain_vma_close(struct vm_area_struct *vma)
+{
+	struct kvm_exec_domain *domain = vma->vm_private_data;
+
+	kref_put(&domain->kref, kvm_exec_domain_free);
+}
+
+static const struct vm_operations_struct kvm_exec_domain_vm_ops = {
+	.open = kvm_exec_domain_vma_open,
+	.close = kvm_exec_domain_vma_close,
+};
+
+static int kvm_exec_domain_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	struct kvm_exec_domain *domain = file->private_data;
+	int ret;
+
+	ret = kvm_exec_domain_access(domain);
+	if (ret)
+		return ret;
+	if (!domain->control_region)
+		return -EOPNOTSUPP;
+	if (vma->vm_pgoff ||
+	    vma->vm_end - vma->vm_start != domain->control_region_size ||
+	    !(vma->vm_flags & VM_SHARED) || (vma->vm_flags & VM_EXEC))
+		return -EINVAL;
+
+	vm_flags_set(vma, VM_DONTCOPY | VM_DONTEXPAND | VM_DONTDUMP);
+	vm_flags_clear(vma, VM_MAYEXEC);
+	ret = remap_vmalloc_range(vma, domain->control_region, 0);
+	if (ret)
+		return ret;
+	vma->vm_ops = &kvm_exec_domain_vm_ops;
+	vma->vm_private_data = domain;
+	kvm_exec_domain_vma_open(vma);
+	return 0;
+}
+
 static const struct file_operations kvm_exec_domain_fops = {
 	.owner = THIS_MODULE,
 	.release = kvm_exec_domain_release,
 	.unlocked_ioctl = kvm_exec_domain_ioctl,
+	.mmap = kvm_exec_domain_mmap,
 	.llseek = noop_llseek,
 #ifdef CONFIG_COMPAT
 	.compat_ioctl = kvm_exec_domain_ioctl,
@@ -5684,6 +5820,8 @@ int kvm_dev_ioctl_create_exec_domain(void __user *argp)
 		return -EFAULT;
 	supported_features = kvm_exec_supported_features();
 	if (create.size != sizeof(create) || create.flags ||
+	    create.control_mmap_size || create.control_stride ||
+	    create.portable_abi_version ||
 	    !create.max_capsules || !create.max_executors ||
 	    create.max_capsules > U16_MAX || create.max_executors > U16_MAX ||
 	    !(create.requested_features & KVM_EXEC_FEATURE_BASE_OBJECTS) ||
@@ -5745,7 +5883,10 @@ int kvm_dev_ioctl_create_exec_domain(void __user *argp)
 	       KVM_EXEC_FEATURE_SYNC_EXITS)) !=
 	     (KVM_EXEC_FEATURE_DYNAMIC_DISPATCH |
 	      KVM_EXEC_FEATURE_SYNC_EXITS)) ||
-	    memchr_inv(create.reserved, 0, sizeof(create.reserved)))
+	    ((create.requested_features & KVM_EXEC_FEATURE_PORTABLE_EXITS) &&
+	     !(create.requested_features & KVM_EXEC_FEATURE_LIFECYCLE_STATE)) ||
+	    ((create.requested_features & KVM_EXEC_FEATURE_ENTRY_STATE_X86) &&
+	     !(create.requested_features & KVM_EXEC_FEATURE_PORTABLE_EXITS)))
 		return -EINVAL;
 
 	fd = get_unused_fd_flags(O_CLOEXEC);
@@ -5773,6 +5914,21 @@ int kvm_dev_ioctl_create_exec_domain(void __user *argp)
 		KVM_EXEC_INTERRUPT_DELIVERY_DIRECT_KICK;
 	domain->max_capsules = create.max_capsules;
 	domain->max_executors = create.max_executors;
+	if (create.requested_features & KVM_EXEC_FEATURE_PORTABLE_EXITS) {
+		domain->control_stride = create.requested_features &
+			KVM_EXEC_FEATURE_ENTRY_STATE_X86 ?
+			KVM_EXEC_CAPSULE_ENTRY_CONTROL_SIZE :
+			KVM_EXEC_CAPSULE_CONTROL_SIZE;
+		/* max_capsules is at most U16_MAX; the product cannot overflow. */
+		domain->control_region_size = PAGE_ALIGN(
+			(size_t)domain->max_capsules * domain->control_stride);
+		domain->control_region = vmalloc_user(domain->control_region_size);
+		if (!domain->control_region) {
+			kref_put(&domain->kref, kvm_exec_domain_free);
+			put_unused_fd(fd);
+			return -ENOMEM;
+		}
+	}
 
 	file = anon_inode_getfile("kvm-exec-domain", &kvm_exec_domain_fops,
 				  domain, O_RDWR);
@@ -5786,6 +5942,10 @@ int kvm_dev_ioctl_create_exec_domain(void __user *argp)
 
 	create.negotiated_features = domain->negotiated_features;
 	create.domain_generation = domain->generation;
+	create.control_mmap_size = domain->control_region_size;
+	create.control_stride = domain->control_stride;
+	create.portable_abi_version = domain->control_region ?
+		KVM_EXEC_PORTABLE_ABI_VERSION : 0;
 	if (copy_to_user(argp, &create, sizeof(create))) {
 		fput(file);
 		put_unused_fd(fd);

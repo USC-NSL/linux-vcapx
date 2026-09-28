@@ -1151,7 +1151,10 @@ struct kvm_exec_domain_create {
 	__u64 requested_features;
 	__u64 negotiated_features;
 	__u64 domain_generation;
-	__u64 reserved[3];
+	/* Zero on input; geometry is returned only for PORTABLE_EXITS. */
+	__u64 control_mmap_size;
+	__u64 control_stride;
+	__u64 portable_abi_version;
 };
 
 struct kvm_exec_attach_vcpu {
@@ -1694,7 +1697,9 @@ struct kvm_exec_query_capsule {
 	__u64 runtime_ns;
 	__u32 last_cpu;
 	__u32 reserved0;
-	__u64 reserved[4];
+	/* Zero on input; byte offset in the portable domain control mapping. */
+	__u64 control_offset;
+	__u64 reserved[3];
 };
 
 struct kvm_exec_query_executor {
