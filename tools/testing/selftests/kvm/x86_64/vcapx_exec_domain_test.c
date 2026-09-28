@@ -4941,6 +4941,8 @@ static void test_dynamic_kick_and_cancel(int kvm_fd, bool tsc_timing)
 				  KVM_EXEC_FEATURE_INTRA_VM_CHAIN |
 				  KVM_EXEC_FEATURE_CROSS_VM_CHAIN |
 				  KVM_EXEC_FEATURE_DYNAMIC_DISPATCH |
+				  KVM_EXEC_FEATURE_SYNC_EXITS |
+				  KVM_EXEC_FEATURE_LIFECYCLE_STATE |
 				  (tsc_timing ? KVM_EXEC_FEATURE_TSC_TIMING : 0);
 	struct kvm_exec_command command = {
 		.opcode = KVM_EXEC_CMD_SWITCH,
@@ -7725,9 +7727,15 @@ static void test_malformed_and_stale_requests(int kvm_fd)
 	bad_create.flags = 1;
 	assert_ioctl_errno(kvm_fd, KVM_CREATE_EXEC_DOMAIN, &bad_create, EINVAL);
 	bad_create.flags = 0;
-	bad_create.reserved[0] = 1;
+	bad_create.control_mmap_size = 1;
 	assert_ioctl_errno(kvm_fd, KVM_CREATE_EXEC_DOMAIN, &bad_create, EINVAL);
-	bad_create.reserved[0] = 0;
+	bad_create.control_mmap_size = 0;
+	bad_create.control_stride = 1;
+	assert_ioctl_errno(kvm_fd, KVM_CREATE_EXEC_DOMAIN, &bad_create, EINVAL);
+	bad_create.control_stride = 0;
+	bad_create.portable_abi_version = KVM_EXEC_PORTABLE_ABI_VERSION;
+	assert_ioctl_errno(kvm_fd, KVM_CREATE_EXEC_DOMAIN, &bad_create, EINVAL);
+	bad_create.portable_abi_version = 0;
 	bad_create.requested_features |= 1ULL << 63;
 	assert_ioctl_errno(kvm_fd, KVM_CREATE_EXEC_DOMAIN, &bad_create, EINVAL);
 
@@ -7877,7 +7885,6 @@ static void test_deterministic_malformed_fuzz(int kvm_fd)
 	struct kvm_exec_run run;
 	uint64_t domain_generation, executor_generation, value;
 	int domain_fd, executor_fd, vm_fd, vcpu_fd;
-	size_t reserved_index;
 	int i;
 
 	for (i = 0; i < 96; i++) {
@@ -7888,7 +7895,7 @@ static void test_deterministic_malformed_fuzz(int kvm_fd)
 			.requested_features = KVM_EXEC_FEATURE_BASE_OBJECTS,
 		};
 		value = (fuzz_next() >> 1) | 1;
-		switch (i % 6) {
+		switch (i % 8) {
 		case 0:
 			create.size = sizeof(create) + (value & 15) + 1;
 			break;
@@ -7905,7 +7912,13 @@ static void test_deterministic_malformed_fuzz(int kvm_fd)
 			create.requested_features |= 1ULL << 63;
 			break;
 		case 5:
-			create.reserved[value % ARRAY_SIZE(create.reserved)] = value;
+			create.control_mmap_size = value;
+			break;
+		case 6:
+			create.control_stride = value;
+			break;
+		case 7:
+			create.portable_abi_version = value;
 			break;
 		}
 		assert_ioctl_errno(kvm_fd, KVM_CREATE_EXEC_DOMAIN, &create, EINVAL);
@@ -7952,7 +7965,7 @@ static void test_deterministic_malformed_fuzz(int kvm_fd)
 			.requested_cpu = KVM_EXEC_CPU_ANY,
 		};
 		value = (fuzz_next() >> 1) | 1;
-		switch (i % 6) {
+		switch (i % 9) {
 		case 0:
 			create_executor_req.size =
 				sizeof(create_executor_req) + (value & 15) + 1;
@@ -7970,9 +7983,16 @@ static void test_deterministic_malformed_fuzz(int kvm_fd)
 			create_executor_req.reserved0 = value;
 			break;
 		case 5:
-			reserved_index =
-				value % ARRAY_SIZE(create_executor_req.reserved);
-			create_executor_req.reserved[reserved_index] = value;
+			create_executor_req.reserved = value;
+			break;
+		case 6:
+			create_executor_req.entry_mmap_size = value;
+			break;
+		case 7:
+			create_executor_req.entry_state_offset = value;
+			break;
+		case 8:
+			create_executor_req.entry_state_stride = value;
 			break;
 		}
 		assert_ioctl_errno(domain_fd, KVM_EXEC_CREATE_EXECUTOR,
