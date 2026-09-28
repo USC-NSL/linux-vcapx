@@ -812,8 +812,7 @@ static void kvm_exec_publish_capsule_status(struct kvm_exec_capsule *capsule)
 	WRITE_ONCE(status->exit_sequence, capsule->exit.sequence);
 	WRITE_ONCE(status->accepted_sequence, portable->accepted_sequence);
 	WRITE_ONCE(status->resolved_sequence, portable->resolved_sequence);
-	WRITE_ONCE(status->owner_generation,
-		   capsule->owner ? capsule->owner->generation : 0);
+	WRITE_ONCE(status->request_epoch, portable->request_epoch);
 	WRITE_ONCE(status->flags, flags);
 	portable->revision += 2;
 	/* Readers acquire the even revision after all snapshot words are visible. */

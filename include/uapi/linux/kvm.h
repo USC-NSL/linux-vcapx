@@ -1072,7 +1072,8 @@ struct kvm_exec_capsule_status {
 	__u64 exit_sequence;
 	__u64 accepted_sequence;
 	__u64 resolved_sequence;
-	__u64 owner_generation;
+	/* Immutable epoch of exit_sequence, even after source release. */
+	__u64 request_epoch;
 	__u64 flags;
 };
 
