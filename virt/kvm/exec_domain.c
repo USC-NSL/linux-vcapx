@@ -3411,8 +3411,11 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 	/* Cancellation and ownership replacement share one serialized apply point. */
 	spin_lock_irqsave(&executor->dispatch_lock, flags);
 	if (executor->cancel_sequence == command.request_sequence) {
+		spin_unlock_irqrestore(&executor->dispatch_lock, flags);
 		status = KVM_EXEC_COMPLETE_CANCELLED_BEFORE_APPLY;
-	} else if (command.opcode == KVM_EXEC_CMD_RELEASE) {
+		goto terminal_locked;
+	}
+	if (command.opcode == KVM_EXEC_CMD_RELEASE) {
 		completion->handoff_started_ns =
 			kvm_exec_performance_ns(executor);
 		if (timing)

@@ -2391,12 +2391,12 @@ struct interrupt_arg {
 	bool started;
 };
 
-static struct dispatch_mapping map_dispatch(int executor_fd)
+static struct dispatch_mapping map_dispatch_size(int executor_fd, size_t size)
 {
 	struct dispatch_mapping mapping;
 	void *region;
 
-	region = mmap(NULL, KVM_EXEC_DISPATCH_MMAP_SIZE,
+	region = mmap(NULL, size,
 		      PROT_READ | PROT_WRITE, MAP_SHARED, executor_fd, 0);
 	TEST_ASSERT(region != MAP_FAILED, "executor mmap failed, errno: %d", errno);
 	mapping.header = region;
@@ -2405,6 +2405,11 @@ static struct dispatch_mapping map_dispatch(int executor_fd)
 	mapping.exit_requests = region + KVM_EXEC_EXIT_REQUEST_OFFSET;
 	mapping.exit_completions = region + KVM_EXEC_EXIT_COMPLETION_OFFSET;
 	return mapping;
+}
+
+static struct dispatch_mapping map_dispatch(int executor_fd)
+{
+	return map_dispatch_size(executor_fd, KVM_EXEC_DISPATCH_MMAP_SIZE);
 }
 
 static bool publish_dispatch_command(struct dispatch_mapping *mapping,
@@ -4907,12 +4912,36 @@ static void test_dynamic_return_kick(int kvm_fd)
 		test_dynamic_return_kick_once(kvm_fd);
 }
 
-static void test_dynamic_kick_and_cancel(int kvm_fd)
+static void assert_dispatch_cancelled(struct kvm_exec_completion *completion,
+				      struct kvm_exec_command_timing *timings)
+{
+	TEST_ASSERT_EQ(completion->status, KVM_EXEC_COMPLETE_CANCELLED_BEFORE_APPLY);
+	TEST_ASSERT_EQ(completion->previous_capsule_id, completion->owned_capsule_id);
+	TEST_ASSERT_EQ(completion->previous_lifecycle_generation,
+		       completion->owned_lifecycle_generation);
+	TEST_ASSERT_EQ(completion->handoff_started_ns, 0);
+	TEST_ASSERT_EQ(completion->applied_ns, 0);
+	TEST_ASSERT_EQ(completion->entry_attempt_ns, 0);
+	if (timings) {
+		struct kvm_exec_command_timing *timing =
+			&timings[(completion->request_sequence - 1) %
+				 KVM_EXEC_DISPATCH_RING_ENTRIES];
+
+		TEST_ASSERT_EQ(timing->request_sequence, completion->request_sequence);
+		TEST_ASSERT(timing->consumed_tsc, "missing consumption time");
+		TEST_ASSERT_EQ(timing->handoff_started_tsc, 0);
+		TEST_ASSERT_EQ(timing->applied_tsc, 0);
+		TEST_ASSERT_EQ(timing->entry_attempt_tsc, 0);
+	}
+}
+
+static void test_dynamic_kick_and_cancel(int kvm_fd, bool tsc_timing)
 {
 	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
 				  KVM_EXEC_FEATURE_INTRA_VM_CHAIN |
 				  KVM_EXEC_FEATURE_CROSS_VM_CHAIN |
-				  KVM_EXEC_FEATURE_DYNAMIC_DISPATCH;
+				  KVM_EXEC_FEATURE_DYNAMIC_DISPATCH |
+				  (tsc_timing ? KVM_EXEC_FEATURE_TSC_TIMING : 0);
 	struct kvm_exec_command command = {
 		.opcode = KVM_EXEC_CMD_SWITCH,
 		.request_sequence = 1,
@@ -4926,6 +4955,11 @@ static void test_dynamic_kick_and_cancel(int kvm_fd)
 		.size = sizeof(stale_cancel),
 		.request_sequence = 6,
 	};
+	struct kvm_exec_query_executor query = { .size = sizeof(query) };
+	struct kvm_exec_command_timing *timings = NULL;
+	const size_t mapping_size = tsc_timing ? KVM_EXEC_TSC_TIMING_MMAP_SIZE :
+					       KVM_EXEC_DISPATCH_MMAP_SIZE;
+	uint64_t cancellations = 1;
 	struct kvm_exec_completion completion;
 	struct dispatch_mapping mapping;
 	uint64_t *started;
@@ -4943,7 +4977,10 @@ static void test_dynamic_kick_and_cancel(int kvm_fd)
 	attach_vcpu(domain_fd, vcpu->fd, 41, 7);
 	run_arg.executor_fd = create_executor(domain_fd, 0x701,
 					      &executor_generation);
-	mapping = map_dispatch(run_arg.executor_fd);
+	mapping = map_dispatch_size(run_arg.executor_fd, mapping_size);
+	if (tsc_timing)
+		timings = (void *)mapping.header + KVM_EXEC_TSC_TIMING_OFFSET +
+			  KVM_EXEC_TSC_COMMAND_TIMING_OFFSET;
 	unsupported_kick = (struct kvm_exec_kick) {
 		.size = sizeof(unsupported_kick),
 		.flags = KVM_EXEC_KICK_F_RETURN_TO_VMM,
@@ -5040,8 +5077,7 @@ static void test_dynamic_kick_and_cancel(int kvm_fd)
 	kick_dispatch(run_arg.executor_fd, domain_generation,
 		      executor_generation, 4);
 	completion = consume_dispatch_completion(&mapping);
-	TEST_ASSERT_EQ(completion.status,
-		       KVM_EXEC_COMPLETE_CANCELLED_BEFORE_APPLY);
+	assert_dispatch_cancelled(&completion, timings);
 	TEST_ASSERT_EQ(completion.owned_capsule_id, 0);
 	TEST_ASSERT_EQ(cancel_dispatch(run_arg.executor_fd, domain_generation,
 				       executor_generation, 4),
@@ -5086,8 +5122,8 @@ static void test_dynamic_kick_and_cancel(int kvm_fd)
 		TEST_ASSERT_EQ(completion.request_sequence,
 			       command.request_sequence);
 		if (cancel_status == KVM_EXEC_CANCEL_ACCEPTED) {
-			TEST_ASSERT_EQ(completion.status,
-				       KVM_EXEC_COMPLETE_CANCELLED_BEFORE_APPLY);
+			assert_dispatch_cancelled(&completion, timings);
+			cancellations++;
 		} else {
 			TEST_ASSERT_EQ(cancel_status, KVM_EXEC_CANCEL_APPLIED);
 			TEST_ASSERT_EQ(completion.status,
@@ -5110,7 +5146,12 @@ static void test_dynamic_kick_and_cancel(int kvm_fd)
 	TEST_ASSERT_EQ(run_arg.run.owned_capsule_id, 41);
 	TEST_ASSERT_EQ(mapping.header->kernel_kick_count, 133);
 
-	munmap(mapping.header, KVM_EXEC_DISPATCH_MMAP_SIZE);
+	query.domain_generation = domain_generation;
+	query.executor_generation = executor_generation;
+	TEST_ASSERT(!ioctl(run_arg.executor_fd, KVM_EXEC_QUERY_EXECUTOR, &query),
+		    "executor query failed, errno: %d", errno);
+	TEST_ASSERT_EQ(query.cancelled_count, cancellations);
+	munmap(mapping.header, mapping_size);
 	close(run_arg.executor_fd);
 	detach_vcpu(domain_fd, 41, 7);
 	close(domain_fd);
@@ -8093,7 +8134,8 @@ int main(int argc, char **argv)
 		      KVM_EXEC_FEATURE_INTERRUPT_RESULT));
 	if (argc == 2 && !strcmp(argv[1], "--dynamic-kick-cancel-only")) {
 		test_dynamic_return_kick(kvm_fd);
-		test_dynamic_kick_and_cancel(kvm_fd);
+		test_dynamic_kick_and_cancel(kvm_fd, false);
+		test_dynamic_kick_and_cancel(kvm_fd, true);
 		close(kvm_fd);
 		return 0;
 	}
@@ -8241,7 +8283,8 @@ int main(int argc, char **argv)
 	test_trace_signal_releases_references(kvm_fd, true);
 	test_halted_trace_pause_and_drain(kvm_fd);
 	test_dynamic_return_kick(kvm_fd);
-	test_dynamic_kick_and_cancel(kvm_fd);
+	test_dynamic_kick_and_cancel(kvm_fd, false);
+	test_dynamic_kick_and_cancel(kvm_fd, true);
 	test_dynamic_ring_backpressure_and_corruption(kvm_fd);
 	test_dynamic_synchronous_exits(kvm_fd);
 	test_sync_exit_kick_preserves_completion(kvm_fd);
