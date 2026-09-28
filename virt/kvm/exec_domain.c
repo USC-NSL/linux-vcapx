@@ -1226,11 +1226,16 @@ static int kvm_exec_detach_vcpu(struct kvm_exec_domain *domain,
 
 	if (copy_from_user(&detach, argp, sizeof(detach)))
 		return -EFAULT;
-	if (detach.size != sizeof(detach) || detach.flags ||
+	if (detach.size != sizeof(detach) ||
+	    (detach.flags & ~KVM_EXEC_DETACH_F_DISCARD) ||
 	    !detach.capsule_id || !detach.lifecycle_generation ||
 	    detach.capsule_id > ULONG_MAX ||
 	    memchr_inv(detach.reserved, 0, sizeof(detach.reserved)))
 		return -EINVAL;
+
+	if ((detach.flags & KVM_EXEC_DETACH_F_DISCARD) &&
+	    !(domain->negotiated_features & KVM_EXEC_FEATURE_PORTABLE_EXITS))
+		return -EOPNOTSUPP;
 
 	mutex_lock(&domain->lock);
 	if (domain->stopping) {
@@ -1247,9 +1252,10 @@ static int kvm_exec_detach_vcpu(struct kvm_exec_domain *domain,
 		goto out;
 	}
 	if (capsule->owner || capsule->running || capsule->trace_refs ||
-	    capsule->exit.completion_pending ||
 	    kvm_exec_entry_unobserved(capsule) ||
-	    (capsule->portable && capsule->portable->service_pending)) {
+	    (!(detach.flags & KVM_EXEC_DETACH_F_DISCARD) &&
+	     (capsule->exit.completion_pending ||
+	      (capsule->portable && capsule->portable->service_pending)))) {
 		ret = -EBUSY;
 		goto out;
 	}
@@ -1267,6 +1273,10 @@ static int kvm_exec_detach_vcpu(struct kvm_exec_domain *domain,
 			goto out;
 		}
 	}
+	/*
+	 * Discard removes domain authority, never retires or fabricates I/O.
+	 * The departing vCPU retains its native continuation until destruction.
+	 */
 	capsule->vcpu->exec_capsule = NULL;
 	capsule->vcpu->exec_native_completion = NULL;
 	mutex_unlock(&capsule->vcpu->mutex);

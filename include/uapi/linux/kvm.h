@@ -987,7 +987,7 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_CMD_F_SET_ENTRY		(1U << 2)
 #define KVM_EXEC_CMD_F_CONTINUE_ENTRY	(1U << 3)
 
-#define KVM_EXEC_PORTABLE_ABI_VERSION	1U
+#define KVM_EXEC_PORTABLE_ABI_VERSION	2U
 #define KVM_EXEC_CAPSULE_CONTROL_SIZE	128U
 #define KVM_EXEC_CAPSULE_ENTRY_CONTROL_SIZE 256U
 #define KVM_EXEC_ENTRY_STATE_SIZE	640U
@@ -1169,6 +1169,9 @@ struct kvm_exec_attach_vcpu {
 	__u64 lifecycle_generation;
 	__u64 reserved[4];
 };
+
+/* Terminal removal only; pending native I/O stays with the departing vCPU. */
+#define KVM_EXEC_DETACH_F_DISCARD (1U << 0)
 
 struct kvm_exec_detach_vcpu {
 	__u32 size;
