@@ -328,6 +328,8 @@ struct kvm_exec_native_completion {
 	int result;
 	bool attempted;
 	bool fault;
+	bool entry_pending;
+	bool entry_attempted;
 };
 
 struct kvm_vcpu {
@@ -1500,6 +1502,11 @@ bool kvm_arch_vcpu_exec_copy_pio_data(struct kvm_vcpu *vcpu, void *data,
 void kvm_arch_vcpu_exec_write_pio_data(struct kvm_vcpu *vcpu, const void *data,
 				       size_t len);
 bool kvm_arch_vcpu_exec_portable_supported(struct kvm_vcpu *vcpu);
+int kvm_arch_vcpu_exec_validate_entry(struct kvm_vcpu *vcpu,
+				     const struct kvm_exec_entry_state *state);
+int kvm_arch_vcpu_exec_apply_entry(struct kvm_vcpu *vcpu,
+				  const struct kvm_exec_entry_state *state);
+int kvm_exec_vcpu_apply_entry(struct kvm_vcpu *vcpu);
 u64 kvm_arch_exec_supported_features(void);
 int kvm_arch_vcpu_exec_inject_interrupt(struct kvm_vcpu *vcpu, u32 vector);
 bool kvm_arch_vcpu_exec_direct_pending(struct kvm_vcpu *vcpu, u32 vector);

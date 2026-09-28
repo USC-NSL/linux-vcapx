@@ -11388,8 +11388,12 @@ bool kvm_arch_vcpu_exec_portable_supported(struct kvm_vcpu *vcpu)
 
 u64 kvm_arch_exec_supported_features(void)
 {
-	return static_call(kvm_x86_exec_posted_interrupt_supported)() ?
+	u64 features = static_call(kvm_x86_exec_posted_interrupt_supported)() ?
 		KVM_EXEC_FEATURE_POSTED_INTERRUPT_DELIVERY : 0;
+
+	if (IS_ENABLED(CONFIG_X86_64) && cpu_feature_enabled(X86_FEATURE_FXSR))
+		features |= KVM_EXEC_FEATURE_ENTRY_STATE_X86;
+	return features;
 }
 
 int kvm_arch_vcpu_exec_inject_interrupt(struct kvm_vcpu *vcpu, u32 vector)
@@ -11655,6 +11659,13 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
 		goto out;
 	}
 
+	if (unlikely(vcpu->exec_native_completion &&
+		     READ_ONCE(vcpu->exec_native_completion->entry_pending))) {
+		r = kvm_exec_vcpu_apply_entry(vcpu);
+		if (r)
+			goto out;
+	}
+
 	r = static_call(kvm_x86_vcpu_pre_run)(vcpu);
 	if (r <= 0)
 		goto out;
@@ -11717,7 +11728,7 @@ int kvm_arch_vcpu_ioctl_get_regs(struct kvm_vcpu *vcpu, struct kvm_regs *regs)
 	return 0;
 }
 
-static void __set_regs(struct kvm_vcpu *vcpu, struct kvm_regs *regs)
+static void __set_regs_common(struct kvm_vcpu *vcpu, const struct kvm_regs *regs)
 {
 	vcpu->arch.emulate_regs_need_sync_from_vcpu = true;
 	vcpu->arch.emulate_regs_need_sync_to_vcpu = false;
@@ -11743,11 +11754,59 @@ static void __set_regs(struct kvm_vcpu *vcpu, struct kvm_regs *regs)
 
 	kvm_rip_write(vcpu, regs->rip);
 	kvm_set_rflags(vcpu, regs->rflags | X86_EFLAGS_FIXED);
+}
 
+static void __set_regs(struct kvm_vcpu *vcpu, struct kvm_regs *regs)
+{
+	__set_regs_common(vcpu, regs);
 	vcpu->arch.exception.pending = false;
 	vcpu->arch.exception_vmexit.pending = false;
 
 	kvm_make_request(KVM_REQ_EVENT, vcpu);
+}
+
+int kvm_arch_vcpu_exec_validate_entry(struct kvm_vcpu *vcpu,
+				     const struct kvm_exec_entry_state *state)
+{
+	const struct kvm_fpu *fpu = (const void *)state->legacy_fpu;
+
+	if (!IS_ENABLED(CONFIG_X86_64) ||
+	    !kvm_arch_vcpu_exec_domain_supported(vcpu) ||
+	    !kvm_arch_vcpu_exec_portable_supported(vcpu))
+		return -EOPNOTSUPP;
+	if (!state->groups || state->groups &
+	    ~(KVM_EXEC_ENTRY_GROUP_GPRS | KVM_EXEC_ENTRY_GROUP_LEGACY_FPU))
+		return -EINVAL;
+	if (state->groups & KVM_EXEC_ENTRY_GROUP_LEGACY_FPU) {
+		if (!cpu_feature_enabled(X86_FEATURE_FXSR))
+			return -EOPNOTSUPP;
+		if (fpu->pad1 || fpu->mxcsr || fpu->pad2)
+			return -EINVAL;
+	}
+	return 0;
+}
+
+/* Called after native I/O completion with the vCPU and guest FPU loaded. */
+int kvm_arch_vcpu_exec_apply_entry(struct kvm_vcpu *vcpu,
+				  const struct kvm_exec_entry_state *state)
+{
+	if (!kvm_arch_vcpu_exec_domain_supported(vcpu) ||
+	    !kvm_arch_vcpu_exec_portable_supported(vcpu))
+		return -EOPNOTSUPP;
+	if (vcpu->arch.exception.pending || vcpu->arch.exception.injected ||
+	    vcpu->arch.exception_vmexit.pending ||
+	    vcpu->arch.mp_state != KVM_MP_STATE_RUNNABLE ||
+	    kvm_apic_has_pending_init_or_sipi(vcpu))
+		return -ECANCELED;
+	if ((state->groups & KVM_EXEC_ENTRY_GROUP_LEGACY_FPU) &&
+	    !fpu_update_guest_legacy_state(&vcpu->arch.guest_fpu,
+					 (const void *)state->legacy_fpu))
+		return -EIO;
+	if (state->groups & KVM_EXEC_ENTRY_GROUP_GPRS) {
+		__set_regs_common(vcpu, (const void *)state->gprs);
+		kvm_make_request(KVM_REQ_EVENT, vcpu);
+	}
+	return 0;
 }
 
 int kvm_arch_vcpu_ioctl_set_regs(struct kvm_vcpu *vcpu, struct kvm_regs *regs)

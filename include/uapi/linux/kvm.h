@@ -1183,7 +1183,25 @@ struct kvm_exec_create_executor {
 	__u32 reserved0;
 	__u64 executor_cookie;
 	__u64 executor_generation;
-	__u64 reserved[4];
+	/* Zero input; returned only when ENTRY_STATE_X86 is negotiated. */
+	__u64 entry_mmap_size;
+	__u64 entry_state_offset;
+	__u64 entry_state_stride;
+	__u64 reserved;
+};
+
+/* Discard only an unapplied intent.  phase reports its resulting/terminal state. */
+struct kvm_exec_discard_entry {
+	__u32 size;
+	__u32 flags;
+	__u64 domain_generation;
+	__u64 capsule_id;
+	__u64 lifecycle_generation;
+	__u64 executor_generation;
+	__u64 command_sequence;
+	__u32 phase;
+	__u32 reserved0;
+	__u64 reserved;
 };
 
 struct kvm_exec_domain_control {
@@ -1828,6 +1846,8 @@ struct kvm_exec_query_interrupt_publication {
 #define KVM_EXEC_INTERRUPT_RESULT \
 				_IOWR(KVMIO, 0xed, \
 				      struct kvm_exec_interrupt_result)
+#define KVM_EXEC_DISCARD_ENTRY \
+				_IOWR(KVMIO, 0xee, struct kvm_exec_discard_entry)
 
 /*
  * Extension capability list.

@@ -117,6 +117,17 @@ struct kvm_exec_exit_state {
 	bool async_reentry_required;
 };
 
+struct kvm_exec_entry_record {
+	struct kvm_exec_entry_state state;
+	u64 revision;
+	u64 executor_generation;
+	u64 command_sequence;
+	u64 applied_groups;
+	u32 phase;
+	int error;
+	bool authorized;
+};
+
 /* Allocated at attachment only for the negotiated portable protocol. */
 struct kvm_exec_portable_state {
 	struct kvm_exec_capsule_status *control;
@@ -129,6 +140,7 @@ struct kvm_exec_portable_state {
 	u8 metadata[256];
 	struct kvm_exec_capsule_response response;
 	struct kvm_exec_native_completion native_completion;
+	struct kvm_exec_entry_record *entry;
 	bool service_pending;
 	bool blocked;
 };
@@ -337,11 +349,78 @@ kvm_exec_current_capsule(struct kvm_exec_executor *executor)
 static bool kvm_exec_portable_advance(struct kvm_exec_capsule *capsule);
 static void kvm_exec_publish_capsule_status(struct kvm_exec_capsule *capsule);
 
+static bool kvm_exec_entry_pending(struct kvm_exec_capsule *capsule)
+{
+	return capsule->portable &&
+	       READ_ONCE(capsule->portable->native_completion.entry_pending);
+}
+
+static void kvm_exec_publish_entry(struct kvm_exec_capsule *capsule)
+{
+	struct kvm_exec_entry_record *entry = capsule->portable->entry;
+	struct kvm_exec_entry_progress *progress =
+		(void *)capsule->portable->control + KVM_EXEC_CAPSULE_CONTROL_SIZE;
+
+	/* The domain lock or exclusive running ownership serializes this writer. */
+	if (entry->revision > U64_MAX - 2) {
+		WRITE_ONCE(progress->revision, U64_MAX);
+		return;
+	}
+	WRITE_ONCE(progress->revision, entry->revision + 1);
+	/* Invalidate the old snapshot before changing any progress word. */
+	smp_wmb();
+	WRITE_ONCE(progress->executor_generation, entry->executor_generation);
+	WRITE_ONCE(progress->command_sequence, entry->command_sequence);
+	WRITE_ONCE(progress->lifecycle_generation, capsule->lifecycle_generation);
+	WRITE_ONCE(progress->boundary_epoch, capsule->portable->boundary_epoch);
+	WRITE_ONCE(progress->exit_sequence, capsule->exit.sequence);
+	WRITE_ONCE(progress->phase, entry->phase);
+	WRITE_ONCE(progress->error, entry->error);
+	WRITE_ONCE(progress->applied_groups, entry->applied_groups);
+	entry->revision += 2;
+	/* Pairs with the ticket observer's acquire snapshot revision. */
+	smp_store_release(&progress->revision, entry->revision);
+}
+
+static bool kvm_exec_entry_unobserved(struct kvm_exec_capsule *capsule)
+{
+	struct kvm_exec_entry_record *entry;
+	struct kvm_exec_entry_observation *observation;
+
+	if (!capsule->portable || !capsule->portable->entry)
+		return false;
+	entry = capsule->portable->entry;
+	if (READ_ONCE(entry->phase) == KVM_EXEC_ENTRY_PHASE_NONE)
+		return false;
+	if (kvm_exec_entry_pending(capsule))
+		return true;
+	observation = (void *)capsule->portable->control +
+		KVM_EXEC_CAPSULE_CONTROL_SIZE + sizeof(struct kvm_exec_entry_progress);
+	/* Pairs with terminal observation publication by the unique ticket owner. */
+	return smp_load_acquire(&observation->command_sequence) != entry->command_sequence ||
+	       READ_ONCE(observation->executor_generation) != entry->executor_generation ||
+	       READ_ONCE(observation->lifecycle_generation) != capsule->lifecycle_generation;
+}
+
+static void kvm_exec_free_capsule(struct kvm_exec_capsule *capsule)
+{
+	if (!capsule)
+		return;
+	if (capsule->portable)
+		kfree(capsule->portable->entry);
+	kfree(capsule->portable);
+	kfree(capsule);
+}
+
 static void kvm_exec_portable_release(struct kvm_exec_capsule *capsule, bool observe)
 {
 	if (!capsule->portable)
 		return;
 	kvm_exec_portable_advance(capsule);
+	if (kvm_exec_entry_pending(capsule)) {
+		capsule->portable->entry->authorized = false;
+		kvm_exec_publish_entry(capsule);
+	}
 	if (observe || capsule->portable->service_pending ||
 	    capsule->exit.completion_pending)
 		kvm_exec_publish_capsule_status(capsule);
@@ -388,6 +467,8 @@ static bool kvm_exec_tsc_timing_enabled(struct kvm_exec_executor *executor)
 
 static size_t kvm_exec_dispatch_region_size(struct kvm_exec_executor *executor)
 {
+	if (executor->domain->negotiated_features & KVM_EXEC_FEATURE_ENTRY_STATE_X86)
+		return KVM_EXEC_ENTRY_STATE_MMAP_SIZE;
 	return kvm_exec_tsc_timing_enabled(executor) ?
 		KVM_EXEC_TSC_TIMING_MMAP_SIZE : KVM_EXEC_DISPATCH_MMAP_SIZE;
 }
@@ -508,6 +589,18 @@ bool __weak kvm_arch_vcpu_exec_portable_supported(struct kvm_vcpu *vcpu)
 	return false;
 }
 
+int __weak kvm_arch_vcpu_exec_validate_entry(struct kvm_vcpu *vcpu,
+					    const struct kvm_exec_entry_state *state)
+{
+	return -EOPNOTSUPP;
+}
+
+int __weak kvm_arch_vcpu_exec_apply_entry(struct kvm_vcpu *vcpu,
+					 const struct kvm_exec_entry_state *state)
+{
+	return -EOPNOTSUPP;
+}
+
 u64 __weak kvm_arch_exec_supported_features(void)
 {
 	return 0;
@@ -607,6 +700,7 @@ bool kvm_exec_domain_vcpu_ioctl_allowed(struct kvm_vcpu *vcpu,
 
 	return READ_ONCE(capsule->domain->paused) &&
 	       !READ_ONCE(capsule->exit.completion_pending) &&
+	       !kvm_exec_entry_unobserved(capsule) &&
 	       (!capsule->portable ||
 		!READ_ONCE(capsule->portable->service_pending));
 }
@@ -643,11 +737,73 @@ static int kvm_exec_vcpu_run(struct kvm_exec_capsule *capsule,
 	u64 start_tsc = kvm_arch_exec_host_tsc_accounting();
 	int ret;
 
-	if (capsule->portable)
+	if (capsule->portable) {
 		capsule->portable->native_completion.attempted = false;
+		capsule->portable->native_completion.entry_attempted = false;
+	}
 	ret = kvm_vcpu_run(capsule->vcpu);
 	*runtime_cycles = kvm_arch_exec_host_tsc_accounting() - start_tsc;
 	return ret;
+}
+
+int kvm_exec_vcpu_apply_entry(struct kvm_vcpu *vcpu)
+{
+	struct kvm_exec_capsule *capsule = vcpu->exec_capsule;
+	struct kvm_exec_entry_record *entry = capsule->portable->entry;
+	int ret;
+
+	/* Admission retained the image; running ownership excludes every writer. */
+	if (signal_pending(current) || READ_ONCE(vcpu->run->immediate_exit) ||
+	    READ_ONCE(capsule->domain->paused) || READ_ONCE(capsule->domain->stopping) ||
+	    kvm_test_request(KVM_REQ_EXEC_DOMAIN_EXIT, vcpu))
+		return -EINTR;
+	if (WARN_ON_ONCE(!entry->authorized))
+		return -EIO;
+	if (entry->revision > U64_MAX - 4)
+		return -EOVERFLOW;
+	capsule->portable->native_completion.entry_attempted = true;
+	ret = kvm_arch_vcpu_exec_apply_entry(vcpu, &entry->state);
+	if (!ret) {
+		entry->applied_groups = entry->state.groups;
+		WRITE_ONCE(entry->phase, KVM_EXEC_ENTRY_PHASE_APPLIED);
+	} else {
+		WRITE_ONCE(entry->phase, ret == -ECANCELED ?
+			   KVM_EXEC_ENTRY_PHASE_BLOCKED : KVM_EXEC_ENTRY_PHASE_FAILED);
+	}
+	entry->error = ret;
+	entry->authorized = false;
+	WRITE_ONCE(capsule->portable->native_completion.entry_pending, false);
+	kvm_exec_publish_entry(capsule);
+	return ret;
+}
+
+static void kvm_exec_entry_after_run(struct kvm_exec_capsule *capsule,
+				    int result, bool valid_exit)
+{
+	struct kvm_exec_entry_record *entry;
+	struct kvm_exec_native_completion *native;
+
+	if (!kvm_exec_entry_pending(capsule))
+		return;
+	entry = capsule->portable->entry;
+	native = &capsule->portable->native_completion;
+	entry->authorized = false;
+	entry->error = result;
+	if ((native->attempted && native->fault) ||
+	    (valid_exit && capsule->portable->blocked)) {
+		entry->phase = KVM_EXEC_ENTRY_PHASE_BLOCKED;
+		native->entry_pending = false;
+	} else if (valid_exit && capsule->portable->service_pending) {
+		entry->phase = KVM_EXEC_ENTRY_PHASE_NEEDS_SERVICE;
+	} else if (result == -EINTR || result == -EAGAIN) {
+		entry->phase = KVM_EXEC_ENTRY_PHASE_INTERRUPTED;
+	} else {
+		entry->phase = KVM_EXEC_ENTRY_PHASE_FAILED;
+		native->entry_pending = false;
+		capsule->portable->blocked = true;
+	}
+	kvm_exec_publish_entry(capsule);
+	kvm_exec_publish_capsule_status(capsule);
 }
 
 static void kvm_exec_account_run(struct kvm_exec_executor *executor,
@@ -689,6 +845,7 @@ static bool kvm_exec_has_pending_exit_locked(struct kvm_exec_domain *domain)
 	xa_for_each(&domain->capsules, index, capsule) {
 		if (capsule->vcpu &&
 		    (capsule->exit.completion_pending ||
+		     kvm_exec_entry_unobserved(capsule) ||
 		     (capsule->portable && capsule->portable->service_pending)))
 			return true;
 	}
@@ -843,6 +1000,8 @@ static void kvm_exec_publish_capsule_status(struct kvm_exec_capsule *capsule)
 		flags |= KVM_EXEC_CAPSULE_F_STOPPED;
 	if (portable->blocked || !capsule->vcpu)
 		flags |= KVM_EXEC_CAPSULE_F_BLOCKED;
+	if (kvm_exec_entry_pending(capsule))
+		flags |= KVM_EXEC_CAPSULE_F_ENTRY_PENDING;
 
 	if (portable->revision > U64_MAX - 2) {
 		/* An exhausted snapshot stays invalid; it must never alias an old one. */
@@ -933,6 +1092,14 @@ static int kvm_exec_attach_vcpu(struct kvm_exec_domain *domain,
 			}
 			new_capsule->portable->control = domain->control_region +
 				domain->nr_capsule_slots * domain->control_stride;
+			if (domain->negotiated_features & KVM_EXEC_FEATURE_ENTRY_STATE_X86) {
+				new_capsule->portable->entry = kzalloc(
+					sizeof(*new_capsule->portable->entry), GFP_KERNEL_ACCOUNT);
+				if (!new_capsule->portable->entry) {
+					ret = -ENOMEM;
+					goto out_unlock;
+				}
+			}
 		}
 		ret = xa_err(xa_store(&domain->capsules, attach.capsule_id,
 				      new_capsule, GFP_KERNEL_ACCOUNT));
@@ -986,6 +1153,18 @@ static int kvm_exec_attach_vcpu(struct kvm_exec_domain *domain,
 			capsule->portable->resolved_sequence = 0;
 			capsule->portable->service_pending = false;
 			capsule->portable->blocked = false;
+			capsule->portable->native_completion.entry_pending = false;
+			if (capsule->portable->entry) {
+				struct kvm_exec_entry_record *entry = capsule->portable->entry;
+
+				entry->phase = KVM_EXEC_ENTRY_PHASE_NONE;
+				entry->executor_generation = 0;
+				entry->command_sequence = 0;
+				entry->applied_groups = 0;
+				entry->error = 0;
+				entry->authorized = false;
+				kvm_exec_publish_entry(capsule);
+			}
 			kvm_exec_publish_capsule_status(capsule);
 		}
 		ret = 0;
@@ -999,13 +1178,10 @@ out_unlock:
 	if (ret && inserted_slot) {
 		xa_erase(&domain->capsules, attach.capsule_id);
 		domain->nr_capsule_slots--;
-		kfree(capsule->portable);
-		kfree(capsule);
+		kvm_exec_free_capsule(capsule);
 	}
 	mutex_unlock(&domain->lock);
-	if (new_capsule)
-		kfree(new_capsule->portable);
-	kfree(new_capsule);
+	kvm_exec_free_capsule(new_capsule);
 out_file:
 	if (vcpu_file)
 		fput(vcpu_file);
@@ -1044,6 +1220,7 @@ static int kvm_exec_detach_vcpu(struct kvm_exec_domain *domain,
 	}
 	if (capsule->owner || capsule->running || capsule->trace_refs ||
 	    capsule->exit.completion_pending ||
+	    kvm_exec_entry_unobserved(capsule) ||
 	    (capsule->portable && capsule->portable->service_pending)) {
 		ret = -EBUSY;
 		goto out;
@@ -1152,10 +1329,8 @@ static void kvm_exec_domain_free(struct kref *kref)
 	struct kvm_exec_capsule *capsule;
 	unsigned long index;
 
-	xa_for_each(&domain->capsules, index, capsule) {
-		kfree(capsule->portable);
-		kfree(capsule);
-	}
+	xa_for_each(&domain->capsules, index, capsule)
+		kvm_exec_free_capsule(capsule);
 	xa_destroy(&domain->capsules);
 	vfree(domain->control_region);
 	put_cred(domain->cred);
@@ -1233,7 +1408,8 @@ static int kvm_exec_create_executor(struct kvm_exec_domain *domain,
 		return -EFAULT;
 	if (create.size != sizeof(create) ||
 	    create.flags & ~KVM_EXECUTOR_F_STRICT_CPU || create.reserved0 ||
-	    memchr_inv(create.reserved, 0, sizeof(create.reserved)) ||
+	    create.entry_mmap_size || create.entry_state_offset ||
+	    create.entry_state_stride || create.reserved ||
 	    ((create.flags & KVM_EXECUTOR_F_STRICT_CPU) &&
 	     create.requested_cpu == KVM_EXEC_CPU_ANY) ||
 	    (create.requested_cpu != KVM_EXEC_CPU_ANY &&
@@ -1313,6 +1489,11 @@ static int kvm_exec_create_executor(struct kvm_exec_domain *domain,
 		goto out_file;
 
 	create.executor_generation = executor->generation;
+	if (domain->negotiated_features & KVM_EXEC_FEATURE_ENTRY_STATE_X86) {
+		create.entry_mmap_size = kvm_exec_dispatch_region_size(executor);
+		create.entry_state_offset = KVM_EXEC_ENTRY_STATE_OFFSET;
+		create.entry_state_stride = KVM_EXEC_ENTRY_STATE_SIZE;
+	}
 	if (copy_to_user(argp, &create, sizeof(create))) {
 		ret = -EFAULT;
 		goto out_file;
@@ -1901,19 +2082,32 @@ static int kvm_exec_dispatch_ring_state(struct kvm_exec_executor *executor,
 	return 0;
 }
 
+static bool kvm_exec_entry_command_supported(struct kvm_exec_domain *domain,
+					     const struct kvm_exec_command *command)
+{
+	return !(command->flags & (KVM_EXEC_CMD_F_SET_ENTRY | KVM_EXEC_CMD_F_CONTINUE_ENTRY)) ||
+	       (domain->negotiated_features & KVM_EXEC_FEATURE_ENTRY_STATE_X86);
+}
+
 static bool kvm_exec_dispatch_command_shape_valid(struct kvm_exec_command *cmd)
 {
 	u64 gate_mask;
 
 	if (cmd->size != sizeof(*cmd) ||
 	    cmd->flags & ~(KVM_EXEC_CMD_F_PIO_WRITE_GATE |
-			   KVM_EXEC_CMD_F_GUARDED_TARGET) ||
+			   KVM_EXEC_CMD_F_GUARDED_TARGET | KVM_EXEC_CMD_F_SET_ENTRY |
+			   KVM_EXEC_CMD_F_CONTINUE_ENTRY) ||
 	    !cmd->request_sequence ||
 	    memchr_inv(cmd->reserved0, 0, sizeof(cmd->reserved0)) ||
 	    (!(cmd->flags & KVM_EXEC_CMD_F_GUARDED_TARGET) && cmd->reserved))
 		return false;
 	if ((cmd->flags & KVM_EXEC_CMD_F_GUARDED_TARGET) &&
 	    (cmd->opcode != KVM_EXEC_CMD_SWITCH || !cmd->reserved))
+		return false;
+	if ((cmd->flags & (KVM_EXEC_CMD_F_SET_ENTRY | KVM_EXEC_CMD_F_CONTINUE_ENTRY)) &&
+	    (!(cmd->flags & KVM_EXEC_CMD_F_GUARDED_TARGET) ||
+	     (cmd->flags & (KVM_EXEC_CMD_F_SET_ENTRY | KVM_EXEC_CMD_F_CONTINUE_ENTRY)) ==
+	     (KVM_EXEC_CMD_F_SET_ENTRY | KVM_EXEC_CMD_F_CONTINUE_ENTRY)))
 		return false;
 	if (!!cmd->expected_current_id != !!cmd->expected_current_generation)
 		return false;
@@ -2009,6 +2203,7 @@ static int kvm_exec_async_handoff_ready(struct kvm_exec_executor *executor)
 		[executor->command_head % KVM_EXEC_DISPATCH_RING_ENTRIES],
 	       sizeof(command));
 	if (!kvm_exec_dispatch_command_shape_valid(&command) ||
+	    !kvm_exec_entry_command_supported(domain, &command) ||
 	    command.domain_generation != domain->generation ||
 	    command.executor_generation != executor->generation ||
 	    ((command.flags & KVM_EXEC_CMD_F_GUARDED_TARGET) &&
@@ -2313,6 +2508,75 @@ static void kvm_exec_portable_accept(struct kvm_exec_capsule *capsule)
 	capsule->exit.async_reentry_required = false;
 }
 
+static int kvm_exec_entry_preflight(struct kvm_exec_executor *executor,
+				    struct kvm_exec_capsule *capsule,
+				    const struct kvm_exec_command *command, u32 slot)
+{
+	struct kvm_exec_entry_record *entry = capsule->portable->entry;
+	struct kvm_exec_entry_state *shared;
+	struct {
+		u64 command_sequence, capsule_id, lifecycle_generation, boundary_epoch;
+		u64 groups, origin_executor_generation, origin_command_sequence, reserved;
+	} header;
+
+	if (!(command->flags & (KVM_EXEC_CMD_F_SET_ENTRY | KVM_EXEC_CMD_F_CONTINUE_ENTRY)))
+		return kvm_exec_entry_pending(capsule) ? -EINPROGRESS : 0;
+	if (!entry || entry->revision > U64_MAX - 4)
+		return -EOVERFLOW;
+	shared = executor->dispatch_region + KVM_EXEC_ENTRY_STATE_OFFSET +
+		slot * KVM_EXEC_ENTRY_STATE_SIZE;
+	static_assert(sizeof(header) == offsetof(struct kvm_exec_entry_state, gprs));
+	memcpy(&header, shared, sizeof(header));
+	if (header.command_sequence != command->request_sequence ||
+	    header.capsule_id != capsule->capsule_id ||
+	    header.lifecycle_generation != capsule->lifecycle_generation ||
+	    header.boundary_epoch != command->reserved || header.reserved)
+		return -EINVAL;
+	if (command->flags & KVM_EXEC_CMD_F_CONTINUE_ENTRY) {
+		if (!kvm_exec_entry_pending(capsule) || header.groups ||
+		    header.origin_executor_generation != entry->executor_generation ||
+		    header.origin_command_sequence != entry->command_sequence)
+			return -ESTALE;
+		return 0;
+	}
+	if (kvm_exec_entry_pending(capsule))
+		return -EINPROGRESS;
+	if (kvm_exec_entry_unobserved(capsule))
+		return -EBUSY;
+	if (header.origin_executor_generation || header.origin_command_sequence ||
+	    !header.groups || header.groups &
+	    ~(KVM_EXEC_ENTRY_GROUP_GPRS | KVM_EXEC_ENTRY_GROUP_LEGACY_FPU) ||
+	    memchr_inv(shared->reserved, 0, sizeof(shared->reserved)))
+		return -EINVAL;
+	/* Provisional bytes are cold storage, not an admitted intent or vCPU state. */
+	entry->state.groups = header.groups;
+	if (header.groups & KVM_EXEC_ENTRY_GROUP_GPRS)
+		memcpy(entry->state.gprs, shared->gprs, sizeof(shared->gprs));
+	if (header.groups & KVM_EXEC_ENTRY_GROUP_LEGACY_FPU)
+		memcpy(entry->state.legacy_fpu, shared->legacy_fpu, sizeof(shared->legacy_fpu));
+	return kvm_arch_vcpu_exec_validate_entry(capsule->vcpu, &entry->state);
+}
+
+static void kvm_exec_entry_admit(struct kvm_exec_capsule *capsule,
+				 const struct kvm_exec_command *command)
+{
+	struct kvm_exec_entry_record *entry = capsule->portable->entry;
+
+	if (!(command->flags & (KVM_EXEC_CMD_F_SET_ENTRY | KVM_EXEC_CMD_F_CONTINUE_ENTRY)))
+		return;
+	if (command->flags & KVM_EXEC_CMD_F_SET_ENTRY) {
+		entry->executor_generation = command->executor_generation;
+		entry->command_sequence = command->request_sequence;
+		entry->applied_groups = 0;
+	}
+	entry->phase = KVM_EXEC_ENTRY_PHASE_PENDING;
+	entry->error = 0;
+	entry->authorized = true;
+	capsule->portable->native_completion.entry_pending = true;
+	kvm_exec_publish_entry(capsule);
+	kvm_exec_publish_capsule_status(capsule);
+}
+
 static u64 kvm_exec_next_exit_sequence_locked(struct kvm_exec_capsule *capsule)
 {
 	u64 sequence;
@@ -2581,7 +2845,8 @@ kvm_exec_async_finish_completion_locked(struct kvm_exec_capsule *capsule)
 static bool kvm_exec_async_blocks_entry(struct kvm_exec_capsule *capsule)
 {
 	if (capsule->portable)
-		return capsule->portable->service_pending || capsule->portable->blocked;
+		return capsule->portable->service_pending || capsule->portable->blocked ||
+		       (kvm_exec_entry_pending(capsule) && !capsule->portable->entry->authorized);
 	return capsule->exit.async_request_pending ||
 	       (capsule->exit.async_completion_ready &&
 		!capsule->exit.async_entry_authorized) ||
@@ -2925,6 +3190,7 @@ kvm_exec_dispatch_gate_unsatisfied(struct kvm_exec_executor *executor,
 	if ((domain->negotiated_features & gate_features) != gate_features)
 		return false;
 	if (!kvm_exec_dispatch_command_shape_valid(command) ||
+	    !kvm_exec_entry_command_supported(domain, command) ||
 	    command->domain_generation != domain->generation ||
 	    command->executor_generation != executor->generation ||
 	    ((command->flags & KVM_EXEC_CMD_F_GUARDED_TARGET) &&
@@ -2958,6 +3224,7 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 	struct kvm_exec_capsule *current_capsule, *target = NULL;
 	struct kvm_exec_capsule *superseded_capsule = NULL;
 	bool async_pio_handoff = false, ownership_changed = false;
+	bool retained_slot;
 	bool has_command, completion_full, supersede_interrupt = false;
 	unsigned long flags;
 	u32 timing_slot =
@@ -2983,10 +3250,14 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 		WRITE_ONCE(executor->gated_command_waiting, true);
 		return 0;
 	}
-	executor->command_head++;
-	/* Pairs with userspace's acquire load before reusing this slot. */
-	smp_store_release(&header->command_head, executor->command_head);
-	WRITE_ONCE(header->last_consumed_sequence, command.request_sequence);
+	retained_slot = command.flags &
+		(KVM_EXEC_CMD_F_SET_ENTRY | KVM_EXEC_CMD_F_CONTINUE_ENTRY);
+	if (!retained_slot) {
+		executor->command_head++;
+		/* Pairs with userspace's acquire load before reusing this slot. */
+		smp_store_release(&header->command_head, executor->command_head);
+		WRITE_ONCE(header->last_consumed_sequence, command.request_sequence);
+	}
 
 	*completion = (struct kvm_exec_completion) {
 		.size = sizeof(*completion),
@@ -3008,6 +3279,7 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 				     &status))
 		goto terminal;
 	if (!kvm_exec_dispatch_command_shape_valid(&command) ||
+	    !kvm_exec_entry_command_supported(domain, &command) ||
 	    command.domain_generation != domain->generation ||
 	    command.executor_generation != executor->generation ||
 	    ((command.flags & KVM_EXEC_CMD_F_GUARDED_TARGET) &&
@@ -3097,6 +3369,9 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 				goto terminal_locked;
 			}
 			ret = kvm_exec_portable_preflight(target);
+			if (!ret)
+				ret = kvm_exec_entry_preflight(executor, target,
+							 &command, timing_slot);
 			if (ret) {
 				status = ret == -EAGAIN ? KVM_EXEC_COMPLETE_EXIT_PENDING :
 					 KVM_EXEC_COMPLETE_TARGET_BLOCKED;
@@ -3154,8 +3429,10 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 			kvm_exec_set_current_capsule(executor, target);
 			atomic64_inc(&executor->switch_count);
 		}
-		if (target->portable)
+		if (target->portable) {
 			kvm_exec_portable_accept(target);
+			kvm_exec_entry_admit(target, &command);
+		}
 		if (async_pio_handoff)
 			completion->flags |=
 				KVM_EXEC_COMPLETE_F_ASYNC_PIO_HANDOFF;
@@ -3195,7 +3472,7 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 	    status == KVM_EXEC_COMPLETE_RETURNED)
 		WRITE_ONCE(header->last_applied_sequence,
 			   command.request_sequence);
-	return 1;
+	goto consumed;
 
 terminal_locked:
 	mutex_unlock(&domain->lock);
@@ -3211,6 +3488,13 @@ terminal:
 	kvm_exec_dispatch_owner(executor, completion);
 	mutex_unlock(&domain->lock);
 	kvm_exec_dispatch_finish(executor, command.request_sequence, status);
+consumed:
+	if (retained_slot) {
+		executor->command_head++;
+		/* The sidecar is private or rejected before its slot becomes reusable. */
+		smp_store_release(&header->command_head, executor->command_head);
+		WRITE_ONCE(header->last_consumed_sequence, command.request_sequence);
+	}
 	return 1;
 }
 
@@ -3604,11 +3888,22 @@ static void kvm_exec_dispatch_run_owner(struct kvm_exec_executor *executor,
 	run->owned_capsule_id = capsule->capsule_id;
 	run->owned_lifecycle_generation = capsule->lifecycle_generation;
 	if (capsule->portable) {
-		/* An interruption keeps the existing service identity, even without a callback. */
+		/* The stopped epoch must be visible in entry progress as well. */
 		if (run->return_reason == KVM_EXEC_RETURN_SIGNAL) {
 			kvm_exec_portable_advance(capsule);
 			kvm_exec_publish_capsule_status(capsule);
 		}
+		if (kvm_exec_entry_pending(capsule)) {
+			struct kvm_exec_entry_record *entry = capsule->portable->entry;
+
+			entry->authorized = false;
+			if (entry->phase == KVM_EXEC_ENTRY_PHASE_PENDING) {
+				entry->phase = KVM_EXEC_ENTRY_PHASE_INTERRUPTED;
+				entry->error = run->run_result;
+			}
+			kvm_exec_publish_entry(capsule);
+		}
+		/* An interruption keeps the existing service identity, even without a callback. */
 		run->exit_sequence = capsule->exit.sequence;
 		if (capsule->exit.completion_pending)
 			run->exit_flags = KVM_EXEC_EXIT_F_COMPLETION_PENDING;
@@ -3701,6 +3996,8 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 			goto out_domain;
 		}
 		ret = kvm_exec_portable_preflight(capsule);
+		if (!ret && kvm_exec_entry_pending(capsule))
+			ret = -EINPROGRESS;
 		if (ret)
 			goto out_domain;
 		kvm_exec_portable_accept(capsule);
@@ -4166,6 +4463,7 @@ command_done:
 		if (invalid_completion) {
 			if (capsule->portable) {
 				capsule->portable->blocked = true;
+				kvm_exec_entry_after_run(capsule, run_ret, false);
 				kvm_exec_publish_capsule_status(capsule);
 			}
 			run.return_reason =
@@ -4210,11 +4508,15 @@ command_done:
 			capsule->exit.async_executor_generation = 0;
 		}
 		if (capsule->portable && attempted_kvm_run && !valid_exit &&
-		    run_ret != -EINTR && run_ret != -EAGAIN) {
+		    run_ret != -EINTR && run_ret != -EAGAIN &&
+		    !(run_ret == -ECANCELED &&
+		      capsule->portable->native_completion.entry_attempted)) {
 			capsule->portable->blocked = true;
 			kvm_exec_portable_advance(capsule);
 			kvm_exec_publish_capsule_status(capsule);
 		}
+		if (attempted_kvm_run)
+			kvm_exec_entry_after_run(capsule, run_ret, valid_exit);
 		if (domain->stopping) {
 			kvm_exec_interrupt_abort(executor, false);
 			run.return_reason = KVM_EXEC_RETURN_DOMAIN_STOPPING;
@@ -5995,6 +6297,8 @@ static int kvm_exec_executor_mmap(struct file *file,
 
 	pfn = page_to_pfn(virt_to_page(executor->dispatch_region));
 	vm_flags_set(vma, VM_DONTCOPY | VM_DONTEXPAND | VM_DONTDUMP);
+	if (executor->domain->negotiated_features & KVM_EXEC_FEATURE_ENTRY_STATE_X86)
+		vm_flags_clear(vma, VM_MAYEXEC);
 	vma->vm_ops = &kvm_exec_executor_vm_ops;
 	vma->vm_private_data = executor;
 	kvm_exec_executor_vma_open(vma);
@@ -6115,6 +6419,61 @@ static long kvm_exec_configure_interrupt_delivery(
 	return ret;
 }
 
+static long kvm_exec_discard_entry(struct kvm_exec_domain *domain, void __user *argp)
+{
+	struct kvm_exec_discard_entry discard;
+	struct kvm_exec_entry_record *entry;
+	struct kvm_exec_capsule *capsule;
+	int ret = 0;
+
+	if (!(domain->negotiated_features & KVM_EXEC_FEATURE_ENTRY_STATE_X86))
+		return -EOPNOTSUPP;
+	if (copy_from_user(&discard, argp, sizeof(discard)))
+		return -EFAULT;
+	if (discard.size != sizeof(discard) || discard.flags || discard.phase ||
+	    discard.reserved0 || discard.reserved ||
+	    discard.domain_generation != domain->generation ||
+	    !discard.capsule_id || discard.capsule_id > ULONG_MAX ||
+	    !discard.lifecycle_generation || !discard.executor_generation ||
+	    !discard.command_sequence)
+		return -EINVAL;
+	mutex_lock(&domain->lock);
+	capsule = xa_load(&domain->capsules, discard.capsule_id);
+	if (!capsule || !capsule->vcpu ||
+	    capsule->lifecycle_generation != discard.lifecycle_generation) {
+		ret = -ESTALE;
+		goto out;
+	}
+	if (capsule->running || !mutex_trylock(&capsule->vcpu->mutex)) {
+		ret = -EBUSY;
+		goto out;
+	}
+	entry = capsule->portable->entry;
+	if (entry->executor_generation != discard.executor_generation ||
+	    entry->command_sequence != discard.command_sequence) {
+		ret = -ESTALE;
+	} else if (entry->revision > U64_MAX - 4) {
+		ret = -EOVERFLOW;
+	} else {
+		if (kvm_exec_entry_pending(capsule)) {
+			entry->phase = KVM_EXEC_ENTRY_PHASE_CANCELLED;
+			entry->error = 0;
+			entry->authorized = false;
+			capsule->portable->native_completion.entry_pending = false;
+			kvm_exec_portable_advance(capsule);
+			kvm_exec_publish_entry(capsule);
+			kvm_exec_publish_capsule_status(capsule);
+		}
+		discard.phase = entry->phase;
+	}
+	mutex_unlock(&capsule->vcpu->mutex);
+out:
+	mutex_unlock(&domain->lock);
+	if (ret)
+		return ret;
+	return copy_to_user(argp, &discard, sizeof(discard)) ? -EFAULT : 0;
+}
+
 static long kvm_exec_domain_ioctl(struct file *file, unsigned int ioctl,
 				  unsigned long arg)
 {
@@ -6130,6 +6489,8 @@ static long kvm_exec_domain_ioctl(struct file *file, unsigned int ioctl,
 		return ret;
 
 	switch (ioctl) {
+	case KVM_EXEC_DISCARD_ENTRY:
+		return kvm_exec_discard_entry(domain, argp);
 	case KVM_EXEC_CONFIGURE_INTERRUPT_DELIVERY:
 		return kvm_exec_configure_interrupt_delivery(domain, argp);
 	case KVM_EXEC_ATTACH_VCPU:

@@ -147,6 +147,9 @@ extern u64 xstate_get_guest_group_perm(void);
 extern bool fpu_alloc_guest_fpstate(struct fpu_guest *gfpu);
 extern void fpu_free_guest_fpstate(struct fpu_guest *gfpu);
 extern int fpu_swap_kvm_fpstate(struct fpu_guest *gfpu, bool enter_guest);
+struct kvm_fpu;
+extern bool fpu_update_guest_legacy_state(struct fpu_guest *gfpu,
+					 const struct kvm_fpu *state);
 extern int fpu_enable_guest_xfd_features(struct fpu_guest *guest_fpu, u64 xfeatures);
 
 #ifdef CONFIG_X86_64

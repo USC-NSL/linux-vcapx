@@ -368,6 +368,48 @@ int fpu_swap_kvm_fpstate(struct fpu_guest *guest_fpu, bool enter_guest)
 }
 EXPORT_SYMBOL_GPL(fpu_swap_kvm_fpstate);
 
+/* Replace KVM's legacy group while this task has the guest fpstate loaded. */
+bool fpu_update_guest_legacy_state(struct fpu_guest *gfpu,
+				   const struct kvm_fpu *state)
+{
+	struct fpu *fpu = &current->thread.fpu;
+	struct fpstate *fps = gfpu->fpstate;
+	struct fxregs_state *fx = &fps->regs.fxsave;
+	u64 restore_mask = XFEATURE_MASK_FPSSE;
+
+	fpregs_lock();
+	if (WARN_ON_ONCE(fpu->fpstate != fps || !fps->in_use || fps->is_confidential)) {
+		fpregs_unlock();
+		return false;
+	}
+	if (test_thread_flag(TIF_NEED_FPU_LOAD))
+		restore_mask = XFEATURE_MASK_FPSTATE;
+	else
+		save_fpregs_to_fpstate(fpu);
+
+	if (use_xsave()) {
+		/* Init components may leave stale bytes in an optimized save image. */
+		if (!(fps->regs.xsave.header.xfeatures &
+		      (XFEATURE_MASK_SSE | XFEATURE_MASK_YMM)))
+			fx->mxcsr = MXCSR_DEFAULT;
+		fps->regs.xsave.header.xfeatures |= XFEATURE_MASK_FPSSE;
+	}
+	memcpy(fx->st_space, state->fpr, sizeof(fx->st_space));
+	fx->cwd = state->fcw;
+	fx->swd = state->fsw;
+	fx->twd = state->ftwx;
+	fx->fop = state->last_opcode;
+	fx->rip = state->last_ip;
+	fx->rdp = state->last_dp;
+	memcpy(fx->xmm_space, state->xmm, sizeof(fx->xmm_space));
+	/* MXCSR and every extended component retain their current guest values. */
+	restore_fpregs_from_fpstate(fps, restore_mask);
+	fpregs_mark_activate();
+	fpregs_unlock();
+	return true;
+}
+EXPORT_SYMBOL_GPL(fpu_update_guest_legacy_state);
+
 void fpu_copy_guest_fpstate_to_uabi(struct fpu_guest *gfpu, void *buf,
 				    unsigned int size, u64 xfeatures, u32 pkru)
 {
