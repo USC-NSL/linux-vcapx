@@ -2331,6 +2331,10 @@ static void kvm_exec_portable_capture(struct kvm_exec_capsule *capsule)
 	case KVM_EXIT_INTR:
 		portable->service_pending = false;
 		break;
+	case KVM_EXIT_SET_TPR:
+		/* Unlike other rare exits, SET_TPR uses a field outside the union. */
+		memcpy(portable->metadata, &run->cr8, sizeof(run->cr8));
+		break;
 	default:
 		memcpy(portable->metadata, run->padding,
 		       sizeof(portable->metadata));
@@ -2340,7 +2344,6 @@ static void kvm_exec_portable_capture(struct kvm_exec_capsule *capsule)
 		case KVM_EXIT_X86_WRMSR:
 		case KVM_EXIT_EXCEPTION:
 		case KVM_EXIT_DEBUG:
-		case KVM_EXIT_SET_TPR:
 		case KVM_EXIT_TPR_ACCESS:
 		case KVM_EXIT_IOAPIC_EOI:
 		case KVM_EXIT_DIRTY_RING_FULL:
@@ -2478,7 +2481,11 @@ static int kvm_exec_portable_preflight(struct kvm_exec_capsule *capsule)
 	case KVM_EXIT_XEN:
 		offset = KVM_EXEC_RESULT_OFFSET(xen.u.hcall.result);
 		result_size = len = sizeof(u64);
-		fallthrough;
+		goto rare;
+	case KVM_EXIT_SET_TPR:
+		metadata_valid = !memcmp(portable->metadata, &run->cr8,
+					 sizeof(run->cr8));
+		break;
 	default:
 rare:
 		metadata_valid = kvm_exec_portable_metadata_valid(capsule,
