@@ -3944,7 +3944,7 @@ void kvm_vcpu_kick(struct kvm_vcpu *vcpu)
 	 * within the vCPU thread itself.
 	 */
 	if (vcpu == __this_cpu_read(kvm_running_vcpu)) {
-		if (vcpu->mode == IN_GUEST_MODE)
+		if (READ_ONCE(vcpu->mode) == IN_GUEST_MODE)
 			WRITE_ONCE(vcpu->mode, EXITING_GUEST_MODE);
 		goto out;
 	}

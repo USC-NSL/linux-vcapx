@@ -2147,7 +2147,7 @@ EXPORT_SYMBOL_GPL(kvm_emulate_monitor);
 static inline bool kvm_vcpu_exit_request(struct kvm_vcpu *vcpu)
 {
 	xfer_to_guest_mode_prepare();
-	return vcpu->mode == EXITING_GUEST_MODE || kvm_request_pending(vcpu) ||
+	return READ_ONCE(vcpu->mode) == EXITING_GUEST_MODE || kvm_request_pending(vcpu) ||
 		xfer_to_guest_mode_work_pending();
 }
 
@@ -2276,7 +2276,8 @@ static void update_pvclock_gtod(struct timekeeper *tk)
 	write_seqcount_begin(&vdata->seq);
 
 	/* copy pvclock gtod data */
-	vdata->clock.vclock_mode	= tk->tkr_mono.clock->vdso_clock_mode;
+	/* The mode and boot offset also have standalone scalar readers. */
+	WRITE_ONCE(vdata->clock.vclock_mode, tk->tkr_mono.clock->vdso_clock_mode);
 	vdata->clock.cycle_last		= tk->tkr_mono.cycle_last;
 	vdata->clock.mask		= tk->tkr_mono.mask;
 	vdata->clock.mult		= tk->tkr_mono.mult;
@@ -2294,7 +2295,7 @@ static void update_pvclock_gtod(struct timekeeper *tk)
 
 	vdata->wall_time_sec            = tk->xtime_sec;
 
-	vdata->offs_boot		= tk->offs_boot;
+	WRITE_ONCE(vdata->offs_boot, tk->offs_boot);
 
 	write_seqcount_end(&vdata->seq);
 }
@@ -2302,7 +2303,7 @@ static void update_pvclock_gtod(struct timekeeper *tk)
 static s64 get_kvmclock_base_ns(void)
 {
 	/* Count up from boot time, but with the frequency of the raw clock.  */
-	return ktime_to_ns(ktime_add(ktime_get_raw(), pvclock_gtod_data.offs_boot));
+	return ktime_to_ns(ktime_add(ktime_get_raw(), READ_ONCE(pvclock_gtod_data.offs_boot)));
 }
 #else
 static s64 get_kvmclock_base_ns(void)
@@ -2527,7 +2528,7 @@ static void kvm_track_tsc_matching(struct kvm_vcpu *vcpu, bool new_generation)
 	 */
 	bool use_master_clock = (ka->nr_vcpus_matched_tsc + 1 ==
 				 atomic_read(&vcpu->kvm->online_vcpus)) &&
-				gtod_is_based_on_tsc(gtod->clock.vclock_mode);
+				gtod_is_based_on_tsc(READ_ONCE(gtod->clock.vclock_mode));
 
 	/*
 	 * Request a masterclock update if the masterclock needs to be toggled
@@ -2541,7 +2542,7 @@ static void kvm_track_tsc_matching(struct kvm_vcpu *vcpu, bool new_generation)
 
 	trace_kvm_track_tsc(vcpu->vcpu_id, ka->nr_vcpus_matched_tsc,
 			    atomic_read(&vcpu->kvm->online_vcpus),
-		            ka->use_master_clock, gtod->clock.vclock_mode);
+			    ka->use_master_clock, READ_ONCE(gtod->clock.vclock_mode));
 #endif
 }
 
@@ -2658,7 +2659,7 @@ static inline bool kvm_check_tsc_unstable(void)
 	 * TSC is marked unstable when we're running on Hyper-V,
 	 * 'TSC page' clocksource is good.
 	 */
-	if (pvclock_gtod_data.clock.vclock_mode == VDSO_CLOCKMODE_HVCLOCK)
+	if (READ_ONCE(pvclock_gtod_data.clock.vclock_mode) == VDSO_CLOCKMODE_HVCLOCK)
 		return false;
 #endif
 	return check_tsc_unstable();
@@ -2903,7 +2904,7 @@ static int do_realtime(struct timespec64 *ts, u64 *tsc_timestamp)
 static bool kvm_get_time_and_clockread(s64 *kernel_ns, u64 *tsc_timestamp)
 {
 	/* checked again under seqlock below */
-	if (!gtod_is_based_on_tsc(pvclock_gtod_data.clock.vclock_mode))
+	if (!gtod_is_based_on_tsc(READ_ONCE(pvclock_gtod_data.clock.vclock_mode)))
 		return false;
 
 	return gtod_is_based_on_tsc(do_monotonic_raw(kernel_ns,
@@ -2915,7 +2916,7 @@ static bool kvm_get_walltime_and_clockread(struct timespec64 *ts,
 					   u64 *tsc_timestamp)
 {
 	/* checked again under seqlock below */
-	if (!gtod_is_based_on_tsc(pvclock_gtod_data.clock.vclock_mode))
+	if (!gtod_is_based_on_tsc(READ_ONCE(pvclock_gtod_data.clock.vclock_mode)))
 		return false;
 
 	return gtod_is_based_on_tsc(do_realtime(ts, tsc_timestamp));
@@ -2989,7 +2990,7 @@ static void pvclock_update_vm_gtod_copy(struct kvm *kvm)
 	if (ka->use_master_clock)
 		atomic_set(&kvm_guest_has_master_clock, 1);
 
-	vclock_mode = pvclock_gtod_data.clock.vclock_mode;
+	vclock_mode = READ_ONCE(pvclock_gtod_data.clock.vclock_mode);
 	trace_kvm_update_master_clock(ka->use_master_clock, vclock_mode,
 					vcpus_matched);
 #endif
@@ -10950,7 +10951,7 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
 		static_call_cond(kvm_x86_sync_pir_to_irr)(vcpu);
 
 	if (kvm_vcpu_exit_request(vcpu)) {
-		vcpu->mode = OUTSIDE_GUEST_MODE;
+		WRITE_ONCE(vcpu->mode, OUTSIDE_GUEST_MODE);
 		smp_wmb();
 		local_irq_enable();
 		preempt_enable();
@@ -11035,7 +11036,7 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
 	vcpu->arch.last_vmentry_cpu = vcpu->cpu;
 	vcpu->arch.last_guest_tsc = kvm_read_l1_tsc(vcpu, rdtsc());
 
-	vcpu->mode = OUTSIDE_GUEST_MODE;
+	WRITE_ONCE(vcpu->mode, OUTSIDE_GUEST_MODE);
 	smp_wmb();
 
 	/*

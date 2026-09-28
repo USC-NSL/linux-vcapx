@@ -789,8 +789,8 @@ static void __loaded_vmcs_clear(void *arg)
 
 	if (loaded_vmcs->cpu != cpu)
 		return; /* vcpu migration can race with cpu offline */
-	if (per_cpu(current_vmcs, cpu) == loaded_vmcs->vmcs)
-		per_cpu(current_vmcs, cpu) = NULL;
+	if (READ_ONCE(per_cpu(current_vmcs, cpu)) == loaded_vmcs->vmcs)
+		WRITE_ONCE(per_cpu(current_vmcs, cpu), NULL);
 
 	vmcs_clear(loaded_vmcs->vmcs);
 	if (loaded_vmcs->shadow_vmcs && loaded_vmcs->launched)
@@ -1436,9 +1436,10 @@ void vmx_vcpu_load_vmcs(struct kvm_vcpu *vcpu, int cpu,
 		local_irq_enable();
 	}
 
-	prev = per_cpu(current_vmcs, cpu);
+	/* An IPI can clear the previous vCPU's VMCS while loading this vCPU. */
+	prev = READ_ONCE(per_cpu(current_vmcs, cpu));
 	if (prev != vmx->loaded_vmcs->vmcs) {
-		per_cpu(current_vmcs, cpu) = vmx->loaded_vmcs->vmcs;
+		WRITE_ONCE(per_cpu(current_vmcs, cpu), vmx->loaded_vmcs->vmcs);
 		vmcs_load(vmx->loaded_vmcs->vmcs);
 
 		/*
