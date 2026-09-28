@@ -11373,6 +11373,19 @@ bool kvm_arch_vcpu_exec_copy_pio_data(struct kvm_vcpu *vcpu, void *data,
 	return true;
 }
 
+void kvm_arch_vcpu_exec_write_pio_data(struct kvm_vcpu *vcpu, const void *data,
+				       size_t len)
+{
+	/* The capsule response preflight bounds every input chunk to this page. */
+	memcpy(vcpu->arch.pio_data, data, len);
+}
+
+bool kvm_arch_vcpu_exec_portable_supported(struct kvm_vcpu *vcpu)
+{
+	/* Protected continuations require their own native conformance gates. */
+	return !vcpu->arch.guest_state_protected;
+}
+
 u64 kvm_arch_exec_supported_features(void)
 {
 	return static_call(kvm_x86_exec_posted_interrupt_supported)() ?
@@ -11622,6 +11635,14 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
 		int (*cui)(struct kvm_vcpu *) = vcpu->arch.complete_userspace_io;
 		vcpu->arch.complete_userspace_io = NULL;
 		r = cui(vcpu);
+		if (unlikely(vcpu->exec_native_completion)) {
+			struct kvm_exec_native_completion *completion =
+				vcpu->exec_native_completion;
+
+			completion->result = r;
+			completion->fault = ex->pending || ex->injected;
+			completion->attempted = true;
+		}
 		if (r <= 0)
 			goto out;
 	} else {

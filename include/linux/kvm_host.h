@@ -323,6 +323,13 @@ struct kvm_mmio_fragment {
 
 struct kvm_exec_capsule;
 
+/* Written by native completion under exclusive vCPU execution. */
+struct kvm_exec_native_completion {
+	int result;
+	bool attempted;
+	bool fault;
+};
+
 struct kvm_vcpu {
 	struct kvm *kvm;
 #ifdef CONFIG_PREEMPT_NOTIFIERS
@@ -398,6 +405,8 @@ struct kvm_vcpu {
 	 */
 	struct kvm_memory_slot *last_used_slot;
 	u64 last_used_slot_gen;
+	/* Optional observation; preserve offsets of ordinary vCPU state. */
+	struct kvm_exec_native_completion *exec_native_completion;
 };
 
 /*
@@ -1488,6 +1497,9 @@ u64 kvm_arch_exec_tsc_delta_to_ns(u64 cycles);
 bool kvm_arch_vcpu_exec_completion_pending(struct kvm_vcpu *vcpu);
 bool kvm_arch_vcpu_exec_copy_pio_data(struct kvm_vcpu *vcpu, void *data,
 				      size_t len);
+void kvm_arch_vcpu_exec_write_pio_data(struct kvm_vcpu *vcpu, const void *data,
+				       size_t len);
+bool kvm_arch_vcpu_exec_portable_supported(struct kvm_vcpu *vcpu);
 u64 kvm_arch_exec_supported_features(void);
 int kvm_arch_vcpu_exec_inject_interrupt(struct kvm_vcpu *vcpu, u32 vector);
 bool kvm_arch_vcpu_exec_direct_pending(struct kvm_vcpu *vcpu, u32 vector);
