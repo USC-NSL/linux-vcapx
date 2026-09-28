@@ -396,9 +396,11 @@ static bool kvm_exec_entry_unobserved(struct kvm_exec_capsule *capsule)
 		return true;
 	observation = (void *)capsule->portable->control +
 		KVM_EXEC_CAPSULE_CONTROL_SIZE + sizeof(struct kvm_exec_entry_progress);
-	/* Pairs with terminal observation publication by the unique ticket owner. */
-	return smp_load_acquire(&observation->command_sequence) != entry->command_sequence ||
-	       READ_ONCE(observation->executor_generation) != entry->executor_generation ||
+	/* Pairs with command-sequence release publication by the ticket owner. */
+	if (smp_load_acquire(&observation->command_sequence) != entry->command_sequence)
+		return true;
+	/* Sequences are executor-local; a new executor word also publishes observation. */
+	return smp_load_acquire(&observation->executor_generation) != entry->executor_generation ||
 	       READ_ONCE(observation->lifecycle_generation) != capsule->lifecycle_generation;
 }
 
@@ -1145,6 +1147,11 @@ static int kvm_exec_attach_vcpu(struct kvm_exec_domain *domain,
 		vcpu->exec_capsule = capsule;
 		domain->nr_attached++;
 		if (capsule->portable) {
+			struct kvm_exec_capsule_response *response =
+				(void *)(capsule->portable->control + 1);
+
+			/* No old service writer remains; the new lifecycle restarts sequences. */
+			WRITE_ONCE(response->sequence, 0);
 			vcpu->exec_native_completion =
 				&capsule->portable->native_completion;
 			capsule->portable->boundary_epoch = 1;
@@ -1156,7 +1163,12 @@ static int kvm_exec_attach_vcpu(struct kvm_exec_domain *domain,
 			capsule->portable->native_completion.entry_pending = false;
 			if (capsule->portable->entry) {
 				struct kvm_exec_entry_record *entry = capsule->portable->entry;
+				struct kvm_exec_entry_observation *observation =
+					(void *)capsule->portable->control +
+					KVM_EXEC_CAPSULE_CONTROL_SIZE +
+					sizeof(struct kvm_exec_entry_progress);
 
+				WRITE_ONCE(observation->command_sequence, 0);
 				entry->phase = KVM_EXEC_ENTRY_PHASE_NONE;
 				entry->executor_generation = 0;
 				entry->command_sequence = 0;
