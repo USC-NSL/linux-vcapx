@@ -749,7 +749,7 @@ static inline void tk_update_ktime_data(struct timekeeper *tk)
 	nsec += (u32)(tk->tkr_mono.xtime_nsec >> tk->tkr_mono.shift);
 	if (nsec >= NSEC_PER_SEC)
 		seconds++;
-	tk->ktime_sec = seconds;
+	WRITE_ONCE(tk->ktime_sec, seconds);
 
 	/* Update the monotonic raw base */
 	tk->tkr_raw.base = ns_to_ktime(tk->raw_sec * NSEC_PER_SEC);
@@ -1005,7 +1005,7 @@ time64_t ktime_get_seconds(void)
 	struct timekeeper *tk = &tk_core.timekeeper;
 
 	WARN_ON(timekeeping_suspended);
-	return tk->ktime_sec;
+	return READ_ONCE(tk->ktime_sec);
 }
 EXPORT_SYMBOL_GPL(ktime_get_seconds);
 
@@ -2215,6 +2215,8 @@ static bool timekeeping_advance(enum timekeeping_adv_mode mode)
 	 * updating.
 	 */
 	timekeeping_update(tk, clock_set);
+	/* Keep the lockless seconds read intact even if the bulk copy tears. */
+	WRITE_ONCE(real_tk->ktime_sec, tk->ktime_sec);
 	memcpy(real_tk, tk, sizeof(*tk));
 	/* The memcpy must come last. Do not put anything here! */
 	write_seqcount_end(&tk_core.seq);
