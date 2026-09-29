@@ -107,6 +107,7 @@ struct kvm_exec_exit_state {
 	u32 count;
 	u32 len;
 	u32 reason;
+	u16 run_flags;
 	u8 direction;
 	u8 data[8];
 	bool payload_valid;
@@ -2275,6 +2276,7 @@ static void kvm_exec_snapshot_exit(struct kvm_vcpu *vcpu, u32 reason,
 
 	memset(exit, 0, sizeof(*exit));
 	exit->reason = reason;
+	exit->run_flags = run->flags;
 	exit->completion_pending = completion_pending;
 	if (reason == KVM_EXIT_IO) {
 		u64 bytes = (u64)run->io.count * run->io.size;
@@ -2328,7 +2330,8 @@ static void kvm_exec_portable_capture(struct kvm_exec_capsule *capsule)
 	case KVM_EXIT_HLT:
 	case KVM_EXIT_IRQ_WINDOW_OPEN:
 	case KVM_EXIT_INTR:
-		portable->service_pending = false;
+		/* Companion policy events still require userspace disposition. */
+		portable->service_pending = capsule->exit.run_flags != 0;
 		break;
 	case KVM_EXIT_SET_TPR:
 		/* Unlike other rare exits, SET_TPR uses a field outside the union. */
@@ -2424,10 +2427,17 @@ static int kvm_exec_portable_preflight(struct kvm_exec_capsule *capsule)
 	    response->lifecycle_generation != capsule->lifecycle_generation ||
 	    response->request_epoch != portable->request_epoch ||
 	    response->reason != exit->reason || response->reserved0 ||
-	    response->reserved || run->exit_reason != exit->reason)
+	    response->reserved || run->exit_reason != exit->reason ||
+	    run->flags != exit->run_flags)
 		return -EINVAL;
 
 	switch (exit->reason) {
+	case KVM_EXIT_HLT:
+	case KVM_EXIT_IRQ_WINDOW_OPEN:
+	case KVM_EXIT_INTR:
+		/* These boundaries have no exit-union request or result fields. */
+		metadata_valid = true;
+		break;
 	case KVM_EXIT_IO:
 		metadata_valid = run->io.port == exit->address &&
 			run->io.data_offset == exit->data_offset &&
@@ -2653,6 +2663,7 @@ static bool kvm_exec_async_pio_write(struct kvm_exec_domain *domain,
 				     struct kvm_exec_exit_state *exit)
 {
 	return domain->negotiated_features & KVM_EXEC_FEATURE_ASYNC_PIO_WRITE &&
+	       !exit->run_flags &&
 	       exit->reason == KVM_EXIT_IO &&
 	       exit->direction == KVM_EXIT_IO_OUT && exit->count == 1 &&
 	       (exit->len == 1 || exit->len == 2 || exit->len == 4) &&
@@ -2669,7 +2680,7 @@ static bool kvm_exec_pending_exit_valid(struct kvm_exec_capsule *capsule)
 
 	if (!exit->completion_pending ||
 	    !kvm_arch_vcpu_exec_completion_pending(capsule->vcpu) ||
-	    run->exit_reason != exit->reason)
+	    run->exit_reason != exit->reason || run->flags != exit->run_flags)
 		return false;
 	if (exit->reason == KVM_EXIT_IO)
 		return run->io.port == exit->address &&
@@ -4498,6 +4509,7 @@ command_done:
 		}
 		interrupt_window_exit =
 			attempted_kvm_run && !run_ret && interrupt_waiting &&
+			!observed_exit.run_flags &&
 			reported_exit_reason == KVM_EXIT_IRQ_WINDOW_OPEN;
 		final_cpu = get_cpu();
 		put_cpu();
@@ -4544,7 +4556,7 @@ command_done:
 			    kvm_exec_async_pio_write(domain, &capsule->exit))
 				async_published =
 					kvm_exec_async_publish(executor, capsule);
-			if (observed_exit.reason == KVM_EXIT_HLT)
+			if (observed_exit.reason == KVM_EXIT_HLT && !observed_exit.run_flags)
 				retained_halt_exit =
 					kvm_exec_interrupt_consume_retained_halt(
 						executor, capsule);
@@ -4667,7 +4679,8 @@ command_done:
 			run.return_reason = KVM_EXEC_RETURN_SIGNAL;
 			break;
 		}
-		if (run_ret || run.vcpu_exit_reason != KVM_EXIT_DEBUG || capsule->portable) {
+		if (run_ret || run.vcpu_exit_reason != KVM_EXIT_DEBUG ||
+		    capsule->portable || capsule->exit.run_flags) {
 			run.return_reason = KVM_EXEC_RETURN_VCPU_EXIT;
 			break;
 		}
