@@ -6069,6 +6069,51 @@ static void test_exact_interrupt_avoids_executor_return(int kvm_fd)
 	kvm_vm_free(vm);
 }
 
+/* Strict posted delivery needs the publisher and guest to run concurrently.
+ * Isolated CPUs do not spread these threads through scheduler load balancing.
+ */
+static void start_apic_dispatch_runner(pthread_t *thread,
+				       struct dispatch_run_arg *arg,
+				       uint32_t mode, cpu_set_t *original_mask)
+{
+	pthread_attr_t attr;
+	cpu_set_t mask;
+	int cpu, control_cpu = -1, runner_cpu = -1;
+
+	if (mode != KVM_EXEC_INTERRUPT_DELIVERY_POSTED) {
+		TEST_ASSERT(!pthread_create(thread, NULL, dispatch_runner, arg),
+			    "pthread_create failed");
+		return;
+	}
+
+	TEST_ASSERT(!sched_getaffinity(0, sizeof(*original_mask), original_mask),
+		    "sched_getaffinity failed, errno %d", errno);
+	for (cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+		if (!CPU_ISSET(cpu, original_mask))
+			continue;
+		if (control_cpu < 0) {
+			control_cpu = cpu;
+		} else {
+			runner_cpu = cpu;
+			break;
+		}
+	}
+	TEST_REQUIRE(runner_cpu >= 0);
+
+	CPU_ZERO(&mask);
+	CPU_SET(control_cpu, &mask);
+	TEST_ASSERT(!sched_setaffinity(0, sizeof(mask), &mask),
+		    "pin posted interrupt controller, errno %d", errno);
+	CPU_ZERO(&mask);
+	CPU_SET(runner_cpu, &mask);
+	TEST_ASSERT(!pthread_attr_init(&attr), "pthread_attr_init failed");
+	TEST_ASSERT(!pthread_attr_setaffinity_np(&attr, sizeof(mask), &mask),
+		    "set posted interrupt runner affinity failed");
+	TEST_ASSERT(!pthread_create(thread, &attr, dispatch_runner, arg),
+		    "pthread_create failed");
+	TEST_ASSERT(!pthread_attr_destroy(&attr), "pthread_attr_destroy failed");
+}
+
 static void test_apic_interrupt_waits_for_eoi(int kvm_fd, uint32_t mode)
 {
 	uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
@@ -6111,6 +6156,7 @@ static void test_apic_interrupt_waits_for_eoi(int kvm_fd, uint32_t mode)
 	uint64_t domain_generation, executor_generation;
 	uint64_t boundary_retry_count = 0;
 	pthread_t thread;
+	cpu_set_t original_mask;
 	int capability, domain_fd, executor_fd, ret;
 
 	TEST_ASSERT(mode == KVM_EXEC_INTERRUPT_DELIVERY_LOCAL_APIC_KICK ||
@@ -6166,8 +6212,7 @@ static void test_apic_interrupt_waits_for_eoi(int kvm_fd, uint32_t mode)
 		.domain_generation = domain_generation,
 		.executor_generation = executor_generation,
 	};
-	TEST_ASSERT(!pthread_create(&thread, NULL, dispatch_runner, &run_arg),
-		    "pthread_create failed");
+	start_apic_dispatch_runner(&thread, &run_arg, mode, &original_mask);
 	wait_for_guest(started);
 	completion = consume_dispatch_completion(&mapping);
 	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_APPLIED);
@@ -6334,6 +6379,9 @@ static void test_apic_interrupt_waits_for_eoi(int kvm_fd, uint32_t mode)
 	detach_vcpu(domain_fd, 93, 7);
 	close(domain_fd);
 	kvm_vm_free(vm);
+	if (mode == KVM_EXEC_INTERRUPT_DELIVERY_POSTED)
+		TEST_ASSERT(!sched_setaffinity(0, sizeof(original_mask), &original_mask),
+			    "restore controller affinity, errno %d", errno);
 }
 
 static void
@@ -6375,6 +6423,7 @@ test_queued_apic_handoff(int kvm_fd, uint32_t mode)
 	uint64_t domain_generation, executor_generation;
 	uint64_t boundary_retry_count = 0;
 	pthread_t thread;
+	cpu_set_t original_mask;
 	int capability, domain_fd, executor_fd, ret;
 
 	TEST_ASSERT(mode == KVM_EXEC_INTERRUPT_DELIVERY_LOCAL_APIC_KICK ||
@@ -6432,8 +6481,7 @@ test_queued_apic_handoff(int kvm_fd, uint32_t mode)
 		.domain_generation = domain_generation,
 		.executor_generation = executor_generation,
 	};
-	TEST_ASSERT(!pthread_create(&thread, NULL, dispatch_runner, &run_arg),
-		    "pthread_create failed");
+	start_apic_dispatch_runner(&thread, &run_arg, mode, &original_mask);
 	wait_for_guest(started);
 	completion = consume_dispatch_completion(&mapping);
 	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_APPLIED);
@@ -6552,6 +6600,9 @@ test_queued_apic_handoff(int kvm_fd, uint32_t mode)
 	detach_vcpu(domain_fd, 94, 8);
 	close(domain_fd);
 	kvm_vm_free(vm);
+	if (mode == KVM_EXEC_INTERRUPT_DELIVERY_POSTED)
+		TEST_ASSERT(!sched_setaffinity(0, sizeof(original_mask), &original_mask),
+			    "restore controller affinity, errno %d", errno);
 }
 
 static void test_pending_exact_interrupt_yields_to_release(int kvm_fd)
