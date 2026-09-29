@@ -1446,10 +1446,17 @@ static int pio_in_emulated(struct x86_emulate_ctxt *ctxt,
 
 	if (ctxt->rep_prefix && (ctxt->d & String) &&
 	    !(ctxt->eflags & X86_EFLAGS_DF)) {
+		unsigned long last = address_mask(ctxt, ~0UL) -
+				     ctxt->dst.addr.mem.ea;
+		unsigned int bytes = rc->end - rc->pos;
+
+		/* Split at index wrap, retaining read-ahead for the next iteration. */
+		if (bytes - 1 > last)
+			bytes = max_t(unsigned int, round_down(last + 1, size), size);
 		ctxt->dst.data = rc->data + rc->pos;
 		ctxt->dst.type = OP_MEM_STR;
-		ctxt->dst.count = (rc->end - rc->pos) / size;
-		rc->pos = rc->end;
+		ctxt->dst.count = bytes / size;
+		rc->pos += bytes;
 	} else {
 		memcpy(dest, rc->data + rc->pos, size);
 		rc->pos += size;
