@@ -2334,8 +2334,8 @@ static void kvm_exec_portable_capture(struct kvm_exec_capsule *capsule)
 {
 	struct kvm_exec_portable_state *portable = capsule->portable;
 	struct kvm_run *run = capsule->vcpu->run;
+	bool service_pending = true;
 
-	portable->service_pending = true;
 	kvm_exec_portable_advance(capsule);
 	portable->request_epoch = portable->boundary_epoch;
 	/* PIO/MMIO already have bounded geometry in capsule->exit. */
@@ -2347,7 +2347,7 @@ static void kvm_exec_portable_capture(struct kvm_exec_capsule *capsule)
 	case KVM_EXIT_IRQ_WINDOW_OPEN:
 	case KVM_EXIT_INTR:
 		/* Companion policy events still require userspace disposition. */
-		portable->service_pending = capsule->exit.run_flags != 0;
+		service_pending = capsule->exit.run_flags != 0;
 		break;
 	case KVM_EXIT_SET_TPR:
 		/* Unlike other rare exits, SET_TPR uses a field outside the union. */
@@ -2387,9 +2387,12 @@ static void kvm_exec_portable_capture(struct kvm_exec_capsule *capsule)
 		}
 		break;
 	}
-	/* A stop is handled by lifecycle recovery, never by a device ACK. */
-	if (portable->blocked)
-		portable->service_pending = false;
+	/*
+	 * Inspection checks this flag without the domain lock. Publish only the
+	 * final classification, so a non-service exit never permits inspection.
+	 * A stop needs lifecycle recovery, never a device ACK.
+	 */
+	WRITE_ONCE(portable->service_pending, service_pending && !portable->blocked);
 	kvm_exec_publish_capsule_status(capsule);
 }
 
