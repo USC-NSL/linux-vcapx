@@ -164,6 +164,7 @@ struct kvm_exec_capsule {
 	atomic64_t wake_count;
 	u64 runtime_cycles;
 	u32 trace_refs;
+	/* Written under domain->lock, also observed by vCPU-mutex-only getters. */
 	bool running;
 	struct kvm_exec_portable_state *portable;
 };
@@ -1569,7 +1570,7 @@ static void kvm_exec_abort_run(struct kvm_exec_executor *executor,
 	struct kvm_exec_domain *domain = executor->domain;
 
 	mutex_lock(&domain->lock);
-	capsule->running = false;
+	WRITE_ONCE(capsule->running, false);
 	if (release_claim && capsule->owner == executor) {
 		capsule->owner = NULL;
 		kvm_exec_set_current_capsule(executor, NULL);
@@ -1648,7 +1649,7 @@ static long kvm_exec_run(struct kvm_exec_executor *executor, void __user *argp)
 		kvm_exec_set_current_capsule(executor, capsule);
 		new_claim = true;
 	}
-	capsule->running = true;
+	WRITE_ONCE(capsule->running, true);
 	atomic_inc(&domain->active_runs);
 	executor->last_request_sequence = run.request_sequence;
 	mutex_unlock(&domain->lock);
@@ -1852,7 +1853,7 @@ static long kvm_exec_run_trace(struct kvm_exec_executor *executor,
 		capsule->owner = executor;
 		kvm_exec_set_current_capsule(executor, capsule);
 	}
-	capsule->running = true;
+	WRITE_ONCE(capsule->running, true);
 	atomic_inc(&domain->active_runs);
 	active = true;
 	executor->last_request_sequence = trace.request_sequence;
@@ -1919,7 +1920,7 @@ static long kvm_exec_run_trace(struct kvm_exec_executor *executor,
 		mutex_unlock(&capsule->vcpu->mutex);
 
 		mutex_lock(&domain->lock);
-		capsule->running = false;
+		WRITE_ONCE(capsule->running, false);
 		if (domain->stopping) {
 			trace.return_reason = KVM_EXEC_RETURN_DOMAIN_STOPPING;
 			goto finish_locked;
@@ -1950,7 +1951,7 @@ static long kvm_exec_run_trace(struct kvm_exec_executor *executor,
 
 		next = capsules[(step + 1) % trace.nr_entries];
 		if (next == capsule) {
-			capsule->running = true;
+			WRITE_ONCE(capsule->running, true);
 			mutex_unlock(&domain->lock);
 			continue;
 		}
@@ -1964,7 +1965,7 @@ static long kvm_exec_run_trace(struct kvm_exec_executor *executor,
 		capsule->owner = NULL;
 		next->owner = executor;
 		kvm_exec_set_current_capsule(executor, next);
-		next->running = true;
+		WRITE_ONCE(next->running, true);
 		handoff_end = ktime_get_ns();
 		trace.switch_count++;
 		if (!trace.first_switch_ns)
@@ -1978,7 +1979,7 @@ finish_run:
 	mutex_lock(&domain->lock);
 	capsule = kvm_exec_current_capsule(executor);
 	if (capsule && capsule->running)
-		capsule->running = false;
+		WRITE_ONCE(capsule->running, false);
 finish_locked:
 	capsule = kvm_exec_current_capsule(executor);
 	if (capsule) {
@@ -2571,7 +2572,7 @@ static void kvm_exec_portable_accept(struct kvm_exec_capsule *capsule)
 		run->xen.u.hcall.result = response->data[0];
 		break;
 	}
-	portable->service_pending = false;
+	WRITE_ONCE(portable->service_pending, false);
 	portable->accepted_sequence = capsule->exit.sequence;
 	if (!capsule->exit.completion_pending)
 		portable->resolved_sequence = capsule->exit.sequence;
@@ -2949,7 +2950,7 @@ kvm_exec_async_apply_completion(struct kvm_exec_executor *executor,
 		mutex_unlock(&domain->lock);
 		return -EINVAL;
 	}
-	capsule->running = true;
+	WRITE_ONCE(capsule->running, true);
 	capsule->exit.async_entry_authorized = true;
 	mutex_unlock(&domain->lock);
 
@@ -2965,7 +2966,7 @@ kvm_exec_async_apply_completion(struct kvm_exec_executor *executor,
 	mutex_unlock(&capsule->vcpu->mutex);
 
 	mutex_lock(&domain->lock);
-	capsule->running = false;
+	WRITE_ONCE(capsule->running, false);
 	if (!pending)
 		kvm_exec_async_finish_completion_locked(capsule);
 	mutex_unlock(&domain->lock);
@@ -4390,7 +4391,7 @@ command_done:
 			}
 			continue;
 		}
-		capsule->running = true;
+		WRITE_ONCE(capsule->running, true);
 		mutex_unlock(&domain->lock);
 
 		if (mutex_lock_killable(&capsule->vcpu->mutex)) {
@@ -4399,7 +4400,7 @@ command_done:
 				completion_pending = false;
 			}
 			mutex_lock(&domain->lock);
-			capsule->running = false;
+			WRITE_ONCE(capsule->running, false);
 			mutex_unlock(&domain->lock);
 			run.return_reason = KVM_EXEC_RETURN_SIGNAL;
 			run.run_result = -EINTR;
@@ -4545,7 +4546,7 @@ command_done:
 		mutex_unlock(&capsule->vcpu->mutex);
 
 		mutex_lock(&domain->lock);
-		capsule->running = false;
+		WRITE_ONCE(capsule->running, false);
 		if (invalid_completion) {
 			if (capsule->portable) {
 				capsule->portable->blocked = true;
