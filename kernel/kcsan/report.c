@@ -112,6 +112,23 @@ static struct report_time report_times[REPORT_TIMES_SIZE];
 static DEFINE_RAW_SPINLOCK(report_lock);
 
 /*
+ * A report may originate while the caller holds a console driver's lock.
+ * Keep messages in the log buffer until report_lock is released instead of
+ * calling console drivers here. IRQs stay disabled across the deferred scope.
+ */
+static void lock_report(unsigned long *flags)
+{
+	raw_spin_lock_irqsave(&report_lock, *flags);
+	printk_deferred_enter();
+}
+
+static void unlock_report(unsigned long *flags)
+{
+	printk_deferred_exit();
+	raw_spin_unlock_irqrestore(&report_lock, *flags);
+}
+
+/*
  * Checks if the race identified by thread frames frame1 and frame2 has
  * been reported since (now - KCSAN_REPORT_ONCE_IN_MS).
  */
@@ -502,7 +519,7 @@ static void release_report(unsigned long *flags, struct other_info *other_info)
 	 * 0-sized accesses.
 	 */
 	other_info->ai.size = 0;
-	raw_spin_unlock_irqrestore(&report_lock, *flags);
+	unlock_report(flags);
 }
 
 /*
@@ -540,14 +557,14 @@ static void set_other_info_task_blocking(unsigned long *flags,
 			 */
 			set_current_state(TASK_UNINTERRUPTIBLE);
 		}
-		raw_spin_unlock_irqrestore(&report_lock, *flags);
+		unlock_report(flags);
 		/*
 		 * We cannot call schedule() since we also cannot reliably
 		 * determine if sleeping here is permitted -- see in_atomic().
 		 */
 
 		udelay(1);
-		raw_spin_lock_irqsave(&report_lock, *flags);
+		lock_report(flags);
 		if (timeout-- < 0) {
 			/*
 			 * Abort. Reset @other_info->task to NULL, since it
@@ -573,7 +590,7 @@ static void prepare_report_producer(unsigned long *flags,
 				    const struct access_info *ai,
 				    struct other_info *other_info)
 {
-	raw_spin_lock_irqsave(&report_lock, *flags);
+	lock_report(flags);
 
 	/*
 	 * The same @other_infos entry cannot be used concurrently, because
@@ -596,7 +613,7 @@ static void prepare_report_producer(unsigned long *flags,
 	if (IS_ENABLED(CONFIG_KCSAN_VERBOSE))
 		set_other_info_task_blocking(flags, ai, other_info);
 
-	raw_spin_unlock_irqrestore(&report_lock, *flags);
+	unlock_report(flags);
 }
 
 /* Awaits producer to fill @other_info and then returns. */
@@ -605,11 +622,11 @@ static bool prepare_report_consumer(unsigned long *flags,
 				    struct other_info *other_info)
 {
 
-	raw_spin_lock_irqsave(&report_lock, *flags);
+	lock_report(flags);
 	while (!other_info->ai.size) { /* Await valid @other_info. */
-		raw_spin_unlock_irqrestore(&report_lock, *flags);
+		unlock_report(flags);
 		cpu_relax();
-		raw_spin_lock_irqsave(&report_lock, *flags);
+		lock_report(flags);
 	}
 
 	/* Should always have a matching access based on watchpoint encoding. */
@@ -673,11 +690,9 @@ void kcsan_report_known_origin(const volatile void *ptr, size_t size, int access
 
 	kcsan_disable_current();
 	/*
-	 * Because we may generate reports when we're in scheduler code, the use
-	 * of printk() could deadlock. Until such time that all printing code
-	 * called in print_report() is scheduler-safe, accept the risk, and just
-	 * get our message out. As such, also disable lockdep to hide the
-	 * warning, and avoid disabling lockdep for the rest of the kernel.
+	 * Reports may originate in scheduler code. Keep lockdep disabled for
+	 * diagnostic helpers; lock_report() separately defers console output
+	 * while the reporting lock is held.
 	 */
 	lockdep_off();
 
@@ -706,9 +721,9 @@ void kcsan_report_unknown_origin(const volatile void *ptr, size_t size, int acce
 	kcsan_disable_current();
 	lockdep_off(); /* See kcsan_report_known_origin(). */
 
-	raw_spin_lock_irqsave(&report_lock, flags);
+	lock_report(&flags);
 	print_report(KCSAN_VALUE_CHANGE_TRUE, &ai, NULL, old, new, mask);
-	raw_spin_unlock_irqrestore(&report_lock, flags);
+	unlock_report(&flags);
 
 	lockdep_on();
 	kcsan_enable_current();
