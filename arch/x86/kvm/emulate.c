@@ -1789,6 +1789,32 @@ static void write_register_operand(struct operand *op)
 	return assign_register(op->addr.reg, op->val, op->bytes);
 }
 
+/* Keep REP-only validation out of the common writeback register-save path. */
+static noinline int segmented_write_string(struct x86_emulate_ctxt *ctxt,
+					   struct operand *op)
+{
+	unsigned int bytes, max_size;
+	unsigned long linear;
+	int rc;
+
+	rc = __linearize(ctxt, op->addr.mem, &max_size, op->bytes,
+			 ctxt->mode, &linear, X86EMUL_F_WRITE);
+	if (rc != X86EMUL_CONTINUE)
+		return rc;
+
+	/* Commit whole elements before a later page or segment can fault. */
+	bytes = op->bytes * op->count;
+	max_size = min_t(unsigned int, max_size,
+			 PAGE_SIZE - offset_in_page(linear));
+	if (bytes > max_size && op->count > 1) {
+		bytes = max(round_down(max_size, op->bytes), op->bytes);
+		ctxt->io_read.pos -= op->bytes * op->count - bytes;
+		op->count = bytes / op->bytes;
+	}
+	return ctxt->ops->write_emulated(ctxt, linear, op->data, bytes,
+					 &ctxt->exception);
+}
+
 static int writeback(struct x86_emulate_ctxt *ctxt, struct operand *op)
 {
 	switch (op->type) {
@@ -1808,10 +1834,7 @@ static int writeback(struct x86_emulate_ctxt *ctxt, struct operand *op)
 					       &op->val,
 					       op->bytes);
 	case OP_MEM_STR:
-		return segmented_write(ctxt,
-				       op->addr.mem,
-				       op->data,
-				       op->bytes * op->count);
+		return segmented_write_string(ctxt, op);
 	case OP_XMM:
 		kvm_write_sse_reg(op->addr.xmm, &op->vec_val);
 		break;
