@@ -11393,7 +11393,8 @@ u64 kvm_arch_exec_supported_features(void)
 		KVM_EXEC_FEATURE_POSTED_INTERRUPT_DELIVERY : 0;
 
 	if (IS_ENABLED(CONFIG_X86_64) && cpu_feature_enabled(X86_FEATURE_FXSR))
-		features |= KVM_EXEC_FEATURE_ENTRY_STATE_X86;
+		features |= KVM_EXEC_FEATURE_ENTRY_STATE_X86 |
+			    KVM_EXEC_FEATURE_INSPECTION_X86;
 	return features;
 }
 

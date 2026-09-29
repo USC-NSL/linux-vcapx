@@ -700,6 +700,22 @@ bool kvm_exec_domain_vcpu_ioctl_allowed(struct kvm_vcpu *vcpu,
 	if (READ_ONCE(capsule->running))
 		return false;
 
+	/* The vCPU mutex excludes native continuation and entry during reads.
+	 * Service stays pending: inspection neither responds nor retires I/O.
+	 */
+	if ((capsule->domain->negotiated_features &
+	     KVM_EXEC_FEATURE_INSPECTION_X86) && capsule->portable &&
+	    READ_ONCE(capsule->portable->service_pending) &&
+	    !kvm_exec_domain_access(capsule->domain)) {
+		switch (ioctl) {
+		case KVM_GET_REGS:
+		case KVM_GET_FPU:
+		case KVM_GET_SREGS:
+		case KVM_TRANSLATE:
+			return true;
+		}
+	}
+
 	return READ_ONCE(capsule->domain->paused) &&
 	       !READ_ONCE(capsule->exit.completion_pending) &&
 	       !kvm_exec_entry_unobserved(capsule) &&
@@ -6730,7 +6746,8 @@ int kvm_dev_ioctl_create_exec_domain(void __user *argp)
 	      KVM_EXEC_FEATURE_SYNC_EXITS)) ||
 	    ((create.requested_features & KVM_EXEC_FEATURE_PORTABLE_EXITS) &&
 	     !(create.requested_features & KVM_EXEC_FEATURE_LIFECYCLE_STATE)) ||
-	    ((create.requested_features & KVM_EXEC_FEATURE_ENTRY_STATE_X86) &&
+	    ((create.requested_features & (KVM_EXEC_FEATURE_ENTRY_STATE_X86 |
+					   KVM_EXEC_FEATURE_INSPECTION_X86)) &&
 	     !(create.requested_features & KVM_EXEC_FEATURE_PORTABLE_EXITS)))
 		return -EINVAL;
 

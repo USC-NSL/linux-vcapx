@@ -901,6 +901,7 @@ struct kvm_ppc_resize_hpt {
 /* Negotiation requires the corresponding execution-path implementation. */
 #define KVM_EXEC_FEATURE_PORTABLE_EXITS		(1ULL << 18)
 #define KVM_EXEC_FEATURE_ENTRY_STATE_X86		(1ULL << 19)
+#define KVM_EXEC_FEATURE_INSPECTION_X86		(1ULL << 20)
 
 #define KVM_EXEC_INTERRUPT_DELIVERY_DIRECT_KICK	1U
 #define KVM_EXEC_INTERRUPT_DELIVERY_LOCAL_APIC_KICK 2U
