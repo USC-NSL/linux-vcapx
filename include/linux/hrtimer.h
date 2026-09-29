@@ -439,7 +439,9 @@ static inline bool hrtimer_is_queued(struct hrtimer *timer)
  */
 static inline int hrtimer_callback_running(struct hrtimer *timer)
 {
-	return timer->base->running == timer;
+	struct hrtimer_clock_base *base = READ_ONCE(timer->base);
+
+	return READ_ONCE(base->running) == timer;
 }
 
 /* Forward a hrtimer so it expires after now: */
