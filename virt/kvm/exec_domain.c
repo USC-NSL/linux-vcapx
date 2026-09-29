@@ -3946,8 +3946,9 @@ static void kvm_exec_dispatch_run_owner(struct kvm_exec_executor *executor,
 	run->owned_capsule_id = capsule->capsule_id;
 	run->owned_lifecycle_generation = capsule->lifecycle_generation;
 	if (capsule->portable) {
-		/* The stopped epoch must be visible in entry progress as well. */
-		if (run->return_reason == KVM_EXEC_RETURN_SIGNAL) {
+		/* Publish completion progress even without a new architectural exit. */
+		if (run->return_reason == KVM_EXEC_RETURN_SIGNAL ||
+		    run->return_reason == KVM_EXEC_RETURN_DOMAIN_PAUSED) {
 			kvm_exec_portable_advance(capsule);
 			kvm_exec_publish_capsule_status(capsule);
 		}
