@@ -5712,7 +5712,13 @@ static void test_accounting_across_executors(int kvm_fd)
 		TEST_ASSERT_EQ(executors[i].failure_count, 0);
 		executor_runtime += executors[i].runtime_ns;
 	}
-	TEST_ASSERT_EQ(capsule_runtime, executor_runtime);
+	/* Each side sums two independently truncated cycle-to-ns conversions. */
+	TEST_ASSERT(capsule_runtime > executor_runtime ?
+		    capsule_runtime - executor_runtime <= 1 :
+		    executor_runtime - capsule_runtime <= 1,
+		    "capsule/executor runtime totals differ beyond 1ns rounding: %llu/%llu",
+		    (unsigned long long)capsule_runtime,
+		    (unsigned long long)executor_runtime);
 
 	for (i = 0; i < 2; i++) {
 		munmap(mappings[i].header, KVM_EXEC_DISPATCH_MMAP_SIZE);
@@ -7477,7 +7483,12 @@ static void test_cross_vm_halt_interrupt_migration(int kvm_fd)
 	TEST_ASSERT_EQ(executor.rejected_count, 0);
 	TEST_ASSERT_EQ(executor.cancelled_count, 0);
 	TEST_ASSERT_EQ(executor.failure_count, 0);
-	TEST_ASSERT_EQ(executor.runtime_ns, capsule_runtime);
+	/* floor(a + b) - floor(a) - floor(b) is either zero or one. */
+	TEST_ASSERT(executor.runtime_ns >= capsule_runtime &&
+		    executor.runtime_ns - capsule_runtime <= 1,
+		    "executor runtime %llu differs from capsule sum %llu beyond rounding",
+		    (unsigned long long)executor.runtime_ns,
+		    (unsigned long long)capsule_runtime);
 
 	munmap(mapping.header, KVM_EXEC_DISPATCH_MMAP_SIZE);
 	close(executor_fd);
