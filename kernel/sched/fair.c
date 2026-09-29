@@ -24,6 +24,7 @@
 #include <linux/mmap_lock.h>
 #include <linux/hugetlb_inline.h>
 #include <linux/jiffies.h>
+#include <linux/kcsan-checks.h>
 #include <linux/mm_api.h>
 #include <linux/highmem.h>
 #include <linux/spinlock_api.h>
@@ -6882,6 +6883,21 @@ static struct {
 	unsigned long next_blocked;	/* Next update of blocked load in jiffies */
 } nohz ____cacheline_aligned;
 
+/*
+ * Idle-mask membership is advisory. Scheduler access instrumentation is
+ * disabled, so data_race() here cannot cover instrumented bitmap helpers.
+ * Scope the runtime annotation to mask searches, never their loop bodies.
+ */
+#define nohz_idle_mask_search(expr)			\
+({							\
+	unsigned long __cpu;				\
+							\
+	kcsan_disable_current();				\
+	__cpu = (expr);					\
+	kcsan_enable_current();				\
+	__cpu;						\
+})
+
 #endif /* CONFIG_NO_HZ_COMMON */
 
 static unsigned long cpu_load(struct rq *rq)
@@ -11796,7 +11812,14 @@ static inline int find_new_ilb(void)
 
 	hk_mask = housekeeping_cpumask(HK_TYPE_MISC);
 
-	for_each_cpu_and(ilb_cpu, nohz.idle_cpus_mask, hk_mask) {
+	/* Membership is advisory and can change during each mask search. */
+	for (ilb_cpu = 0;
+	     ilb_cpu = nohz_idle_mask_search(
+		find_next_and_bit(cpumask_bits(nohz.idle_cpus_mask),
+				  cpumask_bits(hk_mask),
+				  small_cpumask_bits, ilb_cpu)),
+	     ilb_cpu < small_cpumask_bits;
+	     ilb_cpu++) {
 
 		if (ilb_cpu == smp_processor_id())
 			continue;
@@ -11907,9 +11930,16 @@ static void nohz_balancer_kick(struct rq *rq)
 		 * around.
 		 *
 		 * When balancing betwen cores, all the SMT siblings of the
-		 * preferred CPU must be idle.
+		 * preferred CPU must be idle. The idle mask is advisory and its
+		 * membership can change during the search.
 		 */
-		for_each_cpu_and(i, sched_domain_span(sd), nohz.idle_cpus_mask) {
+		for (i = 0;
+		     i = nohz_idle_mask_search(
+			find_next_and_bit(cpumask_bits(sched_domain_span(sd)),
+					  cpumask_bits(nohz.idle_cpus_mask),
+					  small_cpumask_bits, i)),
+		     i < small_cpumask_bits;
+		     i++) {
 			if (sched_use_asym_prio(sd, i) &&
 			    sched_asym_prefer(i, cpu)) {
 				flags = NOHZ_STATS_KICK | NOHZ_BALANCE_KICK;
@@ -12132,9 +12162,17 @@ static void _nohz_idle_balance(struct rq *this_rq, unsigned int flags)
 
 	/*
 	 * Start with the next CPU after this_cpu so we will end with this_cpu and let a
-	 * chance for other idle cpu to pull load.
+	 * chance for other idle cpu to pull load. Only the advisory mask searches
+	 * tolerate concurrent membership updates; keep the body instrumented.
 	 */
-	for_each_cpu_wrap(balance_cpu,  nohz.idle_cpus_mask, this_cpu+1) {
+	for (balance_cpu = nohz_idle_mask_search(
+		find_next_bit_wrap(cpumask_bits(nohz.idle_cpus_mask),
+				   small_cpumask_bits, this_cpu + 1));
+	     balance_cpu < small_cpumask_bits;
+	     balance_cpu = nohz_idle_mask_search(
+		__for_each_wrap(cpumask_bits(nohz.idle_cpus_mask),
+				small_cpumask_bits, this_cpu + 1,
+				balance_cpu + 1))) {
 		if (!idle_cpu(balance_cpu))
 			continue;
 
