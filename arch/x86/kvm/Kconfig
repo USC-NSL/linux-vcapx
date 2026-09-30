@@ -156,6 +156,7 @@ config KVM_HYPERV
 config KVM_XEN
 	bool "Support for Xen hypercall interface"
 	depends on KVM
+	select HAVE_KVM_VCPU_RUN_PID_CHANGE
 	help
 	  Provides KVM support for the hosting Xen HVM guests and
 	  passing Xen hypercalls to userspace.

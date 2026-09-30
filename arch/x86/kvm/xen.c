@@ -462,6 +462,16 @@ static void kvm_xen_update_runstate_guest(struct kvm_vcpu *v, bool atomic)
 		mark_page_dirty_in_slot(v->kvm, gpc2->memslot, gpc2->gpa >> PAGE_SHIFT);
 }
 
+/*
+ * Scheduler run_delay belongs to a task, not a vCPU. Never subtract the
+ * previous runner's value from a newly bound runner's counter.
+ */
+int kvm_arch_vcpu_run_pid_change(struct kvm_vcpu *vcpu)
+{
+	vcpu->arch.xen.last_steal = current->sched_info.run_delay;
+	return 0;
+}
+
 void kvm_xen_update_runstate(struct kvm_vcpu *v, int state)
 {
 	struct kvm_vcpu_xen *vx = &v->arch.xen;
