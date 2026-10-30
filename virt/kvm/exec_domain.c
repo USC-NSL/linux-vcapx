@@ -4033,6 +4033,18 @@ static void kvm_exec_dispatch_run_owner(struct kvm_exec_executor *executor,
 	}
 }
 
+/* The dispatcher's return bookkeeping under the domain mutex. */
+static void kvm_exec_dispatch_return_locked(struct kvm_exec_executor *executor,
+					    struct kvm_exec_run_dispatch *run,
+					    bool active)
+{
+	lockdep_assert_held(&executor->domain->lock);
+	kvm_exec_interrupt_clear_retained_halt(executor);
+	kvm_exec_dispatch_run_owner(executor, run);
+	if (active)
+		atomic_dec(&executor->domain->active_runs);
+}
+
 static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 				  void __user *argp)
 {
@@ -4045,6 +4057,11 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 	u32 initial_cpu, final_cpu;
 	bool active = false;
 	bool completion_pending = false;
+	/*
+	 * locked: the preamble's domain critical section continues into the
+	 * first pass. returned: the last pass did the return bookkeeping.
+	 */
+	bool locked = false, returned = false;
 	int async_ret, command_ret, run_ret, ret;
 
 	if (copy_from_user(&run, argp, sizeof(run)))
@@ -4109,7 +4126,8 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 	}
 	atomic_inc(&domain->active_runs);
 	active = true;
-	mutex_unlock(&domain->lock);
+	/* The first pass's checks continue this critical section. */
+	locked = true;
 
 	header = kvm_exec_dispatch_header(executor);
 	seen_kick_epoch = atomic64_read(&executor->kick_epoch);
@@ -4149,7 +4167,10 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 		int handoff_ready;
 		int interrupt_ret = 0;
 
-		mutex_lock(&domain->lock);
+		/* Stop, kick and return-kick checks share one critical section. */
+		if (!locked)
+			mutex_lock(&domain->lock);
+		locked = false;
 		if (domain->stopping || domain->paused) {
 			kvm_exec_interrupt_abort(executor, false);
 			if (completion_pending) {
@@ -4163,19 +4184,15 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 			mutex_unlock(&domain->lock);
 			break;
 		}
-		mutex_unlock(&domain->lock);
 
 		if (kick_epoch != seen_kick_epoch) {
-			mutex_lock(&domain->lock);
 			capsule = kvm_exec_current_capsule(executor);
 			if (capsule && !capsule->running)
 				kvm_clear_request(KVM_REQ_EXEC_DOMAIN_EXIT,
 						  capsule->vcpu);
-			mutex_unlock(&domain->lock);
 			seen_kick_epoch = kick_epoch;
 		}
 
-		mutex_lock(&domain->lock);
 		capsule = kvm_exec_current_capsule(executor);
 		return_to_vmm = kvm_exec_consume_return_kick(executor);
 		if (return_to_vmm) {
@@ -4642,6 +4659,23 @@ command_done:
 			mutex_unlock(&domain->lock);
 			break;
 		}
+		/*
+		 * An exit that returns to the caller now finishes the return
+		 * bookkeeping in this pass. These are the conditions under which
+		 * the code below would return VCPU_EXIT. A pending completion is
+		 * published before active_runs drops, on the separate return path.
+		 */
+		if (!completion_pending && !strict_migrated &&
+		    !retained_halt_exit && !interrupt_window_exit &&
+		    !async_published && run_ret != -EINTR &&
+		    (run_ret || run.vcpu_exit_reason != KVM_EXIT_DEBUG ||
+		     capsule->portable || capsule->exit.run_flags)) {
+			run.return_reason = KVM_EXEC_RETURN_VCPU_EXIT;
+			kvm_exec_dispatch_return_locked(executor, &run, active);
+			returned = true;
+			mutex_unlock(&domain->lock);
+			break;
+		}
 		mutex_unlock(&domain->lock);
 
 		if (strict_migrated) {
@@ -4740,16 +4774,15 @@ command_done:
 	 * userspace can observe last_applied_sequence without any corresponding
 	 * completion and cannot reconcile the exact command after re-entry.
 	 */
-	if (completion_pending) {
-		kvm_exec_dispatch_publish(executor, &completion);
-		completion_pending = false;
+	if (!returned) {
+		if (completion_pending) {
+			kvm_exec_dispatch_publish(executor, &completion);
+			completion_pending = false;
+		}
+		mutex_lock(&domain->lock);
+		kvm_exec_dispatch_return_locked(executor, &run, active);
+		mutex_unlock(&domain->lock);
 	}
-	mutex_lock(&domain->lock);
-	kvm_exec_interrupt_clear_retained_halt(executor);
-	kvm_exec_dispatch_run_owner(executor, &run);
-	if (active)
-		atomic_dec(&domain->active_runs);
-	mutex_unlock(&domain->lock);
 	/* Drain waiters recheck active_runs after queueing themselves. */
 	if (wq_has_sleeper(&domain->drain_wait))
 		wake_up_all(&domain->drain_wait);
