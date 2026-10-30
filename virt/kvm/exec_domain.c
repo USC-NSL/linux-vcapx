@@ -3654,6 +3654,17 @@ static bool kvm_exec_consume_return_kick(struct kvm_exec_executor *executor)
 	return READ_ONCE(executor->mapped_boundary_return_kick_epoch) < epoch;
 }
 
+/*
+ * Missing an interrupt accepted concurrently with this unlocked check is the
+ * same as accepting it just after a locked snapshot, which delivery already
+ * tolerates: a direct kick follows acceptance, the dispatcher rechecks the kick
+ * epoch before entry, and the kick stops a run that already entered.
+ */
+static bool kvm_exec_interrupt_idle(struct kvm_exec_executor *executor)
+{
+	return !READ_ONCE(executor->pending_interrupt_sequence);
+}
+
 static bool
 kvm_exec_interrupt_snapshot(struct kvm_exec_executor *executor,
 			    struct kvm_exec_pending_interrupt *interrupt)
@@ -3661,6 +3672,8 @@ kvm_exec_interrupt_snapshot(struct kvm_exec_executor *executor,
 	unsigned long flags;
 	bool pending;
 
+	if (kvm_exec_interrupt_idle(executor))
+		return false;
 	spin_lock_irqsave(&executor->interrupt_lock, flags);
 	pending = executor->pending_interrupt_sequence != 0;
 	if (pending && interrupt) {
@@ -3681,7 +3694,7 @@ kvm_exec_interrupt_clear_locked(struct kvm_exec_executor *executor,
 				bool applied)
 {
 	lockdep_assert_held(&executor->interrupt_lock);
-	executor->pending_interrupt_sequence = 0;
+	WRITE_ONCE(executor->pending_interrupt_sequence, 0);
 	executor->pending_interrupt_capsule_id = 0;
 	executor->pending_interrupt_lifecycle_generation = 0;
 	executor->pending_interrupt_vector = 0;
@@ -3725,7 +3738,7 @@ kvm_exec_interrupt_retain_halt(struct kvm_exec_executor *executor,
 	if (!(interrupt->flags & KVM_EXEC_INTERRUPT_F_RETAIN_HLT))
 		return;
 	spin_lock_irqsave(&executor->interrupt_lock, flags);
-	executor->retained_halt_capsule_id = interrupt->capsule_id;
+	WRITE_ONCE(executor->retained_halt_capsule_id, interrupt->capsule_id);
 	executor->retained_halt_lifecycle_generation =
 		interrupt->lifecycle_generation;
 	spin_unlock_irqrestore(&executor->interrupt_lock, flags);
@@ -3736,8 +3749,14 @@ static void kvm_exec_interrupt_clear_retained_halt(
 {
 	unsigned long flags;
 
+	/*
+	 * Retention stores the capsule first. Missing a concurrent retention is
+	 * the same as a locked clear that ran before it.
+	 */
+	if (!READ_ONCE(executor->retained_halt_capsule_id))
+		return;
 	spin_lock_irqsave(&executor->interrupt_lock, flags);
-	executor->retained_halt_capsule_id = 0;
+	WRITE_ONCE(executor->retained_halt_capsule_id, 0);
 	executor->retained_halt_lifecycle_generation = 0;
 	spin_unlock_irqrestore(&executor->interrupt_lock, flags);
 }
@@ -3753,7 +3772,7 @@ static bool kvm_exec_interrupt_consume_retained_halt(
 		executor->retained_halt_lifecycle_generation ==
 			capsule->lifecycle_generation;
 	if (retain) {
-		executor->retained_halt_capsule_id = 0;
+		WRITE_ONCE(executor->retained_halt_capsule_id, 0);
 		executor->retained_halt_lifecycle_generation = 0;
 	}
 	spin_unlock_irqrestore(&executor->interrupt_lock, flags);
@@ -3895,6 +3914,9 @@ static void kvm_exec_refresh_interrupt(struct kvm_exec_executor *executor,
 	u32 vector;
 	u64 exits;
 
+	/* One accepted during this run is refreshed at the next boundary. */
+	if (kvm_exec_interrupt_idle(executor))
+		return;
 	spin_lock_irqsave(&executor->interrupt_lock, flags);
 	if (!executor->pending_interrupt_sequence)
 		goto out;
@@ -4728,7 +4750,9 @@ command_done:
 	if (active)
 		atomic_dec(&domain->active_runs);
 	mutex_unlock(&domain->lock);
-	wake_up_all(&domain->drain_wait);
+	/* Drain waiters recheck active_runs after queueing themselves. */
+	if (wq_has_sleeper(&domain->drain_wait))
+		wake_up_all(&domain->drain_wait);
 	run.command_head = executor->command_head;
 	run.completion_tail = executor->completion_tail;
 	run.corruption_count = executor->corruption_count;
@@ -4882,7 +4906,8 @@ kvm_exec_accept_interrupt_locked(struct kvm_exec_executor *executor,
 		*accepted_ns = kvm_exec_performance_ns(executor);
 		*accepted_tsc = kvm_arch_exec_host_tsc();
 		executor->last_interrupt_sequence = request->request_sequence;
-		executor->pending_interrupt_sequence = request->request_sequence;
+		WRITE_ONCE(executor->pending_interrupt_sequence,
+			   request->request_sequence);
 		executor->pending_interrupt_capsule_id = request->capsule_id;
 		executor->pending_interrupt_lifecycle_generation =
 			request->lifecycle_generation;
