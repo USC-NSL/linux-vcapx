@@ -4253,13 +4253,17 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 		 */
 		if (!completion_pending && !command_ret &&
 		    handoff_ready != KVM_EXEC_HANDOFF_ARMED) {
-			bool command_blocked;
+			bool command_blocked = false;
 
-			mutex_lock(&domain->lock);
-			capsule = kvm_exec_current_capsule(executor);
-			command_blocked = capsule && !capsule->portable &&
-				capsule->exit.async_request_pending;
-			mutex_unlock(&domain->lock);
+			/* Only a negotiated asynchronous PIO write leaves one pending. */
+			if (domain->negotiated_features &
+			    KVM_EXEC_FEATURE_ASYNC_PIO_WRITE) {
+				mutex_lock(&domain->lock);
+				capsule = kvm_exec_current_capsule(executor);
+				command_blocked = capsule && !capsule->portable &&
+					capsule->exit.async_request_pending;
+				mutex_unlock(&domain->lock);
+			}
 			if (command_blocked)
 				goto command_done;
 			memset(&completion, 0, sizeof(completion));
