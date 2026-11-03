@@ -902,6 +902,8 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_FEATURE_PORTABLE_EXITS		(1ULL << 18)
 #define KVM_EXEC_FEATURE_ENTRY_STATE_X86		(1ULL << 19)
 #define KVM_EXEC_FEATURE_INSPECTION_X86		(1ULL << 20)
+/* A capsule may register the exact output PIO that ends its invocation. */
+#define KVM_EXEC_FEATURE_INVOCATION_END		(1ULL << 21)
 
 #define KVM_EXEC_INTERRUPT_DELIVERY_DIRECT_KICK	1U
 #define KVM_EXEC_INTERRUPT_DELIVERY_LOCAL_APIC_KICK 2U
@@ -928,6 +930,8 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_RETURN_DISPATCH_CORRUPT	10
 #define KVM_EXEC_RETURN_INVALID_COMPLETION 11
 #define KVM_EXEC_RETURN_INTERRUPT_FAILED 12
+/* The current capsule's invocation ended and no command selected work. */
+#define KVM_EXEC_RETURN_INVOCATION_END	13
 
 #define KVM_EXEC_DISPATCH_ABI_VERSION	3U
 #define KVM_EXEC_DISPATCH_RING_ENTRIES	32U
@@ -949,6 +953,8 @@ struct kvm_ppc_resize_hpt {
 /* Portable domains: native continuation only, without entering guest code. */
 #define KVM_EXEC_DISPATCH_F_COMPLETION_ONLY (1U << 2)
 #define KVM_EXEC_COMPLETE_F_ASYNC_PIO_HANDOFF (1U << 0)
+/* Applied at its expected-current capsule's invocation end. */
+#define KVM_EXEC_COMPLETE_F_AT_INVOCATION_END (1U << 1)
 
 #define KVM_EXEC_NOTIFICATION_ABI_VERSION	1U
 #define KVM_EXEC_NOTIFICATION_RING_ENTRIES	32U
@@ -987,6 +993,12 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_CMD_F_GUARDED_TARGET	(1U << 1)
 #define KVM_EXEC_CMD_F_SET_ENTRY		(1U << 2)
 #define KVM_EXEC_CMD_F_CONTINUE_ENTRY	(1U << 3)
+/*
+ * The expected-current capsule's open invocation ends here without its end
+ * output.  Valid only when the expected-current capsule has an invocation-end
+ * output registered; the command then applies without waiting for that output.
+ */
+#define KVM_EXEC_CMD_F_END_INVOCATION	(1U << 4)
 
 #define KVM_EXEC_PORTABLE_ABI_VERSION	2U
 #define KVM_EXEC_CAPSULE_CONTROL_SIZE	128U
@@ -995,6 +1007,21 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_ENTRY_STATE_OFFSET	20480U
 #define KVM_EXEC_ENTRY_STATE_REGION_SIZE	20480U
 #define KVM_EXEC_ENTRY_STATE_MMAP_SIZE	40960U
+/*
+ * KVM_EXEC_FEATURE_INVOCATION_END control records add two 64-byte lines to
+ * the entry-state record: the KVM-written end status and the waiter word that
+ * only the capsule's single end waiter writes.
+ */
+#define KVM_EXEC_CAPSULE_END_CONTROL_SIZE	384U
+#define KVM_EXEC_CAPSULE_END_STATUS_OFFSET	256U
+#define KVM_EXEC_CAPSULE_END_WAITER_OFFSET	320U
+
+#define KVM_EXEC_INVOCATION_END_ENABLE	(1U << 0)
+#define KVM_EXEC_INVOCATION_END_DISABLE	(1U << 1)
+#define KVM_EXEC_END_STATUS_F_REGISTERED (1U << 0)
+
+/* dispatcher_state: set by KVM while its dispatcher sleeps for work. */
+#define KVM_EXEC_DISPATCHER_F_SLEEPING	(1ULL << 0)
 
 #define KVM_EXEC_ENTRY_GROUP_GPRS	(1ULL << 0)
 #define KVM_EXEC_ENTRY_GROUP_LEGACY_FPU	(1ULL << 1)
@@ -1119,6 +1146,54 @@ struct kvm_exec_entry_observation {
 	__u64 executor_generation;
 	__u64 lifecycle_generation;
 	__u64 reserved[5];
+};
+
+/*
+ * KVM is the only writer.  Registration writes the output and flags; each
+ * invocation end writes exit_sequence and then release-stores end_sequence
+ * after the capsule's run page holds the complete end view.  A reader
+ * acquire-loads end_sequence and checks lifecycle_generation first.
+ */
+struct kvm_exec_invocation_end_status {
+	__u64 lifecycle_generation;
+	__u64 end_sequence;
+	__u64 exit_sequence;
+	__u16 port;
+	__u8 width;
+	__u8 flags;
+	__u32 value;
+	__u64 reserved[4];
+};
+
+/*
+ * Written only by the capsule's single end waiter: nonzero while it may sleep
+ * in KVM_EXEC_WAIT_INVOCATION_END.  KVM wakes at an end only for a waiter.
+ */
+struct kvm_exec_invocation_end_waiter {
+	__u64 waiting;
+	__u64 reserved[7];
+};
+
+/* KVM_EXEC_SET_INVOCATION_END on the domain fd: a cold capsule only. */
+struct kvm_exec_invocation_end {
+	__u64 capsule_id;
+	__u64 lifecycle_generation;
+	__u16 port;
+	__u8 width;
+	__u8 flags;
+	__u32 value;
+	__u64 reserved[2];
+};
+
+/* KVM_EXEC_WAIT_INVOCATION_END on the domain fd. */
+struct kvm_exec_wait_invocation_end {
+	__u64 capsule_id;
+	__u64 lifecycle_generation;
+	__u64 after_sequence;
+	/* Zero waits without a timeout. */
+	__u64 timeout_ns;
+	__u64 end_sequence;
+	__u64 reserved[2];
 };
 
 /*
@@ -1318,7 +1393,12 @@ struct kvm_exec_dispatch_header {
 	__u64 last_entry_sequence;
 	/* Stable until the next ownership-changing command reaches entry. */
 	__u64 last_handoff_entry_sequence;
-	__u64 reserved2;
+	/*
+	 * KVM_EXEC_DISPATCHER_F_SLEEPING while the dispatcher waits for work,
+	 * with KVM_EXEC_FEATURE_INVOCATION_END only; zero otherwise.  A publisher
+	 * release-stores command_tail, fences, and kicks only when it is set.
+	 */
+	__u64 dispatcher_state;
 	/* line 3: KVM counters */
 	__u64 kernel_corruption_count;
 	__u64 kernel_kick_count;
@@ -1482,6 +1562,17 @@ struct kvm_exec_kick {
 
 #define KVM_EXEC_KICK_F_RETURN_TO_VMM	(1U << 0)
 #define KVM_EXEC_KICK_F_COMPLETION_AVAILABLE (1U << 1)
+/*
+ * With invocation-end output: return at the dispatcher's next pass boundary
+ * (the running guest's next exit or end, or a sleep) without interrupting a
+ * running guest or a selected entry.
+ */
+#define KVM_EXEC_KICK_F_RETURN_AT_BOUNDARY (1U << 2)
+/*
+ * With invocation-end output: wake a dispatcher sleeping for work after
+ * publishing a command, without stopping a running guest or a selected entry.
+ */
+#define KVM_EXEC_KICK_F_WAKE_SLEEPING (1U << 3)
 
 struct kvm_exec_interrupt {
 	__u32 size;
@@ -1854,6 +1945,10 @@ struct kvm_exec_query_interrupt_publication {
 				      struct kvm_exec_interrupt_result)
 #define KVM_EXEC_DISCARD_ENTRY \
 				_IOWR(KVMIO, 0xee, struct kvm_exec_discard_entry)
+#define KVM_EXEC_SET_INVOCATION_END \
+				_IOW(KVMIO, 0xe6, struct kvm_exec_invocation_end)
+#define KVM_EXEC_WAIT_INVOCATION_END \
+				_IOWR(KVMIO, 0xe7, struct kvm_exec_wait_invocation_end)
 
 /*
  * Extension capability list.
