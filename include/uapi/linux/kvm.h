@@ -909,6 +909,28 @@ struct kvm_ppc_resize_hpt {
  * kernels also keep an ended capsule's boundary epoch until it runs again.
  */
 #define KVM_EXEC_FEATURE_INVOCATION_WAKE	(1ULL << 22)
+/*
+ * Requires INVOCATION_WAKE.  A capsule's end waiter may sleep on a futex word
+ * in its waiter record: KVM increments the word and wakes the registered user
+ * address (a process-private futex) at each end, and when a selection of the
+ * capsule completes rejected, stale, busy or blocked (not cancelled before
+ * apply, nor a current mismatch, which follow a withdrawal), naming that
+ * selection in the end record.
+ */
+#define KVM_EXEC_FEATURE_INVOCATION_FUTEX	(1ULL << 23)
+/*
+ * Requires INVOCATION_END.  The dispatch header's boundary_return_request is a
+ * user-written counter: a change requests the boundary return that
+ * KVM_EXEC_KICK_F_RETURN_AT_BOUNDARY requests, without a syscall unless the
+ * dispatcher advertises sleep.
+ */
+#define KVM_EXEC_FEATURE_BOUNDARY_REQUEST	(1ULL << 24)
+/*
+ * Requires ENTRY_STATE_X86.  A capsule's legacy FPU image is registered once
+ * (KVM_EXEC_REGISTER_ENTRY_FPU); SET_ENTRY with ENTRY_GROUP_REGISTERED_FPU
+ * applies it instead of a supplied legacy_fpu group.
+ */
+#define KVM_EXEC_FEATURE_REGISTERED_ENTRY_FPU	(1ULL << 25)
 
 #define KVM_EXEC_INTERRUPT_DELIVERY_DIRECT_KICK	1U
 #define KVM_EXEC_INTERRUPT_DELIVERY_LOCAL_APIC_KICK 2U
@@ -1030,6 +1052,8 @@ struct kvm_ppc_resize_hpt {
 
 #define KVM_EXEC_ENTRY_GROUP_GPRS	(1ULL << 0)
 #define KVM_EXEC_ENTRY_GROUP_LEGACY_FPU	(1ULL << 1)
+/* REGISTERED_ENTRY_FPU: apply the capsule's registered legacy FPU image. */
+#define KVM_EXEC_ENTRY_GROUP_REGISTERED_FPU	(1ULL << 2)
 
 #define KVM_EXEC_ENTRY_PHASE_NONE	0U
 #define KVM_EXEC_ENTRY_PHASE_PENDING	1U
@@ -1170,7 +1194,16 @@ struct kvm_exec_invocation_end_status {
 	__u8 flags;
 	__u32 value;
 	__u64 wake_sequence;
-	__u64 reserved[3];
+	/*
+	 * INVOCATION_FUTEX: the last selection of this capsule that completed
+	 * without applying (rejected, stale, busy or blocked), by request
+	 * sequence and executor generation, and its completion status.
+	 * failed_selection is release-stored after the other two.
+	 */
+	__u64 failed_selection;
+	__u64 failed_executor;
+	__u32 failed_status;
+	__u32 reserved;
 };
 
 /*
@@ -1179,7 +1212,17 @@ struct kvm_exec_invocation_end_status {
  */
 struct kvm_exec_invocation_end_waiter {
 	__u64 waiting;
-	__u64 reserved[7];
+	/*
+	 * INVOCATION_FUTEX: KVM increments wake_word at each end and failed
+	 * selection, then wakes wake_address, the user address of wake_word in
+	 * the caller's mapping (zero: no futex wake).  Other user threads may
+	 * increment and wake it too.  The waiter reads the word before checking
+	 * end_sequence and sleeps only while it is unchanged.
+	 */
+	__u32 wake_word;
+	__u32 reserved0;
+	__u64 wake_address;
+	__u64 reserved[5];
 };
 
 /* KVM_EXEC_SET_INVOCATION_END on the domain fd: a cold capsule only. */
@@ -1218,6 +1261,19 @@ struct kvm_exec_wake_invocation_waiter {
 	/* Out: the capsule's wake_sequence after this wake. */
 	__u64 wake_sequence;
 	__u64 reserved;
+};
+
+/*
+ * KVM_EXEC_REGISTER_ENTRY_FPU on the domain fd: a capsule's legacy FPU image,
+ * validated like a supplied legacy_fpu group, for later SET_ENTRY commands
+ * naming ENTRY_GROUP_REGISTERED_FPU.  Not while the capsule has an admitted
+ * entry; the registration ends with the capsule's lifecycle.
+ */
+struct kvm_exec_register_entry_fpu {
+	__u64 capsule_id;
+	__u64 lifecycle_generation;
+	__u8 legacy_fpu[416];
+	__u64 reserved[2];
 };
 
 /*
@@ -1439,7 +1495,9 @@ struct kvm_exec_dispatch_header {
 	/* line 5: userspace-published command tail and completion head */
 	__u64 command_tail;
 	__u64 completion_head;
-	__u64 reserved4[6];
+	/* BOUNDARY_REQUEST: a change requests a boundary return. */
+	__u64 boundary_return_request;
+	__u64 reserved4[5];
 	/* line 6: userspace-published exit-request head and exit-completion tail */
 	__u64 exit_request_head;
 	__u64 exit_completion_tail;
@@ -1975,6 +2033,8 @@ struct kvm_exec_query_interrupt_publication {
 				_IOWR(KVMIO, 0xe7, struct kvm_exec_wait_invocation_end)
 #define KVM_EXEC_WAKE_INVOCATION_WAITER \
 				_IOWR(KVMIO, 0xe5, struct kvm_exec_wake_invocation_waiter)
+#define KVM_EXEC_REGISTER_ENTRY_FPU \
+				_IOW(KVMIO, 0xe4, struct kvm_exec_register_entry_fpu)
 
 /*
  * Extension capability list.

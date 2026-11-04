@@ -5,6 +5,7 @@
 #include <linux/file.h>
 #include <linux/kref.h>
 #include <linux/kvm_host.h>
+#include <linux/futex.h>
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/slab.h>
@@ -42,6 +43,10 @@
 
 static_assert(sizeof(struct kvm_exec_invocation_end_status) == 64);
 static_assert(sizeof(struct kvm_exec_invocation_end_waiter) == 64);
+static_assert(offsetof(struct kvm_exec_invocation_end_status, failed_selection) == 40);
+static_assert(offsetof(struct kvm_exec_invocation_end_status, failed_status) == 56);
+static_assert(offsetof(struct kvm_exec_invocation_end_waiter, wake_word) == 8);
+static_assert(offsetof(struct kvm_exec_invocation_end_waiter, wake_address) == 16);
 static_assert(KVM_EXEC_CAPSULE_END_STATUS_OFFSET ==
 	      KVM_EXEC_CAPSULE_ENTRY_CONTROL_SIZE);
 static_assert(KVM_EXEC_CAPSULE_ENTRY_CONTROL_SIZE ==
@@ -152,6 +157,13 @@ struct kvm_exec_entry_record {
 	u32 phase;
 	int error;
 	bool authorized;
+	/*
+	 * REGISTERED_ENTRY_FPU: the capsule's validated legacy FPU image, written
+	 * under domain->lock only while no entry is admitted and read when a
+	 * SET_ENTRY naming it is admitted.  Cleared with the lifecycle.
+	 */
+	bool fpu_registered;
+	u8 registered_fpu[416];
 };
 
 /* Allocated at attachment only for the negotiated portable protocol. */
@@ -242,6 +254,8 @@ struct kvm_exec_executor {
 	/* Boundary returns: honored where no selected entry waits to enter. */
 	atomic64_t boundary_return_epoch;
 	u64 consumed_boundary_return_epoch;
+	/* BOUNDARY_REQUEST: the header counter value last honored. */
+	u64 consumed_boundary_request;
 	/*
 	 * Written under domain->lock by mapped-exit publication and by a return
 	 * kick that lands behind that publication; read with READ_ONCE() outside
@@ -414,6 +428,16 @@ static bool kvm_exec_invocation_wake_negotiated(struct kvm_exec_domain *domain)
 	return domain->negotiated_features & KVM_EXEC_FEATURE_INVOCATION_WAKE;
 }
 
+static bool kvm_exec_invocation_futex_negotiated(struct kvm_exec_domain *domain)
+{
+	return domain->negotiated_features & KVM_EXEC_FEATURE_INVOCATION_FUTEX;
+}
+
+static bool kvm_exec_boundary_request_negotiated(struct kvm_exec_domain *domain)
+{
+	return domain->negotiated_features & KVM_EXEC_FEATURE_BOUNDARY_REQUEST;
+}
+
 static bool kvm_exec_end_registered(struct kvm_exec_capsule *capsule)
 {
 	return capsule && capsule->portable && capsule->portable->end_registered;
@@ -434,6 +458,28 @@ static struct kvm_exec_invocation_end_waiter *
 kvm_exec_end_waiter(struct kvm_exec_capsule *capsule)
 {
 	return (void *)capsule->portable->control + KVM_EXEC_CAPSULE_END_WAITER_OFFSET;
+}
+
+/*
+ * INVOCATION_FUTEX: wake a futex waiter of the capsule's end.  Bump the wake
+ * word, which the waiter reads before it rechecks its conditions and sleeps
+ * only while unchanged, then wake the user address it registered.  Both are
+ * user-written words of the control record: a wrong address only fails the
+ * wake or wakes another futex of the same process, since a private futex
+ * wake is keyed by current->mm, which domain access requires to be the
+ * domain's.  futex_wake orders the bump before its check for waiters.
+ */
+static void kvm_exec_wake_end_futex(struct kvm_exec_capsule *capsule)
+{
+	struct kvm_exec_invocation_end_waiter *waiter = kvm_exec_end_waiter(capsule);
+	u64 address;
+
+	if (!kvm_exec_invocation_futex_negotiated(capsule->domain))
+		return;
+	atomic_inc((atomic_t *)&waiter->wake_word);
+	address = READ_ONCE(waiter->wake_address);
+	if (address)
+		futex_wake_private_u32((u32 __user *)(unsigned long)address, INT_MAX);
 }
 
 /*
@@ -468,10 +514,14 @@ static void kvm_exec_cancel_end_waiters(struct kvm_exec_capsule *capsule)
 		return;
 	WRITE_ONCE(capsule->portable->end_cancelled, true);
 	wake_up_all(&capsule->portable->end_wait);
+	kvm_exec_wake_end_futex(capsule);
 }
 
 static bool kvm_exec_portable_advance(struct kvm_exec_capsule *capsule);
 static void kvm_exec_publish_capsule_status(struct kvm_exec_capsule *capsule);
+static void kvm_exec_notify_failed_selection(struct kvm_exec_executor *executor,
+					     const struct kvm_exec_command *command,
+					     u32 status);
 
 static bool kvm_exec_entry_pending(struct kvm_exec_capsule *capsule)
 {
@@ -650,6 +700,8 @@ static_assert(offsetof(struct kvm_exec_dispatch_header, command_tail) ==
 	      KVM_EXEC_DISPATCH_LINE(5));
 static_assert(offsetof(struct kvm_exec_dispatch_header, completion_head) ==
 	      KVM_EXEC_DISPATCH_LINE(5) + 8);
+static_assert(offsetof(struct kvm_exec_dispatch_header, boundary_return_request) ==
+	      KVM_EXEC_DISPATCH_LINE(5) + 16);
 static_assert(offsetof(struct kvm_exec_dispatch_header, exit_request_head) ==
 	      KVM_EXEC_DISPATCH_LINE(6));
 static_assert(offsetof(struct kvm_exec_dispatch_header, exit_completion_tail) ==
@@ -822,7 +874,10 @@ u64 kvm_exec_supported_features(void)
 	/* The end output retires through the supplied-entry protocol. */
 	if (features & KVM_EXEC_FEATURE_ENTRY_STATE_X86)
 		features |= KVM_EXEC_FEATURE_INVOCATION_END |
-			    KVM_EXEC_FEATURE_INVOCATION_WAKE;
+			    KVM_EXEC_FEATURE_INVOCATION_WAKE |
+			    KVM_EXEC_FEATURE_INVOCATION_FUTEX |
+			    KVM_EXEC_FEATURE_BOUNDARY_REQUEST |
+			    KVM_EXEC_FEATURE_REGISTERED_ENTRY_FPU;
 	return features;
 }
 
@@ -1363,6 +1418,7 @@ static int kvm_exec_attach_vcpu(struct kvm_exec_domain *domain,
 				memset(kvm_exec_end_status(capsule), 0,
 				       sizeof(struct kvm_exec_invocation_end_status));
 				WRITE_ONCE(kvm_exec_end_waiter(capsule)->waiting, 0);
+				WRITE_ONCE(kvm_exec_end_waiter(capsule)->wake_address, 0);
 			}
 			if (capsule->portable->entry) {
 				struct kvm_exec_entry_record *entry = capsule->portable->entry;
@@ -1378,6 +1434,7 @@ static int kvm_exec_attach_vcpu(struct kvm_exec_domain *domain,
 				entry->applied_groups = 0;
 				entry->error = 0;
 				entry->authorized = false;
+				entry->fpu_registered = false;
 				kvm_exec_publish_entry(capsule);
 			}
 			kvm_exec_publish_capsule_status(capsule);
@@ -1595,7 +1652,7 @@ static int kvm_exec_executor_release(struct inode *inode, struct file *file)
 		if (!capsule->portable && capsule->vcpu &&
 		    capsule->exit.completion_pending &&
 		    capsule->exit.async_executor_generation == executor->generation) {
-			domain->stopping = true;
+			WRITE_ONCE(domain->stopping, true);
 			kvm_exec_kick_running_locked(domain);
 			break;
 		}
@@ -1606,7 +1663,7 @@ static int kvm_exec_executor_release(struct inode *inode, struct file *file)
 
 		if (kvm_exec_interrupt_snapshot(executor, &interrupt) &&
 		    interrupt.delivery == KVM_EXEC_INTERRUPT_DELIVERY_POSTED)
-			domain->stopping = true;
+			WRITE_ONCE(domain->stopping, true);
 		kvm_exec_interrupt_abort(executor, false);
 		current_capsule->owner = NULL;
 		kvm_exec_portable_release(current_capsule);
@@ -2764,6 +2821,15 @@ static void kvm_exec_portable_accept(struct kvm_exec_capsule *capsule)
 	capsule->exit.async_reentry_required = false;
 }
 
+static u64 kvm_exec_entry_groups(struct kvm_exec_domain *domain)
+{
+	u64 groups = KVM_EXEC_ENTRY_GROUP_GPRS | KVM_EXEC_ENTRY_GROUP_LEGACY_FPU;
+
+	if (domain->negotiated_features & KVM_EXEC_FEATURE_REGISTERED_ENTRY_FPU)
+		groups |= KVM_EXEC_ENTRY_GROUP_REGISTERED_FPU;
+	return groups;
+}
+
 static int kvm_exec_entry_preflight(struct kvm_exec_executor *executor,
 				    struct kvm_exec_capsule *capsule,
 				    const struct kvm_exec_command *command, u32 slot)
@@ -2800,16 +2866,26 @@ static int kvm_exec_entry_preflight(struct kvm_exec_executor *executor,
 	if (kvm_exec_entry_unobserved(capsule))
 		return -EBUSY;
 	if (header.origin_executor_generation || header.origin_command_sequence ||
-	    !header.groups || header.groups &
-	    ~(KVM_EXEC_ENTRY_GROUP_GPRS | KVM_EXEC_ENTRY_GROUP_LEGACY_FPU) ||
+	    !header.groups || header.groups & ~kvm_exec_entry_groups(executor->domain) ||
+	    ((header.groups & KVM_EXEC_ENTRY_GROUP_REGISTERED_FPU) &&
+	     ((header.groups & KVM_EXEC_ENTRY_GROUP_LEGACY_FPU) || !entry->fpu_registered)) ||
 	    memchr_inv(shared->reserved, 0, sizeof(shared->reserved)))
 		return -EINVAL;
-	/* Provisional bytes are cold storage, not an admitted intent or vCPU state. */
-	entry->state.groups = header.groups;
+	/*
+	 * Provisional bytes are cold storage, not an admitted intent or vCPU state.
+	 * A registered image is copied from private memory, already validated,
+	 * and applied as a legacy FPU group.
+	 */
+	entry->state.groups = header.groups & ~KVM_EXEC_ENTRY_GROUP_REGISTERED_FPU;
 	if (header.groups & KVM_EXEC_ENTRY_GROUP_GPRS)
 		memcpy(entry->state.gprs, shared->gprs, sizeof(shared->gprs));
 	if (header.groups & KVM_EXEC_ENTRY_GROUP_LEGACY_FPU)
 		memcpy(entry->state.legacy_fpu, shared->legacy_fpu, sizeof(shared->legacy_fpu));
+	if (header.groups & KVM_EXEC_ENTRY_GROUP_REGISTERED_FPU) {
+		entry->state.groups |= KVM_EXEC_ENTRY_GROUP_LEGACY_FPU;
+		memcpy(entry->state.legacy_fpu, entry->registered_fpu,
+		       sizeof(entry->state.legacy_fpu));
+	}
 	return kvm_arch_vcpu_exec_validate_entry(capsule->vcpu, &entry->state);
 }
 
@@ -3773,6 +3849,7 @@ terminal:
 	if (!completion->previous_capsule_id)
 		kvm_exec_dispatch_previous(executor, completion);
 	kvm_exec_dispatch_owner(executor, completion);
+	kvm_exec_notify_failed_selection(executor, &command, status);
 	mutex_unlock(&domain->lock);
 	kvm_exec_dispatch_finish(executor, command.request_sequence, status);
 consumed:
@@ -3835,6 +3912,19 @@ static int kvm_exec_try_handoff(struct kvm_exec_executor *executor,
 	return ret;
 }
 
+/*
+ * BOUNDARY_REQUEST: the user-written request counter, zero without the
+ * feature.  Any value only causes a boundary return, which grants nothing.
+ * A publisher stores it, fences and kicks only a dispatcher advertising sleep;
+ * the dispatcher advertises sleep, fences and rereads it in kvm_exec_ready().
+ */
+static u64 kvm_exec_boundary_request(struct kvm_exec_executor *executor)
+{
+	if (!kvm_exec_boundary_request_negotiated(executor->domain))
+		return 0;
+	return READ_ONCE(kvm_exec_dispatch_header(executor)->boundary_return_request);
+}
+
 static bool kvm_exec_ready(struct kvm_exec_executor *executor, u64 kick_epoch,
 			   bool boundary)
 {
@@ -3849,10 +3939,12 @@ static bool kvm_exec_ready(struct kvm_exec_executor *executor, u64 kick_epoch,
 	return READ_ONCE(executor->domain->paused) ||
 	       READ_ONCE(executor->domain->stopping) ||
 	       atomic64_read(&executor->kick_epoch) != kick_epoch ||
-	       /* A boundary return changes only its own epoch. */
+	       /* A boundary return changes only its own epoch or counter. */
 	       (boundary &&
-		atomic64_read(&executor->boundary_return_epoch) !=
-			executor->consumed_boundary_return_epoch) ||
+		(atomic64_read(&executor->boundary_return_epoch) !=
+			executor->consumed_boundary_return_epoch ||
+		 kvm_exec_boundary_request(executor) !=
+			executor->consumed_boundary_request)) ||
 	       (command_tail != executor->command_head &&
 		!READ_ONCE(executor->gated_command_waiting)) ||
 	       exit_completion_tail != executor->exit_completion_head;
@@ -3867,11 +3959,14 @@ static bool kvm_exec_consume_boundary_return(struct kvm_exec_executor *executor,
 					     struct kvm_exec_capsule *capsule)
 {
 	u64 epoch = atomic64_read(&executor->boundary_return_epoch);
+	u64 request = kvm_exec_boundary_request(executor);
 
-	if (epoch == executor->consumed_boundary_return_epoch ||
+	if ((epoch == executor->consumed_boundary_return_epoch &&
+	     request == executor->consumed_boundary_request) ||
 	    (capsule && kvm_exec_entry_pending(capsule)))
 		return false;
 	executor->consumed_boundary_return_epoch = epoch;
+	executor->consumed_boundary_request = request;
 	return true;
 }
 
@@ -4313,9 +4408,49 @@ static void kvm_exec_publish_invocation_end(struct kvm_exec_capsule *capsule)
 	 * end_sequence: either it sees the new sequence or this sees its word.
 	 */
 	smp_mb();
-	if (READ_ONCE(kvm_exec_end_waiter(capsule)->waiting) ||
-	    wq_has_sleeper(&portable->end_wait))
+	if (READ_ONCE(kvm_exec_end_waiter(capsule)->waiting)) {
 		wake_up_all(&portable->end_wait);
+		kvm_exec_wake_end_futex(capsule);
+	} else if (wq_has_sleeper(&portable->end_wait)) {
+		wake_up_all(&portable->end_wait);
+	}
+}
+
+/*
+ * INVOCATION_FUTEX: a selection of a capsule with a registered end completed
+ * without applying, so no end will come for it.  Name it in the end record
+ * and wake the end waiter.  A cancellation before apply and a current
+ * mismatch follow the VMM's own withdrawal, which it reports itself.
+ */
+static void kvm_exec_notify_failed_selection(struct kvm_exec_executor *executor,
+					     const struct kvm_exec_command *command,
+					     u32 status)
+{
+	struct kvm_exec_domain *domain = executor->domain;
+	struct kvm_exec_invocation_end_status *end;
+	struct kvm_exec_capsule *capsule;
+
+	lockdep_assert_held(&domain->lock);
+	if (!kvm_exec_invocation_futex_negotiated(domain) ||
+	    !(command->flags & KVM_EXEC_CMD_F_SET_ENTRY) ||
+	    status == KVM_EXEC_COMPLETE_APPLIED ||
+	    status == KVM_EXEC_COMPLETE_RETURNED ||
+	    status == KVM_EXEC_COMPLETE_CANCELLED_BEFORE_APPLY ||
+	    status == KVM_EXEC_COMPLETE_CURRENT_MISMATCH ||
+	    !command->target_capsule_id || command->target_capsule_id > ULONG_MAX)
+		return;
+	capsule = xa_load(&domain->capsules, command->target_capsule_id);
+	if (!capsule || !capsule->vcpu || !kvm_exec_end_registered(capsule) ||
+	    capsule->lifecycle_generation != command->target_lifecycle_generation)
+		return;
+	end = kvm_exec_end_status(capsule);
+	WRITE_ONCE(end->failed_executor, executor->generation);
+	WRITE_ONCE(end->failed_status, status);
+	/* Pairs with the waiter's acquire after its wake. */
+	smp_store_release(&end->failed_selection, command->request_sequence);
+	smp_mb();
+	if (READ_ONCE(kvm_exec_end_waiter(capsule)->waiting))
+		kvm_exec_wake_end_futex(capsule);
 }
 
 /*
@@ -5065,7 +5200,7 @@ command_done:
 			mutex_lock(&domain->lock);
 			if (kvm_exec_interrupt_snapshot(executor, &interrupt) &&
 			    interrupt.delivery == KVM_EXEC_INTERRUPT_DELIVERY_POSTED)
-				domain->stopping = true;
+				WRITE_ONCE(domain->stopping, true);
 			kvm_exec_interrupt_abort(executor, false);
 			mutex_unlock(&domain->lock);
 			run.return_reason = KVM_EXEC_RETURN_CPU_MIGRATED;
@@ -5243,21 +5378,18 @@ static long kvm_exec_kick(struct kvm_exec_executor *executor,
 
 	/* Pair the userspace command publication with the runner's acquire load. */
 	smp_mb();
-	mutex_lock(&domain->lock);
-	if (domain->stopping) {
-		mutex_unlock(&domain->lock);
-		return -ESHUTDOWN;
-	}
 	/*
 	 * A completion or a published command is already visible to the
 	 * dispatcher's wait condition: only wake it.  Unlike an ordinary kick
 	 * this neither stops a running vCPU nor blocks a selected entry, so a
 	 * wake that races a dispatcher that saw the command before it slept
-	 * costs nothing.
+	 * costs nothing.  Nothing here changes domain state, so no domain lock:
+	 * a stopping domain's dispatcher returns on its own.
 	 */
 	if (kick.flags & (KVM_EXEC_KICK_F_COMPLETION_AVAILABLE |
 			  KVM_EXEC_KICK_F_WAKE_SLEEPING)) {
-		mutex_unlock(&domain->lock);
+		if (READ_ONCE(domain->stopping))
+			return -ESHUTDOWN;
 		wake_up_interruptible(&executor->dispatch_wait);
 		return 0;
 	}
@@ -5266,12 +5398,19 @@ static long kvm_exec_kick(struct kvm_exec_executor *executor,
 		 * Return at the dispatcher's next pass boundary: the running
 		 * guest's next exit or end, or a sleep.  Neither the kick epoch
 		 * nor a running vCPU is disturbed, so a selected entry is never
-		 * left interrupted.  The wake covers a sleeping dispatcher.
+		 * left interrupted.  The wake covers a sleeping dispatcher; the
+		 * epoch is atomic and read under the waitqueue's ordering.
 		 */
+		if (READ_ONCE(domain->stopping))
+			return -ESHUTDOWN;
 		atomic64_inc(&executor->boundary_return_epoch);
-		mutex_unlock(&domain->lock);
 		wake_up_interruptible(&executor->dispatch_wait);
 		return 0;
+	}
+	mutex_lock(&domain->lock);
+	if (domain->stopping) {
+		mutex_unlock(&domain->lock);
+		return -ESHUTDOWN;
 	}
 	epoch = atomic64_inc_return(&executor->kick_epoch);
 	capsule = kvm_exec_current_capsule(executor);
@@ -6906,7 +7045,7 @@ static void kvm_exec_domain_stop(struct kvm_exec_domain *domain)
 	unsigned long index;
 
 	mutex_lock(&domain->lock);
-	domain->stopping = true;
+	WRITE_ONCE(domain->stopping, true);
 	domain->paused = true;
 	if (domain->notification_runner) {
 		runner = domain->notification_runner;
@@ -7241,6 +7380,57 @@ static long kvm_exec_wake_invocation_waiter(struct kvm_exec_domain *domain,
 	return 0;
 }
 
+/*
+ * Register a capsule's legacy FPU image for SET_ENTRY commands naming
+ * ENTRY_GROUP_REGISTERED_FPU.  The image is validated as a supplied group
+ * would be and kept in private memory, so admission copies it without reading
+ * shared memory.  A capsule with an admitted entry keeps its registration.
+ */
+static long kvm_exec_register_entry_fpu(struct kvm_exec_domain *domain,
+					void __user *argp)
+{
+	struct kvm_exec_register_entry_fpu reg;
+	struct kvm_exec_entry_state *state;
+	struct kvm_exec_entry_record *entry;
+	struct kvm_exec_capsule *capsule;
+	long ret;
+
+	if (!(domain->negotiated_features & KVM_EXEC_FEATURE_REGISTERED_ENTRY_FPU))
+		return -EOPNOTSUPP;
+	if (copy_from_user(&reg, argp, sizeof(reg)))
+		return -EFAULT;
+	if (memchr_inv(reg.reserved, 0, sizeof(reg.reserved)) ||
+	    !reg.capsule_id || reg.capsule_id > ULONG_MAX || !reg.lifecycle_generation)
+		return -EINVAL;
+	state = kzalloc(sizeof(*state), GFP_KERNEL_ACCOUNT);
+	if (!state)
+		return -ENOMEM;
+	state->groups = KVM_EXEC_ENTRY_GROUP_LEGACY_FPU;
+	memcpy(state->legacy_fpu, reg.legacy_fpu, sizeof(state->legacy_fpu));
+	mutex_lock(&domain->lock);
+	capsule = xa_load(&domain->capsules, reg.capsule_id);
+	if (!capsule || !capsule->vcpu || !capsule->portable ||
+	    !capsule->portable->entry ||
+	    capsule->lifecycle_generation != reg.lifecycle_generation || domain->stopping) {
+		ret = -ESTALE;
+		goto out;
+	}
+	entry = capsule->portable->entry;
+	if (kvm_exec_entry_pending(capsule) || kvm_exec_entry_unobserved(capsule)) {
+		ret = -EBUSY;
+		goto out;
+	}
+	ret = kvm_arch_vcpu_exec_validate_entry(capsule->vcpu, state);
+	if (ret)
+		goto out;
+	memcpy(entry->registered_fpu, state->legacy_fpu, sizeof(entry->registered_fpu));
+	entry->fpu_registered = true;
+out:
+	mutex_unlock(&domain->lock);
+	kfree(state);
+	return ret;
+}
+
 static long kvm_exec_domain_ioctl(struct file *file, unsigned int ioctl,
 				  unsigned long arg)
 {
@@ -7260,6 +7450,8 @@ static long kvm_exec_domain_ioctl(struct file *file, unsigned int ioctl,
 		return kvm_exec_set_invocation_end(domain, argp);
 	case KVM_EXEC_WAIT_INVOCATION_END:
 		return kvm_exec_wait_invocation_end(domain, argp);
+	case KVM_EXEC_REGISTER_ENTRY_FPU:
+		return kvm_exec_register_entry_fpu(domain, argp);
 	case KVM_EXEC_WAKE_INVOCATION_WAITER:
 		return kvm_exec_wake_invocation_waiter(domain, argp);
 	case KVM_EXEC_DISCARD_ENTRY:
@@ -7374,6 +7566,12 @@ int kvm_dev_ioctl_create_exec_domain(void __user *argp)
 	     KVM_EXEC_INVOCATION_END_REQUIRED) ||
 	    ((create.requested_features & KVM_EXEC_FEATURE_INVOCATION_WAKE) &&
 	     !(create.requested_features & KVM_EXEC_FEATURE_INVOCATION_END)) ||
+	    ((create.requested_features & KVM_EXEC_FEATURE_INVOCATION_FUTEX) &&
+	     !(create.requested_features & KVM_EXEC_FEATURE_INVOCATION_WAKE)) ||
+	    ((create.requested_features & KVM_EXEC_FEATURE_BOUNDARY_REQUEST) &&
+	     !(create.requested_features & KVM_EXEC_FEATURE_INVOCATION_END)) ||
+	    ((create.requested_features & KVM_EXEC_FEATURE_REGISTERED_ENTRY_FPU) &&
+	     !(create.requested_features & KVM_EXEC_FEATURE_ENTRY_STATE_X86)) ||
 	    ((create.requested_features & KVM_EXEC_FEATURE_CROSS_VM_CHAIN) &&
 	     !(create.requested_features & KVM_EXEC_FEATURE_INTRA_VM_CHAIN)) ||
 	    ((create.requested_features & KVM_EXEC_FEATURE_SYNC_EXITS) &&
