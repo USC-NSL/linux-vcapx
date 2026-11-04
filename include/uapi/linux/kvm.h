@@ -904,6 +904,11 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_FEATURE_INSPECTION_X86		(1ULL << 20)
 /* A capsule may register the exact output PIO that ends its invocation. */
 #define KVM_EXEC_FEATURE_INVOCATION_END		(1ULL << 21)
+/*
+ * User space may wake a capsule's end waiter; requires INVOCATION_END.  Such
+ * kernels also keep an ended capsule's boundary epoch until it runs again.
+ */
+#define KVM_EXEC_FEATURE_INVOCATION_WAKE	(1ULL << 22)
 
 #define KVM_EXEC_INTERRUPT_DELIVERY_DIRECT_KICK	1U
 #define KVM_EXEC_INTERRUPT_DELIVERY_LOCAL_APIC_KICK 2U
@@ -1152,7 +1157,9 @@ struct kvm_exec_entry_observation {
  * KVM is the only writer.  Registration writes the output and flags; each
  * invocation end writes exit_sequence and then release-stores end_sequence
  * after the capsule's run page holds the complete end view.  A reader
- * acquire-loads end_sequence and checks lifecycle_generation first.
+ * acquire-loads end_sequence and checks lifecycle_generation first.  With
+ * KVM_EXEC_FEATURE_INVOCATION_WAKE, each KVM_EXEC_WAKE_INVOCATION_WAITER
+ * release-stores an incremented wake_sequence.
  */
 struct kvm_exec_invocation_end_status {
 	__u64 lifecycle_generation;
@@ -1162,7 +1169,8 @@ struct kvm_exec_invocation_end_status {
 	__u8 width;
 	__u8 flags;
 	__u32 value;
-	__u64 reserved[4];
+	__u64 wake_sequence;
+	__u64 reserved[3];
 };
 
 /*
@@ -1193,7 +1201,23 @@ struct kvm_exec_wait_invocation_end {
 	/* Zero waits without a timeout. */
 	__u64 timeout_ns;
 	__u64 end_sequence;
-	__u64 reserved[2];
+	/*
+	 * With KVM_EXEC_FEATURE_INVOCATION_WAKE the wait also returns, without
+	 * an end, once the capsule's wake_sequence passes after_wake, which the
+	 * waiter reads before checking its own state.  KVM returns the current
+	 * wake_sequence.  Both are zero without the feature.
+	 */
+	__u64 after_wake;
+	__u64 wake_sequence;
+};
+
+/* KVM_EXEC_WAKE_INVOCATION_WAITER on the domain fd. */
+struct kvm_exec_wake_invocation_waiter {
+	__u64 capsule_id;
+	__u64 lifecycle_generation;
+	/* Out: the capsule's wake_sequence after this wake. */
+	__u64 wake_sequence;
+	__u64 reserved;
 };
 
 /*
@@ -1949,6 +1973,8 @@ struct kvm_exec_query_interrupt_publication {
 				_IOW(KVMIO, 0xe6, struct kvm_exec_invocation_end)
 #define KVM_EXEC_WAIT_INVOCATION_END \
 				_IOWR(KVMIO, 0xe7, struct kvm_exec_wait_invocation_end)
+#define KVM_EXEC_WAKE_INVOCATION_WAITER \
+				_IOWR(KVMIO, 0xe5, struct kvm_exec_wake_invocation_waiter)
 
 /*
  * Extension capability list.
