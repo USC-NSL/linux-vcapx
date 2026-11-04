@@ -5,6 +5,8 @@
 #include <linux/sched/signal.h>
 #include <linux/freezer.h>
 
+#include <linux/export.h>
+
 #include "futex.h"
 
 /*
@@ -199,6 +201,22 @@ int futex_wake(u32 __user *uaddr, unsigned int flags, int nr_wake, u32 bitset)
 	wake_up_q(&wake_q);
 	return ret;
 }
+
+/**
+ * futex_wake_private_u32 - FUTEX_WAKE_PRIVATE on a 32-bit word of current->mm
+ * @uaddr:	user address of the futex word
+ * @nr_wake:	maximum number of waiters to wake
+ *
+ * For in-kernel wakers acting for the current process, such as KVM waking a
+ * thread that sleeps on a word the process registered.  The caller changes
+ * the word first; the wake orders that change before it checks for waiters.
+ * An invalid address only fails the wake.  Return: woken waiters or -errno.
+ */
+int futex_wake_private_u32(u32 __user *uaddr, int nr_wake)
+{
+	return futex_wake(uaddr, FLAGS_SIZE_32, nr_wake, FUTEX_BITSET_MATCH_ANY);
+}
+EXPORT_SYMBOL_GPL(futex_wake_private_u32);
 
 static int futex_atomic_op_inuser(unsigned int encoded_op, u32 __user *uaddr)
 {
