@@ -68,6 +68,7 @@
 #include <trace/events/kvm.h>
 
 #include <linux/kvm_dirty_ring.h>
+#include "run_return_trace.h"
 
 
 /* Worst case buffer size needed for holding an integer. */
@@ -4487,6 +4488,7 @@ static long kvm_vcpu_ioctl(struct file *filp,
 		if (arg)
 			goto out;
 		r = kvm_vcpu_run(vcpu);
+		kvm_trace_run_return(vcpu, r);
 		break;
 	}
 	case KVM_GET_REGS: {
@@ -6319,6 +6321,7 @@ static void kvm_init_debug(void)
 	int i;
 
 	kvm_debugfs_dir = debugfs_create_dir("kvm", NULL);
+	kvm_return_trace_init(kvm_debugfs_dir);
 
 	for (i = 0; i < kvm_vm_stats_header.num_desc; ++i) {
 		pdesc = &kvm_vm_stats_desc[i];
@@ -6552,6 +6555,7 @@ void kvm_exit(void)
 	misc_deregister(&kvm_dev);
 
 	debugfs_remove_recursive(kvm_debugfs_dir);
+	kvm_return_trace_destroy();
 	for_each_possible_cpu(cpu)
 		free_cpumask_var(per_cpu(cpu_kick_mask, cpu));
 	kmem_cache_destroy(kvm_vcpu_cache);
