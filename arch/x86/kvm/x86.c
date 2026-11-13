@@ -5830,6 +5830,23 @@ long kvm_arch_vcpu_ioctl(struct file *filp,
 		void *buffer;
 	} u;
 
+	/*
+	 * Attached capsules enter only through their exact executor.  Queuing
+	 * an ordinary interrupt changes software state under the vCPU mutex;
+	 * it does not need to load the VMCS on this control thread's CPU.
+	 * Keep the common ioctl completion hook responsible for HLT readiness.
+	 * Loading here would synchronously move the VMCS away from its executor
+	 * and force another move back on the next exact entry.
+	 */
+	if (vcpu->exec_capsule && ioctl == KVM_INTERRUPT) {
+		struct kvm_interrupt irq;
+
+		lockdep_assert_held(&vcpu->mutex);
+		if (copy_from_user(&irq, argp, sizeof(irq)))
+			return -EFAULT;
+		return kvm_vcpu_ioctl_interrupt(vcpu, &irq);
+	}
+
 	vcpu_load(vcpu);
 
 	u.buffer = NULL;
