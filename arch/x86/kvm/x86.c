@@ -5157,7 +5157,16 @@ static int kvm_vcpu_ioctl_interrupt(struct kvm_vcpu *vcpu,
 	if (pic_in_kernel(vcpu->kvm))
 		return -ENXIO;
 
-	if (vcpu->arch.pending_external_vector != -1)
+	/*
+	 * An attached capsule can retain an ordinary wake across rejected
+	 * dispatch or a later HLT boundary.  Coalesce the identical pending
+	 * vector so the successful-ioctl hook can clear that HLT block.  It
+	 * still takes an exact executor command to run the capsule.  Preserve
+	 * EEXIST for another vector and for ordinary, unattached KVM_RUN users.
+	 */
+	if (vcpu->arch.pending_external_vector != -1 &&
+	    (!vcpu->exec_capsule ||
+	     vcpu->arch.pending_external_vector != irq->irq))
 		return -EEXIST;
 
 	vcpu->arch.pending_external_vector = irq->irq;

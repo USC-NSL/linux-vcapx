@@ -2182,6 +2182,16 @@ static void guest_halt_then_spin(void)
 		asm volatile("pause");
 }
 
+static void guest_halt_with_pending_wake(void)
+{
+	WRITE_ONCE(halt_wake_progress, 1);
+	/* Model a wake queued before a later guest idle boundary. */
+	asm volatile("cli; hlt; sti; nop; cli" ::: "memory");
+	WRITE_ONCE(halt_wake_progress, 2);
+	for (;;)
+		asm volatile("pause");
+}
+
 static void guest_halt_wake_stress(void)
 {
 	for (;;) {
@@ -6732,7 +6742,8 @@ static void test_pending_exact_interrupt_yields_to_release(int kvm_fd)
 	kvm_vm_free(vm);
 }
 
-static void test_halt_wake_requires_exact_dispatch(int kvm_fd, bool split_irqchip)
+static void test_halt_wake_requires_exact_dispatch(int kvm_fd, bool split_irqchip,
+						 bool pending_before_halt)
 {
 	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
 				  KVM_EXEC_FEATURE_DYNAMIC_DISPATCH |
@@ -6768,7 +6779,8 @@ static void test_halt_wake_requires_exact_dispatch(int kvm_fd, bool split_irqchi
 	vm = __vm_create_without_irqchip(VM_SHAPE_DEFAULT, 1, 0);
 	if (split_irqchip)
 		vm_enable_cap(vm, KVM_CAP_SPLIT_IRQCHIP, 24);
-	vcpu = vm_vcpu_add(vm, 0, guest_halt_then_spin);
+	vcpu = vm_vcpu_add(vm, 0, pending_before_halt ?
+			   guest_halt_with_pending_wake : guest_halt_then_spin);
 	disable_nested_cpuid(vcpu);
 	vm_init_descriptor_tables(vm);
 	vcpu_init_descriptor_tables(vcpu);
@@ -6778,6 +6790,14 @@ static void test_halt_wake_requires_exact_dispatch(int kvm_fd, bool split_irqchi
 	interrupts = addr_gva2hva(vm, (vm_vaddr_t)&halt_wake_interrupts);
 	WRITE_ONCE(*progress, 0);
 	WRITE_ONCE(*interrupts, 0);
+
+	if (pending_before_halt) {
+		/* Ordinary, unattached KVM_INTERRUPT keeps its EEXIST contract. */
+		TEST_ASSERT(split_irqchip, "pending wake test needs a split irqchip");
+		ret = ioctl(vcpu->fd, KVM_INTERRUPT, &irq);
+		TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_INTERRUPT, ret));
+		assert_ioctl_errno(vcpu->fd, KVM_INTERRUPT, &irq, EEXIST);
+	}
 
 	domain_fd = create_domain_with_features(kvm_fd, 1, 1, features,
 						&domain_generation);
@@ -6835,8 +6855,23 @@ static void test_halt_wake_requires_exact_dispatch(int kvm_fd, bool split_irqchi
 	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_TARGET_BLOCKED);
 	TEST_ASSERT_EQ(READ_ONCE(*progress), 1);
 
+	if (pending_before_halt) {
+		struct kvm_interrupt other = { .irq = HALT_WAKE_VECTOR + 1 };
+
+		/* A different vector cannot replace or wake the pending event. */
+		assert_ioctl_errno(vcpu->fd, KVM_INTERRUPT, &other, EEXIST);
+		ret = ioctl(domain_fd, KVM_EXEC_QUERY_CAPSULE, &capsule);
+		TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_EXEC_QUERY_CAPSULE, ret));
+		TEST_ASSERT_EQ(capsule.state, KVM_EXEC_CAPSULE_STATE_BLOCKED_HLT);
+		TEST_ASSERT_EQ(capsule.wake_count, 0);
+	}
 	ret = ioctl(vcpu->fd, KVM_INTERRUPT, &irq);
 	TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_INTERRUPT, ret));
+	if (pending_before_halt) {
+		/* Retrying again coalesces; it must not count another HLT wake. */
+		ret = ioctl(vcpu->fd, KVM_INTERRUPT, &irq);
+		TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_INTERRUPT, ret));
+	}
 	for (i = 0; i < 10000; i++)
 		sched_yield();
 	TEST_ASSERT_EQ(READ_ONCE(*progress), 1);
@@ -8254,9 +8289,15 @@ int main(int argc, char **argv)
 		close(kvm_fd);
 		return 0;
 	}
+	if (argc == 2 && !strcmp(argv[1], "--pending-wake-only")) {
+		test_halt_wake_requires_exact_dispatch(kvm_fd, true, true);
+		close(kvm_fd);
+		return 0;
+	}
 	if (argc == 2 && !strcmp(argv[1], "--halt-wake-only")) {
-		test_halt_wake_requires_exact_dispatch(kvm_fd, false);
-		test_halt_wake_requires_exact_dispatch(kvm_fd, true);
+		test_halt_wake_requires_exact_dispatch(kvm_fd, false, false);
+		test_halt_wake_requires_exact_dispatch(kvm_fd, true, false);
+		test_halt_wake_requires_exact_dispatch(kvm_fd, true, true);
 		test_split_irqchip_deferred_pio_halt_returns_to_dispatcher(kvm_fd);
 		test_halt_wake_dispatch_stress(kvm_fd);
 		close(kvm_fd);
@@ -8342,8 +8383,9 @@ int main(int argc, char **argv)
 		test_apic_interrupt_waits_for_eoi(
 			kvm_fd, KVM_EXEC_INTERRUPT_DELIVERY_POSTED);
 	}
-	test_halt_wake_requires_exact_dispatch(kvm_fd, false);
-	test_halt_wake_requires_exact_dispatch(kvm_fd, true);
+	test_halt_wake_requires_exact_dispatch(kvm_fd, false, false);
+	test_halt_wake_requires_exact_dispatch(kvm_fd, true, false);
+	test_halt_wake_requires_exact_dispatch(kvm_fd, true, true);
 	test_split_irqchip_deferred_pio_halt_returns_to_dispatcher(kvm_fd);
 	test_halt_wake_dispatch_stress(kvm_fd);
 	test_cross_vm_halt_interrupt_migration(kvm_fd);
