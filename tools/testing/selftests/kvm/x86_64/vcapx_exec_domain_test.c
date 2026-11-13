@@ -6732,7 +6732,7 @@ static void test_pending_exact_interrupt_yields_to_release(int kvm_fd)
 	kvm_vm_free(vm);
 }
 
-static void test_halt_wake_requires_exact_dispatch(int kvm_fd)
+static void test_halt_wake_requires_exact_dispatch(int kvm_fd, bool split_irqchip)
 {
 	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
 				  KVM_EXEC_FEATURE_DYNAMIC_DISPATCH |
@@ -6766,6 +6766,8 @@ static void test_halt_wake_requires_exact_dispatch(int kvm_fd)
 	int domain_fd, executor_fd, ret, i;
 
 	vm = __vm_create_without_irqchip(VM_SHAPE_DEFAULT, 1, 0);
+	if (split_irqchip)
+		vm_enable_cap(vm, KVM_CAP_SPLIT_IRQCHIP, 24);
 	vcpu = vm_vcpu_add(vm, 0, guest_halt_then_spin);
 	disable_nested_cpuid(vcpu);
 	vm_init_descriptor_tables(vm);
@@ -8253,7 +8255,8 @@ int main(int argc, char **argv)
 		return 0;
 	}
 	if (argc == 2 && !strcmp(argv[1], "--halt-wake-only")) {
-		test_halt_wake_requires_exact_dispatch(kvm_fd);
+		test_halt_wake_requires_exact_dispatch(kvm_fd, false);
+		test_halt_wake_requires_exact_dispatch(kvm_fd, true);
 		test_split_irqchip_deferred_pio_halt_returns_to_dispatcher(kvm_fd);
 		test_halt_wake_dispatch_stress(kvm_fd);
 		close(kvm_fd);
@@ -8339,7 +8342,8 @@ int main(int argc, char **argv)
 		test_apic_interrupt_waits_for_eoi(
 			kvm_fd, KVM_EXEC_INTERRUPT_DELIVERY_POSTED);
 	}
-	test_halt_wake_requires_exact_dispatch(kvm_fd);
+	test_halt_wake_requires_exact_dispatch(kvm_fd, false);
+	test_halt_wake_requires_exact_dispatch(kvm_fd, true);
 	test_split_irqchip_deferred_pio_halt_returns_to_dispatcher(kvm_fd);
 	test_halt_wake_dispatch_stress(kvm_fd);
 	test_cross_vm_halt_interrupt_migration(kvm_fd);

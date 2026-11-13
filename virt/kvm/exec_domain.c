@@ -945,6 +945,17 @@ bool kvm_exec_domain_vcpu_exit_on_hlt(struct kvm_vcpu *vcpu)
 {
 	struct kvm_exec_capsule *capsule = READ_ONCE(vcpu->exec_capsule);
 
+	/*
+	 * An attached lifecycle-aware capsule must reach the dispatcher on HLT
+	 * even with an in-kernel LAPIC. Otherwise kvm_vcpu_run() sleeps inside
+	 * the old capsule, hiding BLOCKED_HLT from the VMM and preventing exact
+	 * ownership commands from being consumed. Retained-interrupt HLT is
+	 * still handled by the dispatcher's existing retained-halt protocol.
+	 */
+	if (capsule && (capsule->domain->negotiated_features &
+		       KVM_EXEC_FEATURE_LIFECYCLE_STATE))
+		return true;
+
 	return capsule &&
 	       READ_ONCE(capsule->exit.completion_pending) &&
 	       READ_ONCE(capsule->exit.async_completion_ready) &&
