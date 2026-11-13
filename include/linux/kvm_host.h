@@ -1508,6 +1508,8 @@ int kvm_arch_vcpu_exec_apply_entry(struct kvm_vcpu *vcpu,
 				  const struct kvm_exec_entry_state *state);
 int kvm_exec_vcpu_apply_entry(struct kvm_vcpu *vcpu);
 u64 kvm_arch_exec_supported_features(void);
+/* IRQs and preemption disabled; returns 1 after a hardware wait, 0 on a race. */
+int kvm_arch_exec_hardware_wait(atomic64_t *sequence, s64 expected);
 int kvm_arch_vcpu_exec_inject_interrupt(struct kvm_vcpu *vcpu, u32 vector);
 bool kvm_arch_vcpu_exec_direct_pending(struct kvm_vcpu *vcpu, u32 vector);
 void kvm_arch_vcpu_exec_cancel_direct(struct kvm_vcpu *vcpu, u32 vector);

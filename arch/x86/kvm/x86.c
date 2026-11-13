@@ -67,6 +67,7 @@
 #include <trace/events/kvm.h>
 
 #include <asm/debugreg.h>
+#include <asm/mwait.h>
 #include <asm/msr.h>
 #include <asm/tsc.h>
 #include <asm/desc.h>
@@ -11425,6 +11426,55 @@ bool kvm_arch_vcpu_exec_portable_supported(struct kvm_vcpu *vcpu)
 	return !vcpu->arch.guest_state_protected;
 }
 
+/* CPUID is stable for a logical CPU. Cache leaf 5 off the ordinary wait path.
+ * The current CPU's feature/erratum flags are still checked on every use.
+ */
+static DEFINE_PER_CPU(int, exec_mwait_capability);
+
+static bool kvm_exec_mwait_supported_this_cpu(void)
+{
+	const struct cpuinfo_x86 *info = &cpu_data(smp_processor_id());
+	u32 eax, ebx, ecx, edx;
+	int supported;
+
+	lockdep_assert_preemption_disabled();
+	if (info->x86_vendor != X86_VENDOR_INTEL || info->cpuid_level < 5 ||
+	    !this_cpu_has(X86_FEATURE_MWAIT) ||
+	    !this_cpu_has(X86_FEATURE_ARAT) ||
+	    cpu_has_bug(info, X86_BUG_MONITOR) ||
+	    cpu_has_bug(info, X86_BUG_CLFLUSH_MONITOR))
+		return false;
+	supported = this_cpu_read(exec_mwait_capability);
+	if (!supported) {
+		cpuid(CPUID_MWAIT_LEAF, &eax, &ebx, &ecx, &edx);
+		supported = (ecx & CPUID5_ECX_EXTENSIONS_SUPPORTED) &&
+			    (ecx & CPUID5_ECX_INTERRUPT_BREAK) &&
+			    (edx & MWAIT_C1_SUBSTATE_MASK) ? 1 : -1;
+		this_cpu_write(exec_mwait_capability, supported);
+	}
+	return supported > 0;
+}
+
+int kvm_arch_exec_hardware_wait(atomic64_t *sequence, s64 expected)
+{
+	lockdep_assert_irqs_disabled();
+	lockdep_assert_preemption_disabled();
+	if (!kvm_exec_mwait_supported_this_cpu())
+		return -EOPNOTSUPP;
+	/* The generic waiter already checked readiness after arming its epoch.
+	 * Recheck after MONITOR, so a store before arming cannot be missed.
+	 * Interrupt-break covers signals, rescheduling and the bounded timer,
+	 * including an interrupt arriving between the final check and MWAIT.
+	 */
+	__monitor(sequence, 0, 0);
+	smp_mb();
+	if (atomic64_read(sequence) != expected || need_resched() ||
+	    signal_pending(current))
+		return 0;
+	__mwait(0, MWAIT_ECX_INTERRUPT_BREAK);
+	return 1;
+}
+
 u64 kvm_arch_exec_supported_features(void)
 {
 	u64 features = static_call(kvm_x86_exec_posted_interrupt_supported)() ?
@@ -11433,6 +11483,10 @@ u64 kvm_arch_exec_supported_features(void)
 	if (IS_ENABLED(CONFIG_X86_64) && cpu_feature_enabled(X86_FEATURE_FXSR))
 		features |= KVM_EXEC_FEATURE_ENTRY_STATE_X86 |
 			    KVM_EXEC_FEATURE_INSPECTION_X86;
+	preempt_disable();
+	if (kvm_exec_mwait_supported_this_cpu())
+		features |= KVM_EXEC_FEATURE_HARDWARE_WAIT;
+	preempt_enable();
 	return features;
 }
 

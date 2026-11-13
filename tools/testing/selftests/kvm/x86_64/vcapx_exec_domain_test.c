@@ -12,6 +12,7 @@
 #include <sys/fsuid.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -2391,6 +2392,8 @@ struct dispatch_run_arg {
 	int error;
 	bool finished;
 	bool reenter_signals;
+	pid_t tid;
+	int return_cpu;
 	uint64_t signal_returns;
 };
 
@@ -2622,6 +2625,7 @@ static void *dispatch_runner(void *opaque)
 	uint64_t domain_generation = arg->run.domain_generation;
 	uint64_t executor_generation = arg->run.executor_generation;
 
+	__atomic_store_n(&arg->tid, syscall(SYS_gettid), __ATOMIC_RELEASE);
 	for (;;) {
 		errno = 0;
 		arg->ret = ioctl(arg->executor_fd, KVM_EXEC_RUN_DISPATCH,
@@ -2638,6 +2642,7 @@ static void *dispatch_runner(void *opaque)
 			.executor_generation = executor_generation,
 		};
 	}
+	arg->return_cpu = sched_getcpu();
 	__atomic_store_n(&arg->finished, true, __ATOMIC_RELEASE);
 	return NULL;
 }
@@ -3814,7 +3819,8 @@ static void test_output_gate_holds_across_dispatcher_iterations(int kvm_fd)
 	kvm_vm_free(donor_vm);
 }
 
-static void test_output_gate_resumes_after_nonmatching_output(int kvm_fd, bool command_wait)
+static void test_output_gate_resumes_after_nonmatching_output(int kvm_fd, bool command_wait,
+						      bool hardware_wait)
 {
 	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
 				  KVM_EXEC_FEATURE_INTRA_VM_CHAIN |
@@ -3826,7 +3832,8 @@ static void test_output_gate_resumes_after_nonmatching_output(int kvm_fd, bool c
 				  KVM_EXEC_FEATURE_LIFECYCLE_STATE |
 				  KVM_EXEC_FEATURE_ASYNC_PIO_HANDOFF |
 				  KVM_EXEC_FEATURE_PIO_WRITE_GATE |
-				  (command_wait ? KVM_EXEC_FEATURE_COMMAND_WAIT : 0);
+				  (command_wait ? KVM_EXEC_FEATURE_COMMAND_WAIT : 0) |
+				  (hardware_wait ? KVM_EXEC_FEATURE_HARDWARE_WAIT : 0);
 	struct kvm_exec_command donor_command = {
 		.opcode = KVM_EXEC_CMD_SWITCH,
 		.request_sequence = 1,
@@ -3890,6 +3897,7 @@ static void test_output_gate_resumes_after_nonmatching_output(int kvm_fd, bool c
 		    "nonmatching-output-gate donor command did not publish");
 	run_arg.run = (struct kvm_exec_run_dispatch) {
 		.size = sizeof(run_arg.run),
+		.flags = hardware_wait ? KVM_EXEC_DISPATCH_F_HARDWARE_WAIT : 0,
 		.domain_generation = domain_generation,
 		.executor_generation = executor_generation,
 	};
@@ -3911,7 +3919,8 @@ static void test_output_gate_resumes_after_nonmatching_output(int kvm_fd, bool c
 		TEST_ASSERT_EQ(run_arg.run.return_reason, KVM_EXEC_RETURN_SIGNAL);
 		run_arg.run = (struct kvm_exec_run_dispatch) {
 			.size = sizeof(run_arg.run),
-			.flags = KVM_EXEC_DISPATCH_F_WAIT_FOR_COMMAND,
+			.flags = KVM_EXEC_DISPATCH_F_WAIT_FOR_COMMAND |
+				(hardware_wait ? KVM_EXEC_DISPATCH_F_HARDWARE_WAIT : 0),
 			.domain_generation = domain_generation,
 			.executor_generation = executor_generation,
 			.command_head = run_arg.run.command_head,
@@ -6982,7 +6991,8 @@ static void test_halt_wake_requires_exact_dispatch(int kvm_fd, bool split_irqchi
  * dispatch is unsafe: a wake-only kick can enter the old, now-ready capsule.
  * The control is deliberately expected to fail the no-entry assertion.
  */
-static void test_command_wait_halt(int kvm_fd, bool control, bool wake_before_wait)
+static void test_command_wait_halt(int kvm_fd, bool control, bool wake_before_wait,
+				   bool hardware_wait)
 {
 	uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
 		KVM_EXEC_FEATURE_DYNAMIC_DISPATCH | KVM_EXEC_FEATURE_SYNC_EXITS |
@@ -7007,6 +7017,8 @@ static void test_command_wait_halt(int kvm_fd, bool control, bool wake_before_wa
 
 	if (!control)
 		features |= KVM_EXEC_FEATURE_COMMAND_WAIT;
+	if (hardware_wait)
+		features |= KVM_EXEC_FEATURE_HARDWARE_WAIT;
 	vm = __vm_create_without_irqchip(VM_SHAPE_DEFAULT, 1, 0);
 	vcpu = vm_vcpu_add(vm, 0, guest_halt_then_spin);
 	disable_nested_cpuid(vcpu);
@@ -7033,7 +7045,8 @@ static void test_command_wait_halt(int kvm_fd, bool control, bool wake_before_wa
 	arg.executor_fd = executor_fd;
 	arg.run = (struct kvm_exec_run_dispatch) {
 		.size = sizeof(arg.run),
-		.flags = control ? 0 : KVM_EXEC_DISPATCH_F_WAIT_FOR_COMMAND,
+		.flags = (control ? 0 : KVM_EXEC_DISPATCH_F_WAIT_FOR_COMMAND) |
+			(hardware_wait ? KVM_EXEC_DISPATCH_F_HARDWARE_WAIT : 0),
 		.domain_generation = domain_generation,
 		.executor_generation = executor_generation,
 		.command_head = run.command_head,
@@ -7245,6 +7258,200 @@ static void test_command_wait_lifecycle(int kvm_fd)
 	TEST_ASSERT(!sigaction(SIGUSR1, &old_action, NULL), "restoring sigaction failed");
 	munmap(mapping.header, KVM_EXEC_DISPATCH_MMAP_SIZE);
 	close(executor_fd);
+}
+
+/* An idle executor must remain TASK_RUNNING rather than parking in Linux.
+ * Separate physical tracing must prove MWAIT execution (R alone could spin).
+ */
+static void test_hardware_wait_idle(int kvm_fd)
+{
+	const uint64_t base = KVM_EXEC_FEATURE_BASE_OBJECTS |
+		KVM_EXEC_FEATURE_DYNAMIC_DISPATCH | KVM_EXEC_FEATURE_RETURN_KICK;
+	struct sigaction action = { .sa_handler = signal_handler }, old_action;
+	struct dispatch_run_arg arg;
+	struct dispatch_mapping mapping;
+	struct kvm_exec_run_dispatch run;
+	uint64_t domain_generation, executor_generation;
+	pthread_t thread;
+	int domain_fd, executor_fd, event, i;
+
+	domain_fd = create_domain_with_features(kvm_fd, 1, 1, base, &domain_generation);
+	executor_fd = create_executor(domain_fd, 0x8130, &executor_generation);
+	run = (struct kvm_exec_run_dispatch) {
+		.size = sizeof(run),
+		.flags = KVM_EXEC_DISPATCH_F_HARDWARE_WAIT,
+		.domain_generation = domain_generation,
+		.executor_generation = executor_generation,
+	};
+	assert_ioctl_errno(executor_fd, KVM_EXEC_RUN_DISPATCH, &run, EOPNOTSUPP);
+	close(executor_fd);
+	close(domain_fd);
+
+	domain_fd = create_domain_with_features(kvm_fd, 1, 1,
+		base | KVM_EXEC_FEATURE_HARDWARE_WAIT, &domain_generation);
+	executor_fd = create_executor(domain_fd, 0x8131, &executor_generation);
+	mapping = map_dispatch(executor_fd);
+	sigemptyset(&action.sa_mask);
+	TEST_ASSERT(!sigaction(SIGUSR1, &action, &old_action), "sigaction failed");
+	/* Negotiation alone must not change blocking. Also switch back after
+	 * hardware waits on this same executor, without recreating the domain.
+	 */
+	for (event = 0; event < 6; event++) {
+		bool hardware_wait = event != 0 && event != 3;
+
+		arg = (struct dispatch_run_arg) {
+			.executor_fd = executor_fd,
+			.run = {
+				.size = sizeof(run),
+				.flags = hardware_wait ? KVM_EXEC_DISPATCH_F_HARDWARE_WAIT : 0,
+				.domain_generation = domain_generation,
+				.executor_generation = executor_generation,
+			},
+		};
+		TEST_ASSERT(!pthread_create(&thread, NULL, dispatch_runner, &arg), "pthread_create");
+		for (i = 0; i < 10000; i++) {
+			TEST_ASSERT(!__atomic_load_n(&arg.finished, __ATOMIC_ACQUIRE),
+				    "hardware wait returned early: ret=%d errno=%d reason=%u result=%d",
+				    arg.ret, arg.error, arg.run.return_reason, arg.run.run_result);
+			if (__atomic_load_n(&mapping.header->dispatcher_state, __ATOMIC_ACQUIRE) &
+			    KVM_EXEC_DISPATCHER_F_SLEEPING)
+				break;
+			usleep(100);
+		}
+		TEST_ASSERT(i < 10000, "hardware wait never armed");
+		/* Sample well beyond one timer period, not merely during ioctl entry. */
+		for (i = 0; i < 5; i++) {
+			char name[128], line[256], state = 0;
+			FILE *status;
+
+			usleep(20000);
+			snprintf(name, sizeof(name), "/proc/self/task/%d/status",
+				 __atomic_load_n(&arg.tid, __ATOMIC_ACQUIRE));
+			status = fopen(name, "r");
+			TEST_ASSERT(status, "opening runner status");
+			while (fgets(line, sizeof(line), status))
+				if (sscanf(line, "State: %c", &state) == 1)
+					break;
+			fclose(status);
+			TEST_ASSERT_EQ(state, hardware_wait ? 'R' : 'S');
+			TEST_ASSERT(!__atomic_load_n(&arg.finished, __ATOMIC_ACQUIRE), "idle runner ended");
+		}
+		if (event == 1)
+			TEST_ASSERT(!pthread_kill(thread, SIGUSR1), "pthread_kill");
+		else if (event < 4)
+			kick_dispatch_flags(executor_fd, domain_generation, executor_generation,
+					    1, KVM_EXEC_KICK_F_RETURN_TO_VMM);
+		else if (event == 4)
+			control_domain(domain_fd, KVM_EXEC_PAUSE);
+		else
+			close(domain_fd);
+		pthread_join(thread, NULL);
+		TEST_ASSERT(!arg.ret, "hardware wait event %d: ret=%d errno=%d", event, arg.ret, arg.error);
+		TEST_ASSERT_EQ(arg.run.return_reason, event < 4 ? KVM_EXEC_RETURN_SIGNAL :
+			       event == 4 ? KVM_EXEC_RETURN_DOMAIN_PAUSED : KVM_EXEC_RETURN_DOMAIN_STOPPING);
+		TEST_ASSERT_EQ(__atomic_load_n(&mapping.header->dispatcher_state, __ATOMIC_ACQUIRE), 0);
+		if (event == 4) {
+			control_domain(domain_fd, KVM_EXEC_DRAIN);
+			control_domain(domain_fd, KVM_EXEC_RESUME);
+		}
+	}
+	TEST_ASSERT(!sigaction(SIGUSR1, &old_action, NULL), "restoring sigaction");
+	munmap(mapping.header, KVM_EXEC_DISPATCH_MMAP_SIZE);
+	close(executor_fd);
+}
+
+/* A resident task must still obey Linux migration and the caller's CPU contract. */
+static void test_hardware_wait_migration(int kvm_fd, bool strict)
+{
+	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
+		KVM_EXEC_FEATURE_DYNAMIC_DISPATCH | KVM_EXEC_FEATURE_RETURN_KICK |
+		KVM_EXEC_FEATURE_HARDWARE_WAIT | KVM_EXEC_FEATURE_LIFECYCLE_STATE |
+		KVM_EXEC_FEATURE_SYNC_EXITS;
+	struct dispatch_run_arg arg = { };
+	struct dispatch_mapping mapping;
+	struct kvm_exec_query_executor query = { .size = sizeof(query) };
+	cpu_set_t allowed, mask;
+	pthread_attr_t attr;
+	pthread_t thread;
+	uint64_t domain_generation, executor_generation;
+	int domain_fd, cpu, source = -1, target = -1, i;
+
+	TEST_ASSERT(!sched_getaffinity(0, sizeof(allowed), &allowed), "get affinity");
+	for (cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+		if (!CPU_ISSET(cpu, &allowed))
+			continue;
+		if (source < 0)
+			source = cpu;
+		else {
+			target = cpu;
+			break;
+		}
+	}
+	if (target < 0) {
+		printf("SKIP: hardware-wait migration requires two allowed CPUs\n");
+		return;
+	}
+	domain_fd = create_domain_with_features(kvm_fd, 1, 1, features, &domain_generation);
+	arg.executor_fd = create_executor_on_cpu(domain_fd, 0x8132,
+		strict ? KVM_EXECUTOR_F_STRICT_CPU : 0, source, &executor_generation);
+	mapping = map_dispatch(arg.executor_fd);
+	arg.run = (struct kvm_exec_run_dispatch) {
+		.size = sizeof(arg.run),
+		.flags = KVM_EXEC_DISPATCH_F_HARDWARE_WAIT,
+		.domain_generation = domain_generation,
+		.executor_generation = executor_generation,
+	};
+	CPU_ZERO(&mask);
+	CPU_SET(source, &mask);
+	TEST_ASSERT(!pthread_attr_init(&attr), "pthread_attr_init");
+	TEST_ASSERT(!pthread_attr_setaffinity_np(&attr, sizeof(mask), &mask), "set runner affinity");
+	TEST_ASSERT(!pthread_create(&thread, &attr, dispatch_runner, &arg), "pthread_create");
+	TEST_ASSERT(!pthread_attr_destroy(&attr), "pthread_attr_destroy");
+	for (i = 0; i < 10000; i++) {
+		TEST_ASSERT(!__atomic_load_n(&arg.finished, __ATOMIC_ACQUIRE), "runner ended before migration");
+		if (__atomic_load_n(&mapping.header->dispatcher_state, __ATOMIC_ACQUIRE) &
+		    KVM_EXEC_DISPATCHER_F_HARDWARE_WAIT)
+			break;
+		usleep(100);
+	}
+	TEST_ASSERT(i < 10000, "hardware wait never armed before migration");
+	CPU_ZERO(&mask);
+	CPU_SET(target, &mask);
+	TEST_ASSERT(!sched_setaffinity(__atomic_load_n(&arg.tid, __ATOMIC_ACQUIRE),
+				      sizeof(mask), &mask), "migrate hardware waiter");
+	if (!strict) {
+		/* Cross several timer periods, then wake from the new CPU. */
+		usleep(20000);
+		TEST_ASSERT(!__atomic_load_n(&arg.finished, __ATOMIC_ACQUIRE), "non-strict migration returned");
+		kick_dispatch_flags(arg.executor_fd, domain_generation, executor_generation,
+				    1, KVM_EXEC_KICK_F_RETURN_TO_VMM);
+	}
+	for (i = 0; i < 10000; i++) {
+		if (__atomic_load_n(&arg.finished, __ATOMIC_ACQUIRE))
+			break;
+		usleep(100);
+	}
+	TEST_ASSERT(i < 10000, "migrated hardware waiter failed to return");
+	TEST_ASSERT(!pthread_join(thread, NULL), "pthread_join");
+	TEST_ASSERT(!arg.ret, "migration ioctl errno=%d", arg.error);
+	TEST_ASSERT_EQ(arg.run.return_reason, strict ? KVM_EXEC_RETURN_CPU_MIGRATED : KVM_EXEC_RETURN_SIGNAL);
+	TEST_ASSERT_EQ(arg.run.run_result, strict ? -EXDEV : -EINTR);
+	TEST_ASSERT_EQ(arg.return_cpu, target);
+	/* Empty non-strict runs retain the CPU sampled at entry. Strict wait
+	 * failure must instead report the CPU that violated the contract.
+	 */
+	if (strict)
+		TEST_ASSERT_EQ(arg.run.current_cpu, target);
+	TEST_ASSERT_EQ(arg.run.owned_capsule_id, 0);
+	query.domain_generation = domain_generation;
+	query.executor_generation = executor_generation;
+	TEST_ASSERT(!ioctl(arg.executor_fd, KVM_EXEC_QUERY_EXECUTOR, &query), "query executor");
+	TEST_ASSERT_EQ(query.failure_count, strict ? 1 : 0);
+	TEST_ASSERT_EQ(__atomic_load_n(&mapping.header->dispatcher_state, __ATOMIC_ACQUIRE), 0);
+	munmap(mapping.header, KVM_EXEC_DISPATCH_MMAP_SIZE);
+	close(arg.executor_fd);
+	close(domain_fd);
+	printf("hardware-wait migration strict=%d CPU %d to %d passed\n", strict, source, target);
 }
 
 static void test_split_irqchip_deferred_pio_halt_returns_to_dispatcher(int kvm_fd)
@@ -8541,6 +8748,18 @@ int main(int argc, char **argv)
 		      KVM_EXEC_FEATURE_ASYNC_PIO_HANDOFF |
 		      KVM_EXEC_FEATURE_TSC_TIMING |
 		      KVM_EXEC_FEATURE_INTERRUPT_RESULT));
+	if (argc == 2 && !strcmp(argv[1], "--hardware-wait-only")) {
+		TEST_ASSERT(capability & KVM_EXEC_FEATURE_HARDWARE_WAIT,
+			    "explicit hardware-wait test requires supported capability");
+		test_hardware_wait_idle(kvm_fd);
+		test_hardware_wait_migration(kvm_fd, false);
+		test_hardware_wait_migration(kvm_fd, true);
+		test_command_wait_halt(kvm_fd, false, false, true);
+		test_command_wait_halt(kvm_fd, false, true, true);
+		test_output_gate_resumes_after_nonmatching_output(kvm_fd, true, true);
+		close(kvm_fd);
+		return 0;
+	}
 	if (argc == 2 && !strcmp(argv[1], "--dynamic-kick-cancel-only")) {
 		test_dynamic_return_kick(kvm_fd);
 		test_dynamic_kick_and_cancel(kvm_fd, false);
@@ -8586,11 +8805,11 @@ int main(int argc, char **argv)
 	}
 	if (argc == 2 && (!strcmp(argv[1], "--command-wait-only") ||
 			  !strcmp(argv[1], "--command-wait-control"))) {
-		test_command_wait_halt(kvm_fd, !strcmp(argv[1], "--command-wait-control"), false);
+		test_command_wait_halt(kvm_fd, !strcmp(argv[1], "--command-wait-control"), false, false);
 		if (!strcmp(argv[1], "--command-wait-only")) {
-			test_command_wait_halt(kvm_fd, false, true);
+			test_command_wait_halt(kvm_fd, false, true, false);
 			test_command_wait_lifecycle(kvm_fd);
-			test_output_gate_resumes_after_nonmatching_output(kvm_fd, true);
+			test_output_gate_resumes_after_nonmatching_output(kvm_fd, true, false);
 		}
 		close(kvm_fd);
 		return 0;
@@ -8640,7 +8859,7 @@ int main(int argc, char **argv)
 		return 0;
 	}
 	if (argc == 2 && !strcmp(argv[1], "--output-gate-reentry-only")) {
-		test_output_gate_resumes_after_nonmatching_output(kvm_fd, false);
+		test_output_gate_resumes_after_nonmatching_output(kvm_fd, false, false);
 		close(kvm_fd);
 		return 0;
 	}
@@ -8649,7 +8868,7 @@ int main(int argc, char **argv)
 			    "KVM does not advertise asynchronous PIO handoff");
 		test_output_gated_async_pio_handoff(kvm_fd);
 		test_output_gate_holds_across_dispatcher_iterations(kvm_fd);
-		test_output_gate_resumes_after_nonmatching_output(kvm_fd, false);
+		test_output_gate_resumes_after_nonmatching_output(kvm_fd, false, false);
 		test_output_gated_handoff_with_completion_backlog(kvm_fd);
 		test_async_pio_handoff_before_completion(kvm_fd);
 		test_async_pio_handoff_fallback(kvm_fd, KVM_EXEC_CMD_SWITCH);
@@ -8688,10 +8907,10 @@ int main(int argc, char **argv)
 	test_halt_wake_requires_exact_dispatch(kvm_fd, true, false);
 	test_halt_wake_requires_exact_dispatch(kvm_fd, true, true);
 	test_split_irqchip_deferred_pio_halt_returns_to_dispatcher(kvm_fd);
-	test_command_wait_halt(kvm_fd, false, false);
-	test_command_wait_halt(kvm_fd, false, true);
+	test_command_wait_halt(kvm_fd, false, false, false);
+	test_command_wait_halt(kvm_fd, false, true, false);
 	test_command_wait_lifecycle(kvm_fd);
-	test_output_gate_resumes_after_nonmatching_output(kvm_fd, true);
+	test_output_gate_resumes_after_nonmatching_output(kvm_fd, true, false);
 	test_halt_wake_dispatch_stress(kvm_fd);
 	test_cross_vm_halt_interrupt_migration(kvm_fd);
 	test_fd_close_orders(kvm_fd);
@@ -8724,7 +8943,7 @@ int main(int argc, char **argv)
 	test_async_pio_write_switch(kvm_fd);
 	test_async_pio_handoff_before_completion(kvm_fd);
 	test_output_gate_holds_across_dispatcher_iterations(kvm_fd);
-	test_output_gate_resumes_after_nonmatching_output(kvm_fd, false);
+	test_output_gate_resumes_after_nonmatching_output(kvm_fd, false, false);
 	test_output_gated_handoff_with_completion_backlog(kvm_fd);
 	test_async_pio_handoff_fallback(kvm_fd, KVM_EXEC_CMD_SWITCH);
 	test_async_pio_handoff_fallback(kvm_fd, KVM_EXEC_CMD_RELEASE);

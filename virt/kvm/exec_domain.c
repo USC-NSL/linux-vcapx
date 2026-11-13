@@ -4,6 +4,7 @@
 #include <linux/cred.h>
 #include <linux/file.h>
 #include <linux/kref.h>
+#include <linux/hrtimer.h>
 #include <linux/kvm_host.h>
 #include <linux/futex.h>
 #include <linux/mm.h>
@@ -339,6 +340,8 @@ struct kvm_exec_executor {
 	u32 flags;
 	bool pending_interrupt_handler_observed;
 	bool listed;
+	/* Private, notification-only monitor line; never execution authority. */
+	atomic64_t wait_sequence ____cacheline_aligned_in_smp;
 };
 
 struct kvm_exec_notification_runner {
@@ -442,7 +445,8 @@ static bool kvm_exec_boundary_request_negotiated(struct kvm_exec_domain *domain)
 static bool kvm_exec_sleep_state_negotiated(struct kvm_exec_domain *domain)
 {
 	return domain->negotiated_features &
-		(KVM_EXEC_FEATURE_INVOCATION_END | KVM_EXEC_FEATURE_COMMAND_WAIT);
+		(KVM_EXEC_FEATURE_INVOCATION_END | KVM_EXEC_FEATURE_COMMAND_WAIT |
+		 KVM_EXEC_FEATURE_HARDWARE_WAIT);
 }
 
 static bool kvm_exec_end_registered(struct kvm_exec_capsule *capsule)
@@ -809,6 +813,11 @@ u64 __weak kvm_arch_exec_supported_features(void)
 	return 0;
 }
 
+int __weak kvm_arch_exec_hardware_wait(atomic64_t *sequence, s64 expected)
+{
+	return -EOPNOTSUPP;
+}
+
 int __weak kvm_arch_vcpu_exec_inject_interrupt(struct kvm_vcpu *vcpu,
 					       u32 vector)
 {
@@ -1113,6 +1122,17 @@ static bool kvm_exec_control_valid(struct kvm_exec_domain_control *control)
 	       !memchr_inv(control->reserved, 0, sizeof(control->reserved));
 }
 
+/* Publication precedes this full-barrier store. A hardware waiter either
+ * observes the publication on its readiness recheck or observes this sequence
+ * change after MONITOR. Linux waiters keep their existing waitqueue wake.
+ */
+static void kvm_exec_notify_dispatcher(struct kvm_exec_executor *executor)
+{
+	if (executor->domain->negotiated_features & KVM_EXEC_FEATURE_HARDWARE_WAIT)
+		atomic64_inc_return(&executor->wait_sequence);
+	wake_up_interruptible(&executor->dispatch_wait);
+}
+
 static void kvm_exec_kick_running_locked(struct kvm_exec_domain *domain)
 {
 	struct kvm_exec_capsule *capsule;
@@ -1120,7 +1140,7 @@ static void kvm_exec_kick_running_locked(struct kvm_exec_domain *domain)
 	unsigned long index;
 
 	list_for_each_entry(executor, &domain->executors, node)
-		wake_up_interruptible(&executor->dispatch_wait);
+		kvm_exec_notify_dispatcher(executor);
 
 	xa_for_each(&domain->capsules, index, capsule) {
 		if (!capsule->vcpu || !capsule->running)
@@ -1740,6 +1760,7 @@ static int kvm_exec_create_executor(struct kvm_exec_domain *domain,
 	spin_lock_init(&executor->dispatch_lock);
 	spin_lock_init(&executor->interrupt_lock);
 	init_waitqueue_head(&executor->dispatch_wait);
+	atomic64_set(&executor->wait_sequence, 0);
 	atomic64_set(&executor->kick_epoch, 0);
 	atomic64_set(&executor->return_kick_epoch, 0);
 	atomic64_set(&executor->boundary_return_epoch, 0);
@@ -4246,7 +4267,7 @@ void kvm_exec_domain_apic_eoi(struct kvm_vcpu *vcpu, u32 vector)
 	}
 	spin_unlock_irqrestore(&executor->interrupt_lock, flags);
 	if (retired)
-		wake_up_interruptible(&executor->dispatch_wait);
+		kvm_exec_notify_dispatcher(executor);
 }
 
 static void kvm_exec_refresh_interrupt(struct kvm_exec_executor *executor,
@@ -4317,6 +4338,7 @@ static bool kvm_exec_dispatch_failed(const struct kvm_exec_run_dispatch *run)
 		return !(run->flags & KVM_EXEC_DISPATCH_F_RETURN_IF_EMPTY);
 
 	return run->return_reason == KVM_EXEC_RETURN_CPU_MIGRATED ||
+	       run->return_reason == KVM_EXEC_RETURN_WAIT_FAILED ||
 	       run->return_reason == KVM_EXEC_RETURN_COMPLETION_FULL ||
 	       run->return_reason == KVM_EXEC_RETURN_DISPATCH_CORRUPT ||
 	       run->return_reason == KVM_EXEC_RETURN_INVALID_COMPLETION;
@@ -4532,6 +4554,94 @@ static int kvm_exec_finish_invocation(struct kvm_exec_executor *executor,
 	return 0;
 }
 
+struct kvm_exec_wait_timer {
+	struct hrtimer timer;
+	struct kvm_exec_executor *executor;
+	bool expired;
+};
+
+static enum hrtimer_restart kvm_exec_wait_tick(struct hrtimer *timer)
+{
+	struct kvm_exec_wait_timer *wait = container_of(timer,
+					struct kvm_exec_wait_timer, timer);
+
+	WRITE_ONCE(wait->expired, true);
+	/* A schedulable runner may have migrated away from this pinned timer.
+	 * Wake its monitored line as well as interrupting this timer's CPU.
+	 */
+	kvm_exec_notify_dispatcher(wait->executor);
+	return HRTIMER_NORESTART;
+}
+
+/* Remain TASK_RUNNING, but never suppress Linux scheduling, signals or IRQs.
+ * A one-millisecond pinned hard timer bounds the interval before returning to
+ * the dispatcher for its full lifecycle/ownership recheck. It grants no entry.
+ * The run_lock retains the executor; no domain/vCPU mutex is held here.
+ */
+static int kvm_exec_dispatch_hardware_wait(struct kvm_exec_executor *executor,
+					 u64 kick_epoch, bool boundary)
+{
+	struct kvm_exec_wait_timer wait = { .executor = executor };
+	unsigned long flags;
+	s64 sequence;
+	int ret = 0;
+
+	hrtimer_init_on_stack(&wait.timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_HARD);
+	wait.timer.function = kvm_exec_wait_tick;
+	hrtimer_start(&wait.timer, ns_to_ktime(NSEC_PER_MSEC),
+		      HRTIMER_MODE_REL_PINNED_HARD);
+	for (;;) {
+		/* No polling-task flag: reschedule IPIs must still reach this task. */
+		cond_resched();
+		preempt_disable();
+		local_irq_save(flags);
+		if ((executor->flags & KVM_EXECUTOR_F_STRICT_CPU) &&
+		    smp_processor_id() != executor->requested_cpu) {
+			ret = -EXDEV;
+			goto unlock;
+		}
+		if (signal_pending(current)) {
+			ret = -EINTR;
+			goto unlock;
+		}
+		sequence = atomic64_read(&executor->wait_sequence);
+		/* Readiness must be read after the notification epoch snapshot. */
+		smp_mb();
+		if (READ_ONCE(wait.expired) ||
+		    kvm_exec_ready(executor, kick_epoch, boundary))
+			goto unlock;
+		ret = kvm_arch_exec_hardware_wait(&executor->wait_sequence, sequence);
+		local_irq_restore(flags);
+		preempt_enable();
+		if (ret < 0)
+			break;
+		ret = 0;
+	}
+	goto done;
+unlock:
+	local_irq_restore(flags);
+	preempt_enable();
+done:
+	hrtimer_cancel(&wait.timer);
+	destroy_hrtimer_on_stack(&wait.timer);
+	return ret;
+}
+
+static void kvm_exec_dispatch_wait_failure(struct kvm_exec_run_dispatch *run,
+					 int error)
+{
+	if (error == -ERESTARTSYS || error == -EINTR) {
+		run->return_reason = KVM_EXEC_RETURN_SIGNAL;
+		run->run_result = -EINTR;
+	} else {
+		run->return_reason = error == -EXDEV ? KVM_EXEC_RETURN_CPU_MIGRATED :
+						     KVM_EXEC_RETURN_WAIT_FAILED;
+		run->run_result = error;
+		run->current_cpu = get_cpu();
+		put_cpu();
+	}
+}
+
 /*
  * Wait for work.  With invocation-end output the dispatcher advertises its
  * sleep in the header: a publisher release-stores command_tail, fences and
@@ -4540,7 +4650,8 @@ static int kvm_exec_finish_invocation(struct kvm_exec_executor *executor,
  */
 static int kvm_exec_dispatch_sleep(struct kvm_exec_executor *executor,
 				   u64 kick_epoch,
-				   struct kvm_exec_capsule *capsule)
+				   struct kvm_exec_capsule *capsule,
+				   bool hardware_wait)
 {
 	struct kvm_exec_dispatch_header *header = kvm_exec_dispatch_header(executor);
 	bool advertise = kvm_exec_sleep_state_negotiated(executor->domain);
@@ -4549,12 +4660,16 @@ static int kvm_exec_dispatch_sleep(struct kvm_exec_executor *executor,
 	int ret;
 
 	if (advertise) {
-		WRITE_ONCE(header->dispatcher_state, KVM_EXEC_DISPATCHER_F_SLEEPING);
+		WRITE_ONCE(header->dispatcher_state, KVM_EXEC_DISPATCHER_F_SLEEPING |
+			   (hardware_wait ? KVM_EXEC_DISPATCHER_F_HARDWARE_WAIT : 0));
 		/* Pairs with the publisher's fence between its tail and this word. */
 		smp_mb();
 	}
-	ret = wait_event_interruptible(executor->dispatch_wait,
-				       kvm_exec_ready(executor, kick_epoch, boundary));
+	if (hardware_wait)
+		ret = kvm_exec_dispatch_hardware_wait(executor, kick_epoch, boundary);
+	else
+		ret = wait_event_interruptible(executor->dispatch_wait,
+					       kvm_exec_ready(executor, kick_epoch, boundary));
 	if (advertise)
 		WRITE_ONCE(header->dispatcher_state, 0);
 	return ret;
@@ -4572,7 +4687,7 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 	u32 initial_cpu, final_cpu;
 	bool active = false;
 	bool completion_pending = false;
-	bool wait_for_command;
+	bool wait_for_command, hardware_wait;
 	/*
 	 * locked: the preamble's domain critical section continues into the
 	 * first pass. returned: the last pass did the return bookkeeping.
@@ -4586,7 +4701,8 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 	    run.flags & ~(KVM_EXEC_DISPATCH_F_RETURN_IF_EMPTY |
 			  KVM_EXEC_DISPATCH_F_RESUME_SERVICED_EXIT |
 			  KVM_EXEC_DISPATCH_F_COMPLETION_ONLY |
-			  KVM_EXEC_DISPATCH_F_WAIT_FOR_COMMAND) ||
+			  KVM_EXEC_DISPATCH_F_WAIT_FOR_COMMAND |
+			  KVM_EXEC_DISPATCH_F_HARDWARE_WAIT) ||
 	    (!(run.flags & KVM_EXEC_DISPATCH_F_RESUME_SERVICED_EXIT) &&
 	     run.exit_sequence) || run.exit_flags || run.reserved0)
 		return -EINVAL;
@@ -4594,6 +4710,10 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 	if (ret)
 		return ret;
 	if (!(domain->negotiated_features & KVM_EXEC_FEATURE_DYNAMIC_DISPATCH))
+		return -EOPNOTSUPP;
+	hardware_wait = run.flags & KVM_EXEC_DISPATCH_F_HARDWARE_WAIT;
+	if (hardware_wait &&
+	    !(domain->negotiated_features & KVM_EXEC_FEATURE_HARDWARE_WAIT))
 		return -EOPNOTSUPP;
 	wait_for_command = run.flags & KVM_EXEC_DISPATCH_F_WAIT_FOR_COMMAND;
 	if (wait_for_command &&
@@ -4913,10 +5033,10 @@ command_done:
 				run.return_reason = KVM_EXEC_RETURN_DISPATCH_EMPTY;
 				break;
 			}
-			ret = kvm_exec_dispatch_sleep(executor, seen_kick_epoch, capsule);
+			ret = kvm_exec_dispatch_sleep(executor, seen_kick_epoch, capsule,
+						      hardware_wait);
 			if (ret) {
-				run.return_reason = KVM_EXEC_RETURN_SIGNAL;
-				run.run_result = -EINTR;
+				kvm_exec_dispatch_wait_failure(&run, ret);
 				break;
 			}
 			continue;
@@ -4936,10 +5056,10 @@ command_done:
 					KVM_EXEC_RETURN_DISPATCH_EMPTY;
 				break;
 			}
-			ret = kvm_exec_dispatch_sleep(executor, seen_kick_epoch, capsule);
+			ret = kvm_exec_dispatch_sleep(executor, seen_kick_epoch, capsule,
+						      hardware_wait);
 			if (ret) {
-				run.return_reason = KVM_EXEC_RETURN_SIGNAL;
-				run.run_result = -EINTR;
+				kvm_exec_dispatch_wait_failure(&run, ret);
 				break;
 			}
 			continue;
@@ -4956,10 +5076,10 @@ command_done:
 					KVM_EXEC_RETURN_DISPATCH_EMPTY;
 				break;
 			}
-			ret = kvm_exec_dispatch_sleep(executor, seen_kick_epoch, capsule);
+			ret = kvm_exec_dispatch_sleep(executor, seen_kick_epoch, capsule,
+						      hardware_wait);
 			if (ret) {
-				run.return_reason = KVM_EXEC_RETURN_SIGNAL;
-				run.run_result = -EINTR;
+				kvm_exec_dispatch_wait_failure(&run, ret);
 				break;
 			}
 			continue;
@@ -4988,10 +5108,10 @@ command_done:
 				run.return_reason = KVM_EXEC_RETURN_INVOCATION_END;
 				break;
 			}
-			ret = kvm_exec_dispatch_sleep(executor, seen_kick_epoch, capsule);
+			ret = kvm_exec_dispatch_sleep(executor, seen_kick_epoch, capsule,
+						      hardware_wait);
 			if (ret) {
-				run.return_reason = KVM_EXEC_RETURN_SIGNAL;
-				run.run_result = -EINTR;
+				kvm_exec_dispatch_wait_failure(&run, ret);
 				break;
 			}
 			continue;
@@ -5003,10 +5123,10 @@ command_done:
 				run.return_reason = KVM_EXEC_RETURN_DISPATCH_EMPTY;
 				break;
 			}
-			ret = kvm_exec_dispatch_sleep(executor, seen_kick_epoch, capsule);
+			ret = kvm_exec_dispatch_sleep(executor, seen_kick_epoch, capsule,
+						      hardware_wait);
 			if (ret) {
-				run.return_reason = KVM_EXEC_RETURN_SIGNAL;
-				run.run_result = -EINTR;
+				kvm_exec_dispatch_wait_failure(&run, ret);
 				break;
 			}
 			continue;
@@ -5454,7 +5574,7 @@ static long kvm_exec_kick(struct kvm_exec_executor *executor,
 			  KVM_EXEC_KICK_F_WAKE_SLEEPING)) {
 		if (READ_ONCE(domain->stopping))
 			return -ESHUTDOWN;
-		wake_up_interruptible(&executor->dispatch_wait);
+		kvm_exec_notify_dispatcher(executor);
 		return 0;
 	}
 	if (kick.flags & KVM_EXEC_KICK_F_RETURN_AT_BOUNDARY) {
@@ -5468,7 +5588,7 @@ static long kvm_exec_kick(struct kvm_exec_executor *executor,
 		if (READ_ONCE(domain->stopping))
 			return -ESHUTDOWN;
 		atomic64_inc(&executor->boundary_return_epoch);
-		wake_up_interruptible(&executor->dispatch_wait);
+		kvm_exec_notify_dispatcher(executor);
 		return 0;
 	}
 	mutex_lock(&domain->lock);
@@ -5503,7 +5623,7 @@ static long kvm_exec_kick(struct kvm_exec_executor *executor,
 		kvm_vcpu_kick(capsule->vcpu);
 	}
 	mutex_unlock(&domain->lock);
-	wake_up_interruptible(&executor->dispatch_wait);
+	kvm_exec_notify_dispatcher(executor);
 	return 0;
 }
 
@@ -5880,7 +6000,7 @@ out:
 			request->flags & KVM_EXEC_INTERRUPT_F_RETAIN_HLT;
 	mutex_unlock(&domain->lock);
 	if (!ret)
-		wake_up_interruptible(&executor->dispatch_wait);
+		kvm_exec_notify_dispatcher(executor);
 	kvm_exec_interrupt_outcome_finish(outcome, ret);
 	return ret;
 }
@@ -7636,7 +7756,8 @@ int kvm_dev_ioctl_create_exec_domain(void __user *argp)
 	     !(create.requested_features & KVM_EXEC_FEATURE_INVOCATION_END)) ||
 	    ((create.requested_features & KVM_EXEC_FEATURE_REGISTERED_ENTRY_FPU) &&
 	     !(create.requested_features & KVM_EXEC_FEATURE_ENTRY_STATE_X86)) ||
-	    ((create.requested_features & KVM_EXEC_FEATURE_COMMAND_WAIT) &&
+	    ((create.requested_features & (KVM_EXEC_FEATURE_COMMAND_WAIT |
+				  KVM_EXEC_FEATURE_HARDWARE_WAIT)) &&
 	     !(create.requested_features & KVM_EXEC_FEATURE_DYNAMIC_DISPATCH)) ||
 	    ((create.requested_features & KVM_EXEC_FEATURE_CROSS_VM_CHAIN) &&
 	     !(create.requested_features & KVM_EXEC_FEATURE_INTRA_VM_CHAIN)) ||

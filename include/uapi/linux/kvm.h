@@ -933,6 +933,8 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_FEATURE_REGISTERED_ENTRY_FPU	(1ULL << 25)
 /* An executor may wait for exact command admission after a returned boundary. */
 #define KVM_EXEC_FEATURE_COMMAND_WAIT		(1ULL << 26)
+/* Optional dispatcher hardware wait; ordinary task blocking remains default. */
+#define KVM_EXEC_FEATURE_HARDWARE_WAIT		(1ULL << 27)
 
 #define KVM_EXEC_INTERRUPT_DELIVERY_DIRECT_KICK	1U
 #define KVM_EXEC_INTERRUPT_DELIVERY_LOCAL_APIC_KICK 2U
@@ -961,6 +963,8 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_RETURN_INTERRUPT_FAILED 12
 /* The current capsule's invocation ended and no command selected work. */
 #define KVM_EXEC_RETURN_INVOCATION_END	13
+/* The requested hardware wait cannot continue on the current CPU. */
+#define KVM_EXEC_RETURN_WAIT_FAILED	14
 
 #define KVM_EXEC_DISPATCH_ABI_VERSION	3U
 #define KVM_EXEC_DISPATCH_RING_ENTRIES	32U
@@ -983,6 +987,8 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_DISPATCH_F_COMPLETION_ONLY (1U << 2)
 /* COMMAND_WAIT: command_head is the exact returned cursor to wait after. */
 #define KVM_EXEC_DISPATCH_F_WAIT_FOR_COMMAND (1U << 3)
+/* Wait in hardware while remaining schedulable; requires HARDWARE_WAIT. */
+#define KVM_EXEC_DISPATCH_F_HARDWARE_WAIT (1U << 4)
 #define KVM_EXEC_COMPLETE_F_ASYNC_PIO_HANDOFF (1U << 0)
 /* Applied at its expected-current capsule's invocation end. */
 #define KVM_EXEC_COMPLETE_F_AT_INVOCATION_END (1U << 1)
@@ -1053,6 +1059,8 @@ struct kvm_ppc_resize_hpt {
 
 /* dispatcher_state: set by KVM while its dispatcher sleeps for work. */
 #define KVM_EXEC_DISPATCHER_F_SLEEPING	(1ULL << 0)
+/* Observational: set together with SLEEPING during an opted-in hardware wait. */
+#define KVM_EXEC_DISPATCHER_F_HARDWARE_WAIT (1ULL << 1)
 
 #define KVM_EXEC_ENTRY_GROUP_GPRS	(1ULL << 0)
 #define KVM_EXEC_ENTRY_GROUP_LEGACY_FPU	(1ULL << 1)
@@ -1479,7 +1487,7 @@ struct kvm_exec_dispatch_header {
 	__u64 last_handoff_entry_sequence;
 	/*
 	 * KVM_EXEC_DISPATCHER_F_SLEEPING while the dispatcher waits for work,
-	 * with KVM_EXEC_FEATURE_INVOCATION_END only; zero otherwise.  A publisher
+	 * with INVOCATION_END, COMMAND_WAIT or HARDWARE_WAIT negotiated; zero otherwise.  A publisher
 	 * release-stores command_tail, fences, and kicks only when it is set.
 	 */
 	__u64 dispatcher_state;
