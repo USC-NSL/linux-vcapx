@@ -931,6 +931,8 @@ struct kvm_ppc_resize_hpt {
  * applies it instead of a supplied legacy_fpu group.
  */
 #define KVM_EXEC_FEATURE_REGISTERED_ENTRY_FPU	(1ULL << 25)
+/* An executor may wait for exact command admission after a returned boundary. */
+#define KVM_EXEC_FEATURE_COMMAND_WAIT		(1ULL << 26)
 
 #define KVM_EXEC_INTERRUPT_DELIVERY_DIRECT_KICK	1U
 #define KVM_EXEC_INTERRUPT_DELIVERY_LOCAL_APIC_KICK 2U
@@ -979,6 +981,8 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_DISPATCH_F_RESUME_SERVICED_EXIT (1U << 1)
 /* Portable domains: native continuation only, without entering guest code. */
 #define KVM_EXEC_DISPATCH_F_COMPLETION_ONLY (1U << 2)
+/* COMMAND_WAIT: command_head is the exact returned cursor to wait after. */
+#define KVM_EXEC_DISPATCH_F_WAIT_FOR_COMMAND (1U << 3)
 #define KVM_EXEC_COMPLETE_F_ASYNC_PIO_HANDOFF (1U << 0)
 /* Applied at its expected-current capsule's invocation end. */
 #define KVM_EXEC_COMPLETE_F_AT_INVOCATION_END (1U << 1)

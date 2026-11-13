@@ -30,7 +30,8 @@
 	 KVM_EXEC_FEATURE_PIO_WRITE_GATE | \
 	 KVM_EXEC_FEATURE_HANDOFF_ENTRY_OBSERVATION | \
 	 KVM_EXEC_FEATURE_TSC_TIMING | \
-	 KVM_EXEC_FEATURE_INTERRUPT_RESULT | KVM_EXEC_FEATURE_PORTABLE_EXITS)
+	 KVM_EXEC_FEATURE_INTERRUPT_RESULT | KVM_EXEC_FEATURE_PORTABLE_EXITS | \
+	 KVM_EXEC_FEATURE_COMMAND_WAIT)
 
 /*
  * An invocation-end output builds on these negotiated mechanisms.  Mapped
@@ -436,6 +437,12 @@ static bool kvm_exec_invocation_futex_negotiated(struct kvm_exec_domain *domain)
 static bool kvm_exec_boundary_request_negotiated(struct kvm_exec_domain *domain)
 {
 	return domain->negotiated_features & KVM_EXEC_FEATURE_BOUNDARY_REQUEST;
+}
+
+static bool kvm_exec_sleep_state_negotiated(struct kvm_exec_domain *domain)
+{
+	return domain->negotiated_features &
+		(KVM_EXEC_FEATURE_INVOCATION_END | KVM_EXEC_FEATURE_COMMAND_WAIT);
 }
 
 static bool kvm_exec_end_registered(struct kvm_exec_capsule *capsule)
@@ -4536,7 +4543,7 @@ static int kvm_exec_dispatch_sleep(struct kvm_exec_executor *executor,
 				   struct kvm_exec_capsule *capsule)
 {
 	struct kvm_exec_dispatch_header *header = kvm_exec_dispatch_header(executor);
-	bool advertise = kvm_exec_invocation_end_negotiated(executor->domain);
+	bool advertise = kvm_exec_sleep_state_negotiated(executor->domain);
 	/* A deferred boundary return must not end the sleep it waits behind. */
 	bool boundary = !capsule || !kvm_exec_entry_pending(capsule);
 	int ret;
@@ -4565,6 +4572,7 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 	u32 initial_cpu, final_cpu;
 	bool active = false;
 	bool completion_pending = false;
+	bool wait_for_command;
 	/*
 	 * locked: the preamble's domain critical section continues into the
 	 * first pass. returned: the last pass did the return bookkeeping.
@@ -4577,7 +4585,8 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 	if (run.size != sizeof(run) ||
 	    run.flags & ~(KVM_EXEC_DISPATCH_F_RETURN_IF_EMPTY |
 			  KVM_EXEC_DISPATCH_F_RESUME_SERVICED_EXIT |
-			  KVM_EXEC_DISPATCH_F_COMPLETION_ONLY) ||
+			  KVM_EXEC_DISPATCH_F_COMPLETION_ONLY |
+			  KVM_EXEC_DISPATCH_F_WAIT_FOR_COMMAND) ||
 	    (!(run.flags & KVM_EXEC_DISPATCH_F_RESUME_SERVICED_EXIT) &&
 	     run.exit_sequence) || run.exit_flags || run.reserved0)
 		return -EINVAL;
@@ -4586,6 +4595,14 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 		return ret;
 	if (!(domain->negotiated_features & KVM_EXEC_FEATURE_DYNAMIC_DISPATCH))
 		return -EOPNOTSUPP;
+	wait_for_command = run.flags & KVM_EXEC_DISPATCH_F_WAIT_FOR_COMMAND;
+	if (wait_for_command &&
+	    !(domain->negotiated_features & KVM_EXEC_FEATURE_COMMAND_WAIT))
+		return -EOPNOTSUPP;
+	if (wait_for_command &&
+	    (run.flags & (KVM_EXEC_DISPATCH_F_RESUME_SERVICED_EXIT |
+			  KVM_EXEC_DISPATCH_F_COMPLETION_ONLY)))
+		return -EINVAL;
 	if ((run.flags & KVM_EXEC_DISPATCH_F_COMPLETION_ONLY) &&
 	    !(domain->negotiated_features & KVM_EXEC_FEATURE_PORTABLE_EXITS))
 		return -EOPNOTSUPP;
@@ -4594,6 +4611,13 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 		return -ESTALE;
 	if (mutex_lock_killable(&executor->run_lock))
 		return -EINTR;
+	/* The unique runner names its last returned boundary. A stale caller
+	 * must not turn an intervening selection into authorization to run.
+	 */
+	if (wait_for_command && run.command_head != executor->command_head) {
+		ret = -ESTALE;
+		goto out_executor;
+	}
 
 	initial_cpu = get_cpu();
 	put_cpu();
@@ -4841,6 +4865,14 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 			}
 		}
 command_done:
+		/*
+		 * Only an applied selection leaves an entry completion pending.
+		 * Include immediate output handoffs from the previous pass: their
+		 * command_ret is no longer available here. Readiness changes and
+		 * rejected/cancelled commands cannot independently grant entry.
+		 */
+		if (completion_pending)
+			wait_for_command = false;
 		interrupt_pending =
 			kvm_exec_interrupt_snapshot(executor,
 						    &pending_interrupt);
@@ -4868,6 +4900,27 @@ command_done:
 			break;
 		}
 		capsule = kvm_exec_current_capsule(executor);
+		/* An armed exact gate already authorizes its current source to
+		 * reach the requested output. Otherwise keep the selected capsule
+		 * resident without entering it until a command admits progress.
+		 */
+		if (wait_for_command &&
+		    !READ_ONCE(executor->gated_command_waiting)) {
+			mutex_unlock(&domain->lock);
+			if (command_ret > 0)
+				continue;
+			if (run.flags & KVM_EXEC_DISPATCH_F_RETURN_IF_EMPTY) {
+				run.return_reason = KVM_EXEC_RETURN_DISPATCH_EMPTY;
+				break;
+			}
+			ret = kvm_exec_dispatch_sleep(executor, seen_kick_epoch, capsule);
+			if (ret) {
+				run.return_reason = KVM_EXEC_RETURN_SIGNAL;
+				run.run_result = -EINTR;
+				break;
+			}
+			continue;
+		}
 		if (!capsule) {
 			mutex_unlock(&domain->lock);
 			/*
@@ -5381,7 +5434,7 @@ static long kvm_exec_kick(struct kvm_exec_executor *executor,
 	     !kvm_exec_invocation_end_negotiated(domain)))
 		return -EOPNOTSUPP;
 	if ((kick.flags & KVM_EXEC_KICK_F_WAKE_SLEEPING) &&
-	    !kvm_exec_invocation_end_negotiated(domain))
+	    !kvm_exec_sleep_state_negotiated(domain))
 		return -EOPNOTSUPP;
 	if (kick.domain_generation != domain->generation ||
 	    kick.executor_generation != executor->generation)
@@ -7583,6 +7636,8 @@ int kvm_dev_ioctl_create_exec_domain(void __user *argp)
 	     !(create.requested_features & KVM_EXEC_FEATURE_INVOCATION_END)) ||
 	    ((create.requested_features & KVM_EXEC_FEATURE_REGISTERED_ENTRY_FPU) &&
 	     !(create.requested_features & KVM_EXEC_FEATURE_ENTRY_STATE_X86)) ||
+	    ((create.requested_features & KVM_EXEC_FEATURE_COMMAND_WAIT) &&
+	     !(create.requested_features & KVM_EXEC_FEATURE_DYNAMIC_DISPATCH)) ||
 	    ((create.requested_features & KVM_EXEC_FEATURE_CROSS_VM_CHAIN) &&
 	     !(create.requested_features & KVM_EXEC_FEATURE_INTRA_VM_CHAIN)) ||
 	    ((create.requested_features & KVM_EXEC_FEATURE_SYNC_EXITS) &&

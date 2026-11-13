@@ -3814,7 +3814,7 @@ static void test_output_gate_holds_across_dispatcher_iterations(int kvm_fd)
 	kvm_vm_free(donor_vm);
 }
 
-static void test_output_gate_resumes_after_nonmatching_output(int kvm_fd)
+static void test_output_gate_resumes_after_nonmatching_output(int kvm_fd, bool command_wait)
 {
 	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
 				  KVM_EXEC_FEATURE_INTRA_VM_CHAIN |
@@ -3825,7 +3825,8 @@ static void test_output_gate_resumes_after_nonmatching_output(int kvm_fd)
 				  KVM_EXEC_FEATURE_RETURN_KICK |
 				  KVM_EXEC_FEATURE_LIFECYCLE_STATE |
 				  KVM_EXEC_FEATURE_ASYNC_PIO_HANDOFF |
-				  KVM_EXEC_FEATURE_PIO_WRITE_GATE;
+				  KVM_EXEC_FEATURE_PIO_WRITE_GATE |
+				  (command_wait ? KVM_EXEC_FEATURE_COMMAND_WAIT : 0);
 	struct kvm_exec_command donor_command = {
 		.opcode = KVM_EXEC_CMD_SWITCH,
 		.request_sequence = 1,
@@ -3899,6 +3900,26 @@ static void test_output_gate_resumes_after_nonmatching_output(int kvm_fd)
 	TEST_ASSERT_EQ(completion.request_sequence, 1);
 	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_APPLIED);
 	TEST_ASSERT_EQ(completion.owned_capsule_id, 91);
+
+	if (command_wait) {
+		/* Return before publishing the gate, then wait in KVM for it. */
+		kick_dispatch_flags(run_arg.executor_fd, domain_generation,
+				    executor_generation, 100,
+				    KVM_EXEC_KICK_F_RETURN_TO_VMM);
+		pthread_join(thread, NULL);
+		TEST_ASSERT(!run_arg.ret, "source return failed: %d", run_arg.error);
+		TEST_ASSERT_EQ(run_arg.run.return_reason, KVM_EXEC_RETURN_SIGNAL);
+		run_arg.run = (struct kvm_exec_run_dispatch) {
+			.size = sizeof(run_arg.run),
+			.flags = KVM_EXEC_DISPATCH_F_WAIT_FOR_COMMAND,
+			.domain_generation = domain_generation,
+			.executor_generation = executor_generation,
+			.command_head = run_arg.run.command_head,
+		};
+		run_arg.finished = false;
+		TEST_ASSERT(!pthread_create(&thread, NULL, dispatch_runner, &run_arg),
+			    "pthread_create failed");
+	}
 
 	gated_command.request_sequence = ++sequence;
 	TEST_ASSERT(publish_dispatch_command(&mapping, gated_command),
@@ -6957,6 +6978,275 @@ static void test_halt_wake_requires_exact_dispatch(int kvm_fd, bool split_irqchi
 	kvm_vm_free(vm);
 }
 
+/* control=true demonstrates why replacing a userspace wait with an ordinary
+ * dispatch is unsafe: a wake-only kick can enter the old, now-ready capsule.
+ * The control is deliberately expected to fail the no-entry assertion.
+ */
+static void test_command_wait_halt(int kvm_fd, bool control, bool wake_before_wait)
+{
+	uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
+		KVM_EXEC_FEATURE_DYNAMIC_DISPATCH | KVM_EXEC_FEATURE_SYNC_EXITS |
+		KVM_EXEC_FEATURE_RETURN_KICK | KVM_EXEC_FEATURE_LIFECYCLE_STATE;
+	struct dispatch_run_arg arg = { };
+	struct kvm_exec_command command = {
+		.opcode = KVM_EXEC_CMD_SWITCH,
+		.request_sequence = 1,
+		.target_capsule_id = 81,
+		.target_lifecycle_generation = 7,
+	};
+	struct kvm_exec_completion completion;
+	struct kvm_exec_run_dispatch run;
+	struct kvm_interrupt irq = { .irq = HALT_WAKE_VECTOR };
+	struct dispatch_mapping mapping;
+	struct kvm_vcpu *vcpu;
+	struct kvm_vm *vm;
+	uint64_t *progress;
+	uint64_t domain_generation, executor_generation;
+	pthread_t thread;
+	int domain_fd, executor_fd, ret, i;
+
+	if (!control)
+		features |= KVM_EXEC_FEATURE_COMMAND_WAIT;
+	vm = __vm_create_without_irqchip(VM_SHAPE_DEFAULT, 1, 0);
+	vcpu = vm_vcpu_add(vm, 0, guest_halt_then_spin);
+	disable_nested_cpuid(vcpu);
+	vm_init_descriptor_tables(vm);
+	vcpu_init_descriptor_tables(vcpu);
+	vm_install_exception_handler(vm, HALT_WAKE_VECTOR,
+				     guest_halt_wake_handler);
+	progress = addr_gva2hva(vm, (vm_vaddr_t)&halt_wake_progress);
+	WRITE_ONCE(*progress, 0);
+	domain_fd = create_domain_with_features(kvm_fd, 1, 1, features,
+					       &domain_generation);
+	attach_vcpu(domain_fd, vcpu->fd, 81, 7);
+	executor_fd = create_executor(domain_fd, 0x8127, &executor_generation);
+	mapping = map_dispatch(executor_fd);
+	command.domain_generation = domain_generation;
+	command.executor_generation = executor_generation;
+	TEST_ASSERT(publish_dispatch_command(&mapping, command), "initial publish");
+	run = run_dispatch_once(executor_fd, domain_generation, executor_generation);
+	TEST_ASSERT_EQ(run.vcpu_exit_reason, KVM_EXIT_HLT);
+	completion = consume_dispatch_completion(&mapping);
+	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_APPLIED);
+	TEST_ASSERT_EQ(READ_ONCE(*progress), 1);
+
+	arg.executor_fd = executor_fd;
+	arg.run = (struct kvm_exec_run_dispatch) {
+		.size = sizeof(arg.run),
+		.flags = control ? 0 : KVM_EXEC_DISPATCH_F_WAIT_FOR_COMMAND,
+		.domain_generation = domain_generation,
+		.executor_generation = executor_generation,
+		.command_head = run.command_head,
+	};
+	if (!control) {
+		struct kvm_exec_run_dispatch stale = arg.run;
+
+		stale.command_head++;
+		assert_ioctl_errno(executor_fd, KVM_EXEC_RUN_DISPATCH, &stale, ESTALE);
+	}
+	if (wake_before_wait) {
+		ret = ioctl(vcpu->fd, KVM_INTERRUPT, &irq);
+		TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_INTERRUPT, ret));
+	}
+	TEST_ASSERT(!pthread_create(&thread, NULL, dispatch_runner, &arg),
+		    "pthread_create failed");
+	/* COMMAND_WAIT publishes its sleeping state, unlike old non-end domains. */
+	for (i = 0; !control && i < 10000; i++) {
+		TEST_ASSERT(!__atomic_load_n(&arg.finished, __ATOMIC_ACQUIRE),
+			    "command wait returned early: ret=%d errno=%d", arg.ret, arg.error);
+		if (__atomic_load_n(&mapping.header->dispatcher_state, __ATOMIC_ACQUIRE) &
+		    KVM_EXEC_DISPATCHER_F_SLEEPING)
+			break;
+		usleep(100);
+	}
+	TEST_ASSERT(control || i < 10000, "dispatcher never advertised sleep");
+	if (!wake_before_wait) {
+		ret = ioctl(vcpu->fd, KVM_INTERRUPT, &irq);
+		TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_INTERRUPT, ret));
+	}
+	kick_dispatch_flags(executor_fd, domain_generation, executor_generation,
+			    100, 0);
+	/* Force the ready-state observation without granting a command. */
+	usleep(20000);
+	TEST_ASSERT_EQ(READ_ONCE(*progress), 1);
+	TEST_ASSERT(!__atomic_load_n(&arg.finished, __ATOMIC_ACQUIRE),
+		    "wake-only event ended command wait");
+
+	command.request_sequence = 2;
+	command.expected_current_id = 81;
+	command.expected_current_generation = 8;
+	TEST_ASSERT(publish_dispatch_command(&mapping, command), "stale publish");
+	kick_dispatch_flags(executor_fd, domain_generation, executor_generation,
+			    101, 0);
+	completion = consume_dispatch_completion(&mapping);
+	TEST_ASSERT(completion.status != KVM_EXEC_COMPLETE_APPLIED,
+		    "stale selection unexpectedly applied");
+	usleep(20000);
+	TEST_ASSERT_EQ(READ_ONCE(*progress), 1);
+
+	command.request_sequence = 3;
+	command.expected_current_generation = 7;
+	TEST_ASSERT_EQ(cancel_dispatch(executor_fd, domain_generation,
+				       executor_generation, 3), KVM_EXEC_CANCEL_ACCEPTED);
+	TEST_ASSERT(publish_dispatch_command(&mapping, command), "cancelled publish");
+	kick_dispatch_flags(executor_fd, domain_generation, executor_generation,
+			    102, 0);
+	completion = consume_dispatch_completion(&mapping);
+	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_CANCELLED_BEFORE_APPLY);
+	usleep(20000);
+	TEST_ASSERT_EQ(READ_ONCE(*progress), 1);
+
+	if (wake_before_wait) {
+		/* A RELEASE must retire while waiting, without admitting the old guest. */
+		command.request_sequence = 4;
+		command.opcode = KVM_EXEC_CMD_RELEASE;
+		command.target_capsule_id = 0;
+		command.target_lifecycle_generation = 0;
+		TEST_ASSERT(publish_dispatch_command(&mapping, command), "idle release publish");
+		kick_dispatch_flags(executor_fd, domain_generation, executor_generation,
+				    103, KVM_EXEC_KICK_F_WAKE_SLEEPING);
+		completion = consume_dispatch_completion(&mapping);
+		TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_RETURNED);
+		TEST_ASSERT_EQ(completion.owned_capsule_id, 0);
+		TEST_ASSERT_EQ(READ_ONCE(*progress), 1);
+		TEST_ASSERT(!__atomic_load_n(&arg.finished, __ATOMIC_ACQUIRE),
+			    "release ended blocking command wait");
+	}
+
+	command.request_sequence = 5;
+	command.opcode = KVM_EXEC_CMD_SWITCH;
+	command.expected_current_id = wake_before_wait ? 0 : 81;
+	command.expected_current_generation = wake_before_wait ? 0 : 7;
+	command.target_capsule_id = 81;
+	command.target_lifecycle_generation = 7;
+	TEST_ASSERT(publish_dispatch_command(&mapping, command), "resume publish");
+	kick_dispatch_flags(executor_fd, domain_generation, executor_generation,
+			    104, KVM_EXEC_KICK_F_WAKE_SLEEPING);
+	wait_for_trace_progress(progress, 1);
+	kick_dispatch_flags(executor_fd, domain_generation, executor_generation,
+			    105, KVM_EXEC_KICK_F_RETURN_TO_VMM);
+	pthread_join(thread, NULL);
+	TEST_ASSERT(!arg.ret, "command wait returned %d errno %d", arg.ret, arg.error);
+	TEST_ASSERT_EQ(arg.run.return_reason, KVM_EXEC_RETURN_SIGNAL);
+	completion = consume_dispatch_completion(&mapping);
+	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_APPLIED);
+	TEST_ASSERT_EQ(READ_ONCE(*progress), 2);
+
+	command.opcode = KVM_EXEC_CMD_RELEASE;
+	command.request_sequence = 6;
+	command.expected_current_id = 81;
+	command.expected_current_generation = 7;
+	command.target_capsule_id = 0;
+	command.target_lifecycle_generation = 0;
+	TEST_ASSERT(publish_dispatch_command(&mapping, command), "release publish");
+	run = run_dispatch_once(executor_fd, domain_generation, executor_generation);
+	TEST_ASSERT_EQ(run.return_reason, KVM_EXEC_RETURN_DISPATCH_EMPTY);
+	completion = consume_dispatch_completion(&mapping);
+	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_RETURNED);
+	control_domain(domain_fd, KVM_EXEC_PAUSE);
+	control_domain(domain_fd, KVM_EXEC_DRAIN);
+	detach_vcpu(domain_fd, 81, 7);
+	munmap(mapping.header, KVM_EXEC_DISPATCH_MMAP_SIZE);
+	close(executor_fd);
+	close(domain_fd);
+	kvm_vm_free(vm);
+}
+
+/* No guest or HyperFlux policy is needed for the generic wait lifecycle. */
+static void test_command_wait_lifecycle(int kvm_fd)
+{
+	const uint64_t base = KVM_EXEC_FEATURE_BASE_OBJECTS |
+		KVM_EXEC_FEATURE_DYNAMIC_DISPATCH | KVM_EXEC_FEATURE_RETURN_KICK;
+	struct sigaction action = { .sa_handler = signal_handler }, old_action;
+	struct dispatch_run_arg arg;
+	struct dispatch_mapping mapping;
+	struct kvm_exec_run_dispatch run;
+	uint64_t domain_generation, executor_generation;
+	pthread_t thread;
+	int domain_fd, executor_fd, i, event, ret;
+
+	domain_fd = create_domain_with_features(kvm_fd, 1, 1, base, &domain_generation);
+	executor_fd = create_executor(domain_fd, 0x8128, &executor_generation);
+	run = (struct kvm_exec_run_dispatch) {
+		.size = sizeof(run),
+		.flags = KVM_EXEC_DISPATCH_F_WAIT_FOR_COMMAND,
+		.domain_generation = domain_generation,
+		.executor_generation = executor_generation,
+	};
+	assert_ioctl_errno(executor_fd, KVM_EXEC_RUN_DISPATCH, &run, EOPNOTSUPP);
+	close(executor_fd);
+	close(domain_fd);
+
+	domain_fd = create_domain_with_features(kvm_fd, 1, 1,
+		base | KVM_EXEC_FEATURE_COMMAND_WAIT, &domain_generation);
+	executor_fd = create_executor(domain_fd, 0x8129, &executor_generation);
+	mapping = map_dispatch(executor_fd);
+	run.domain_generation = domain_generation;
+	run.executor_generation = executor_generation;
+	run.flags |= KVM_EXEC_DISPATCH_F_COMPLETION_ONLY;
+	assert_ioctl_errno(executor_fd, KVM_EXEC_RUN_DISPATCH, &run, EINVAL);
+	run.flags = KVM_EXEC_DISPATCH_F_WAIT_FOR_COMMAND |
+		KVM_EXEC_DISPATCH_F_RESUME_SERVICED_EXIT;
+	assert_ioctl_errno(executor_fd, KVM_EXEC_RUN_DISPATCH, &run, EINVAL);
+	run.flags = KVM_EXEC_DISPATCH_F_WAIT_FOR_COMMAND |
+		KVM_EXEC_DISPATCH_F_RETURN_IF_EMPTY;
+	ret = ioctl(executor_fd, KVM_EXEC_RUN_DISPATCH, &run);
+	TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_EXEC_RUN_DISPATCH, ret));
+	TEST_ASSERT_EQ(run.return_reason, KVM_EXEC_RETURN_DISPATCH_EMPTY);
+	sigemptyset(&action.sa_mask);
+	TEST_ASSERT(!sigaction(SIGUSR1, &action, &old_action), "sigaction failed");
+
+	/* Reenter the same cursor after a signal, return kick and pause/resume. */
+	for (event = 0; event < 4; event++) {
+		arg = (struct dispatch_run_arg) {
+			.executor_fd = executor_fd,
+			.run = {
+				.size = sizeof(run),
+				.flags = KVM_EXEC_DISPATCH_F_WAIT_FOR_COMMAND,
+				.domain_generation = domain_generation,
+				.executor_generation = executor_generation,
+			},
+		};
+		TEST_ASSERT(!pthread_create(&thread, NULL, dispatch_runner, &arg),
+			    "pthread_create failed");
+		for (i = 0; i < 10000; i++) {
+			TEST_ASSERT(!__atomic_load_n(&arg.finished, __ATOMIC_ACQUIRE),
+				    "wait returned before event %d", event);
+			if (__atomic_load_n(&mapping.header->dispatcher_state, __ATOMIC_ACQUIRE) &
+			    KVM_EXEC_DISPATCHER_F_SLEEPING)
+				break;
+			usleep(100);
+		}
+		TEST_ASSERT(i < 10000, "wait never slept for event %d", event);
+		if (event == 0)
+			TEST_ASSERT(!pthread_kill(thread, SIGUSR1), "pthread_kill failed");
+		else if (event == 1)
+			kick_dispatch_flags(executor_fd, domain_generation, executor_generation,
+					    1, KVM_EXEC_KICK_F_RETURN_TO_VMM);
+		else if (event == 2)
+			control_domain(domain_fd, KVM_EXEC_PAUSE);
+		else
+			close(domain_fd);
+		pthread_join(thread, NULL);
+		TEST_ASSERT(!arg.ret, "wait event %d: ret=%d errno=%d", event, arg.ret, arg.error);
+		TEST_ASSERT_EQ(arg.run.return_reason,
+			event < 2 ? KVM_EXEC_RETURN_SIGNAL :
+			event == 2 ? KVM_EXEC_RETURN_DOMAIN_PAUSED :
+			KVM_EXEC_RETURN_DOMAIN_STOPPING);
+		TEST_ASSERT_EQ(arg.run.command_head, 0);
+		TEST_ASSERT_EQ(arg.run.owned_capsule_id, 0);
+		TEST_ASSERT_EQ(__atomic_load_n(&mapping.header->dispatcher_state,
+					      __ATOMIC_ACQUIRE), 0);
+		if (event == 2) {
+			control_domain(domain_fd, KVM_EXEC_DRAIN);
+			control_domain(domain_fd, KVM_EXEC_RESUME);
+		}
+	}
+	TEST_ASSERT(!sigaction(SIGUSR1, &old_action, NULL), "restoring sigaction failed");
+	munmap(mapping.header, KVM_EXEC_DISPATCH_MMAP_SIZE);
+	close(executor_fd);
+}
+
 static void test_split_irqchip_deferred_pio_halt_returns_to_dispatcher(int kvm_fd)
 {
 	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
@@ -8294,6 +8584,17 @@ int main(int argc, char **argv)
 		close(kvm_fd);
 		return 0;
 	}
+	if (argc == 2 && (!strcmp(argv[1], "--command-wait-only") ||
+			  !strcmp(argv[1], "--command-wait-control"))) {
+		test_command_wait_halt(kvm_fd, !strcmp(argv[1], "--command-wait-control"), false);
+		if (!strcmp(argv[1], "--command-wait-only")) {
+			test_command_wait_halt(kvm_fd, false, true);
+			test_command_wait_lifecycle(kvm_fd);
+			test_output_gate_resumes_after_nonmatching_output(kvm_fd, true);
+		}
+		close(kvm_fd);
+		return 0;
+	}
 	if (argc == 2 && !strcmp(argv[1], "--halt-wake-only")) {
 		test_halt_wake_requires_exact_dispatch(kvm_fd, false, false);
 		test_halt_wake_requires_exact_dispatch(kvm_fd, true, false);
@@ -8339,7 +8640,7 @@ int main(int argc, char **argv)
 		return 0;
 	}
 	if (argc == 2 && !strcmp(argv[1], "--output-gate-reentry-only")) {
-		test_output_gate_resumes_after_nonmatching_output(kvm_fd);
+		test_output_gate_resumes_after_nonmatching_output(kvm_fd, false);
 		close(kvm_fd);
 		return 0;
 	}
@@ -8348,7 +8649,7 @@ int main(int argc, char **argv)
 			    "KVM does not advertise asynchronous PIO handoff");
 		test_output_gated_async_pio_handoff(kvm_fd);
 		test_output_gate_holds_across_dispatcher_iterations(kvm_fd);
-		test_output_gate_resumes_after_nonmatching_output(kvm_fd);
+		test_output_gate_resumes_after_nonmatching_output(kvm_fd, false);
 		test_output_gated_handoff_with_completion_backlog(kvm_fd);
 		test_async_pio_handoff_before_completion(kvm_fd);
 		test_async_pio_handoff_fallback(kvm_fd, KVM_EXEC_CMD_SWITCH);
@@ -8387,6 +8688,10 @@ int main(int argc, char **argv)
 	test_halt_wake_requires_exact_dispatch(kvm_fd, true, false);
 	test_halt_wake_requires_exact_dispatch(kvm_fd, true, true);
 	test_split_irqchip_deferred_pio_halt_returns_to_dispatcher(kvm_fd);
+	test_command_wait_halt(kvm_fd, false, false);
+	test_command_wait_halt(kvm_fd, false, true);
+	test_command_wait_lifecycle(kvm_fd);
+	test_output_gate_resumes_after_nonmatching_output(kvm_fd, true);
 	test_halt_wake_dispatch_stress(kvm_fd);
 	test_cross_vm_halt_interrupt_migration(kvm_fd);
 	test_fd_close_orders(kvm_fd);
@@ -8419,7 +8724,7 @@ int main(int argc, char **argv)
 	test_async_pio_write_switch(kvm_fd);
 	test_async_pio_handoff_before_completion(kvm_fd);
 	test_output_gate_holds_across_dispatcher_iterations(kvm_fd);
-	test_output_gate_resumes_after_nonmatching_output(kvm_fd);
+	test_output_gate_resumes_after_nonmatching_output(kvm_fd, false);
 	test_output_gated_handoff_with_completion_backlog(kvm_fd);
 	test_async_pio_handoff_fallback(kvm_fd, KVM_EXEC_CMD_SWITCH);
 	test_async_pio_handoff_fallback(kvm_fd, KVM_EXEC_CMD_RELEASE);
