@@ -935,6 +935,10 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_FEATURE_COMMAND_WAIT		(1ULL << 26)
 /* Optional dispatcher hardware wait; ordinary task blocking remains default. */
 #define KVM_EXEC_FEATURE_HARDWARE_WAIT		(1ULL << 27)
+/* Exact HLT readiness and selection commit in one command. */
+#define KVM_EXEC_FEATURE_RESUME_HALT		(1ULL << 28)
+/* Ordinary HLT observations use the mapped request/ACK channel. */
+#define KVM_EXEC_FEATURE_MAPPED_HALT		(1ULL << 29)
 
 #define KVM_EXEC_INTERRUPT_DELIVERY_DIRECT_KICK	1U
 #define KVM_EXEC_INTERRUPT_DELIVERY_LOCAL_APIC_KICK 2U
@@ -1036,6 +1040,10 @@ struct kvm_ppc_resize_hpt {
  * output registered; the command then applies without waiting for that output.
  */
 #define KVM_EXEC_CMD_F_END_INVOCATION	(1U << 4)
+/* RESUME_HALT: reserved names the target's exact HLT exit sequence.
+ * No interrupt is injected. Mutually exclusive with every other command flag.
+ */
+#define KVM_EXEC_CMD_F_RESUME_HALT	(1U << 5)
 
 #define KVM_EXEC_PORTABLE_ABI_VERSION	2U
 #define KVM_EXEC_CAPSULE_CONTROL_SIZE	128U
@@ -1120,7 +1128,10 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_EXECUTOR_STATE_PAUSED		7U
 
 #define KVM_EXEC_EXIT_F_COMPLETION_PENDING (1U << 0)
+/* The existing mapped HLT observation still owns this idle boundary. */
+#define KVM_EXEC_EXIT_F_MAPPED_HALT	(1U << 1)
 
+#define KVM_EXEC_EXIT_REQUEST_HALT	2
 #define KVM_EXEC_EXIT_REQUEST_PIO_WRITE	1U
 #define KVM_EXEC_EXIT_COMPLETE_OK	1U
 

@@ -32,7 +32,8 @@
 	 KVM_EXEC_FEATURE_HANDOFF_ENTRY_OBSERVATION | \
 	 KVM_EXEC_FEATURE_TSC_TIMING | \
 	 KVM_EXEC_FEATURE_INTERRUPT_RESULT | KVM_EXEC_FEATURE_PORTABLE_EXITS | \
-	 KVM_EXEC_FEATURE_COMMAND_WAIT)
+	 KVM_EXEC_FEATURE_COMMAND_WAIT | KVM_EXEC_FEATURE_RESUME_HALT | \
+	 KVM_EXEC_FEATURE_MAPPED_HALT)
 
 /*
  * An invocation-end output builds on these negotiated mechanisms.  Mapped
@@ -937,6 +938,8 @@ bool kvm_exec_domain_vcpu_ioctl_allowed(struct kvm_vcpu *vcpu,
 
 	return READ_ONCE(capsule->domain->paused) &&
 	       !READ_ONCE(capsule->exit.completion_pending) &&
+	       !READ_ONCE(capsule->exit.async_request_pending) &&
+	       !READ_ONCE(capsule->exit.async_completion_ready) &&
 	       !kvm_exec_entry_unobserved(capsule) &&
 	       (!capsule->portable ||
 		!READ_ONCE(capsule->portable->service_pending));
@@ -1109,6 +1112,8 @@ static bool kvm_exec_has_pending_exit_locked(struct kvm_exec_domain *domain)
 	xa_for_each(&domain->capsules, index, capsule) {
 		if (capsule->vcpu &&
 		    (capsule->exit.completion_pending ||
+		     capsule->exit.async_request_pending ||
+		     capsule->exit.async_completion_ready ||
 		     kvm_exec_entry_unobserved(capsule) ||
 		     (capsule->portable && capsule->portable->service_pending)))
 			return true;
@@ -1537,6 +1542,8 @@ static int kvm_exec_detach_vcpu(struct kvm_exec_domain *domain,
 	    kvm_exec_entry_unobserved(capsule) ||
 	    (!(detach.flags & KVM_EXEC_DETACH_F_DISCARD) &&
 	     (capsule->exit.completion_pending ||
+		     capsule->exit.async_request_pending ||
+		     capsule->exit.async_completion_ready ||
 	      (capsule->portable && capsule->portable->service_pending)))) {
 		ret = -EBUSY;
 		goto out;
@@ -1613,6 +1620,8 @@ static long kvm_exec_query_capsule(struct kvm_exec_domain *domain,
 	if (domain->stopping)
 		query.state = KVM_EXEC_CAPSULE_STATE_STOPPING;
 	else if (capsule->exit.completion_pending ||
+		     capsule->exit.async_request_pending ||
+		     capsule->exit.async_completion_ready ||
 		 (capsule->portable && capsule->portable->service_pending))
 		query.state = KVM_EXEC_CAPSULE_STATE_COMPLETION_PENDING;
 	else if (capsule->running)
@@ -1688,7 +1697,8 @@ static int kvm_exec_executor_release(struct inode *inode, struct file *file)
 	 */
 	xa_for_each(&domain->capsules, index, capsule) {
 		if (!capsule->portable && capsule->vcpu &&
-		    capsule->exit.completion_pending &&
+		    (capsule->exit.completion_pending || capsule->exit.async_request_pending ||
+		     capsule->exit.async_completion_ready) &&
 		    capsule->exit.async_executor_generation == executor->generation) {
 			WRITE_ONCE(domain->stopping, true);
 			kvm_exec_kick_running_locked(domain);
@@ -2424,13 +2434,18 @@ static bool kvm_exec_dispatch_command_shape_valid(struct kvm_exec_command *cmd)
 	    cmd->flags & ~(KVM_EXEC_CMD_F_PIO_WRITE_GATE |
 			   KVM_EXEC_CMD_F_GUARDED_TARGET | KVM_EXEC_CMD_F_SET_ENTRY |
 			   KVM_EXEC_CMD_F_CONTINUE_ENTRY |
-			   KVM_EXEC_CMD_F_END_INVOCATION) ||
+			   KVM_EXEC_CMD_F_END_INVOCATION | KVM_EXEC_CMD_F_RESUME_HALT) ||
 	    ((cmd->flags & KVM_EXEC_CMD_F_END_INVOCATION) &&
 	     (!cmd->expected_current_id ||
 	      (cmd->flags & KVM_EXEC_CMD_F_PIO_WRITE_GATE))) ||
 	    !cmd->request_sequence ||
 	    memchr_inv(cmd->reserved0, 0, sizeof(cmd->reserved0)) ||
-	    (!(cmd->flags & KVM_EXEC_CMD_F_GUARDED_TARGET) && cmd->reserved))
+	    (!(cmd->flags & (KVM_EXEC_CMD_F_GUARDED_TARGET |
+			     KVM_EXEC_CMD_F_RESUME_HALT)) && cmd->reserved))
+		return false;
+	if ((cmd->flags & KVM_EXEC_CMD_F_RESUME_HALT) &&
+	    (cmd->flags != KVM_EXEC_CMD_F_RESUME_HALT ||
+	     cmd->opcode != KVM_EXEC_CMD_SWITCH || !cmd->reserved))
 		return false;
 	if ((cmd->flags & KVM_EXEC_CMD_F_GUARDED_TARGET) &&
 	    (cmd->opcode != KVM_EXEC_CMD_SWITCH || !cmd->reserved))
@@ -2494,6 +2509,7 @@ kvm_exec_async_handoff_command(struct kvm_exec_executor *executor,
 	return source &&
 	       (executor->domain->negotiated_features &
 		KVM_EXEC_FEATURE_ASYNC_PIO_HANDOFF) &&
+	       source->exit.reason == KVM_EXIT_IO &&
 	       source->exit.async_request_pending &&
 	       source->exit.async_executor_generation == executor->generation &&
 	       command->opcode == KVM_EXEC_CMD_SWITCH &&
@@ -3051,7 +3067,8 @@ kvm_exec_async_publish(struct kvm_exec_executor *executor,
 		kvm_exec_dispatch_header(executor);
 	struct kvm_exec_exit_request request = {
 		.size = sizeof(request),
-		.type = KVM_EXEC_EXIT_REQUEST_PIO_WRITE,
+		.type = capsule->exit.reason == KVM_EXIT_HLT ?
+			KVM_EXEC_EXIT_REQUEST_HALT : KVM_EXEC_EXIT_REQUEST_PIO_WRITE,
 		.domain_generation = executor->domain->generation,
 		.executor_generation = executor->generation,
 		.capsule_id = capsule->capsule_id,
@@ -3160,7 +3177,8 @@ kvm_exec_async_consume(struct kvm_exec_executor *executor,
 		capsule->exit.async_executor_generation == executor->generation &&
 		capsule->lifecycle_generation == response.lifecycle_generation &&
 		capsule->exit.sequence == response.exit_sequence &&
-		capsule->exit.completion_pending &&
+		(capsule->exit.completion_pending ||
+		 capsule->exit.reason == KVM_EXIT_HLT) &&
 		capsule->exit.async_request_pending &&
 		!capsule->exit.async_completion_ready;
 	if (valid && detached_only && capsule->owner) {
@@ -3243,10 +3261,17 @@ kvm_exec_async_apply_completion(struct kvm_exec_executor *executor,
 	     (capsule->owner != executor ||
 	      kvm_exec_current_capsule(executor) != capsule)) ||
 	    capsule->exit.async_executor_generation != executor->generation ||
-	    !capsule->exit.completion_pending ||
+	    (!capsule->exit.completion_pending && capsule->exit.reason != KVM_EXIT_HLT) ||
 	    !capsule->exit.async_completion_ready) {
 		mutex_unlock(&domain->lock);
 		return -EINVAL;
+	}
+	if (capsule->exit.reason == KVM_EXIT_HLT) {
+		/* ACK retires observation only; exact selection still admits entry. */
+		kvm_exec_async_finish_completion_locked(capsule);
+		mutex_unlock(&domain->lock);
+		wake_up_all(&domain->drain_wait);
+		return 0;
 	}
 	WRITE_ONCE(capsule->running, true);
 	capsule->exit.async_entry_authorized = true;
@@ -3277,7 +3302,8 @@ kvm_exec_async_apply_completion(struct kvm_exec_executor *executor,
 
 static bool kvm_exec_exit_blocks_handoff(struct kvm_exec_capsule *capsule)
 {
-	return !capsule->portable && capsule->exit.completion_pending;
+	return !capsule->portable && (capsule->exit.completion_pending ||
+		capsule->exit.async_request_pending || capsule->exit.async_completion_ready);
 }
 
 static bool
@@ -3723,7 +3749,18 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 			status = KVM_EXEC_COMPLETE_TARGET_STALE;
 			goto terminal_locked;
 		}
-		if ((domain->negotiated_features &
+		if (command.flags & KVM_EXEC_CMD_F_RESUME_HALT) {
+			if (!(domain->negotiated_features & KVM_EXEC_FEATURE_RESUME_HALT) ||
+			    target->portable) {
+				status = KVM_EXEC_COMPLETE_REJECTED;
+				goto terminal_locked;
+			}
+			if (target->exit.sequence != command.reserved ||
+			    target->exit.reason != KVM_EXIT_HLT || target->exit.run_flags) {
+				status = KVM_EXEC_COMPLETE_TARGET_STALE;
+				goto terminal_locked;
+			}
+		} else if ((domain->negotiated_features &
 		     KVM_EXEC_FEATURE_LIFECYCLE_STATE) &&
 		    atomic_read(&target->block_reason) == KVM_EXEC_BLOCK_HLT) {
 			status = KVM_EXEC_COMPLETE_TARGET_BLOCKED;
@@ -3809,6 +3846,15 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 		if (timing)
 			timing->handoff_started_tsc =
 				kvm_arch_exec_host_tsc();
+		if (command.flags & KVM_EXEC_CMD_F_RESUME_HALT) {
+			/* HLT already advanced RIP and left architectural mp_state runnable.
+			 * Explicit VMM admission wakes this exact software halt; it does
+			 * not fabricate a guest interrupt or clear any other block reason.
+			 */
+			if (atomic_cmpxchg(&target->block_reason, KVM_EXEC_BLOCK_HLT,
+					   KVM_EXEC_BLOCK_NONE) == KVM_EXEC_BLOCK_HLT)
+				atomic64_inc(&target->wake_count);
+		}
 		ownership_changed = current_capsule != target;
 		if (current_capsule != target) {
 			supersede_interrupt = true;
@@ -4386,6 +4432,13 @@ static void kvm_exec_dispatch_run_owner(struct kvm_exec_executor *executor,
 	 * cannot collide with the next architectural KVM exit.  A return while a
 	 * read completion is still pending must retain the issuing exit's tag.
 	 */
+	if (run->return_reason != KVM_EXEC_RETURN_SIGNAL &&
+	    (executor->domain->negotiated_features & KVM_EXEC_FEATURE_MAPPED_HALT) &&
+	    capsule->exit.reason == KVM_EXIT_HLT && capsule->exit.async_reentry_required) {
+		run->exit_sequence = capsule->exit.sequence;
+		run->exit_flags = KVM_EXEC_EXIT_F_MAPPED_HALT;
+		return;
+	}
 	if (run->return_reason == KVM_EXEC_RETURN_SIGNAL &&
 	    !capsule->exit.completion_pending) {
 		run->exit_sequence =
@@ -5094,7 +5147,9 @@ command_done:
 		 */
 		if (READ_ONCE(executor->gated_command_waiting) &&
 		    capsule->owner == executor &&
-		    !capsule->exit.completion_pending)
+		    !capsule->exit.completion_pending &&
+		    !capsule->exit.async_request_pending &&
+		    !capsule->exit.async_completion_ready)
 			capsule->exit.async_reentry_required = false;
 		/*
 		 * An ended capsule stays current until a command moves the executor
@@ -5324,8 +5379,13 @@ command_done:
 				retained_halt_exit =
 					kvm_exec_interrupt_consume_retained_halt(
 						executor, capsule);
-			else if (!async_published &&
-				 observed_exit.reason != KVM_EXIT_DEBUG)
+			if (!retained_halt_exit && !strict_migrated &&
+			    !domain->stopping && !domain->paused &&
+			    (domain->negotiated_features & KVM_EXEC_FEATURE_MAPPED_HALT) &&
+			    observed_exit.reason == KVM_EXIT_HLT && !observed_exit.run_flags)
+				async_published = kvm_exec_async_publish(executor, capsule);
+			if (!async_published && observed_exit.reason != KVM_EXIT_HLT &&
+			    observed_exit.reason != KVM_EXIT_DEBUG)
 				kvm_exec_interrupt_clear_retained_halt(
 					executor);
 		} else if (attempted_kvm_run &&
@@ -5606,9 +5666,11 @@ static long kvm_exec_kick(struct kvm_exec_executor *executor,
 		 * A mapped exit is already a userspace-visible service boundary.
 		 * If the return request races behind its publication, satisfy the
 		 * request at that boundary instead of forcing a redundant ioctl
-		 * return before the next exact command.
+		 * return before the next exact command. HLT observation is not
+		 * a mutable control-service boundary; honor a fresh return for it.
 		 */
-		if (capsule && capsule->exit.async_request_pending)
+		if (capsule && capsule->exit.async_request_pending &&
+		    capsule->exit.reason != KVM_EXIT_HLT)
 			WRITE_ONCE(executor->mapped_boundary_return_kick_epoch,
 				   return_epoch);
 	}
@@ -6932,7 +6994,8 @@ static long kvm_exec_query_executor(struct kvm_exec_executor *executor,
 		query.state = KVM_EXEC_EXECUTOR_STATE_PAUSED;
 	} else if (capsule) {
 		block_reason = atomic_read(&capsule->block_reason);
-		if (capsule->exit.completion_pending)
+		if (capsule->exit.completion_pending || capsule->exit.async_request_pending ||
+		    capsule->exit.async_completion_ready)
 			query.state =
 				KVM_EXEC_EXECUTOR_STATE_COMPLETION_PENDING;
 		else if (capsule->running)
@@ -7759,6 +7822,16 @@ int kvm_dev_ioctl_create_exec_domain(void __user *argp)
 	    ((create.requested_features & (KVM_EXEC_FEATURE_COMMAND_WAIT |
 				  KVM_EXEC_FEATURE_HARDWARE_WAIT)) &&
 	     !(create.requested_features & KVM_EXEC_FEATURE_DYNAMIC_DISPATCH)) ||
+	    ((create.requested_features & KVM_EXEC_FEATURE_MAPPED_HALT) &&
+	     ((create.requested_features & (KVM_EXEC_FEATURE_ASYNC_PIO_WRITE |
+		KVM_EXEC_FEATURE_COMMAND_WAIT | KVM_EXEC_FEATURE_LIFECYCLE_STATE)) !=
+	      (KVM_EXEC_FEATURE_ASYNC_PIO_WRITE | KVM_EXEC_FEATURE_COMMAND_WAIT |
+		KVM_EXEC_FEATURE_LIFECYCLE_STATE) ||
+	      (create.requested_features & KVM_EXEC_FEATURE_PORTABLE_EXITS))) ||
+	    ((create.requested_features & KVM_EXEC_FEATURE_RESUME_HALT) &&
+	     (create.requested_features & (KVM_EXEC_FEATURE_DYNAMIC_DISPATCH |
+					  KVM_EXEC_FEATURE_LIFECYCLE_STATE)) !=
+	     (KVM_EXEC_FEATURE_DYNAMIC_DISPATCH | KVM_EXEC_FEATURE_LIFECYCLE_STATE)) ||
 	    ((create.requested_features & KVM_EXEC_FEATURE_CROSS_VM_CHAIN) &&
 	     !(create.requested_features & KVM_EXEC_FEATURE_INTRA_VM_CHAIN)) ||
 	    ((create.requested_features & KVM_EXEC_FEATURE_SYNC_EXITS) &&
