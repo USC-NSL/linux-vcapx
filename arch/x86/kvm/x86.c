@@ -150,8 +150,8 @@ EXPORT_STATIC_CALL_GPL(kvm_x86_cache_reg);
 static bool __read_mostly ignore_msrs = 0;
 module_param(ignore_msrs, bool, 0644);
 
-/* Opt-in ablation for registered invocation-end fast OUT completion. */
-static bool exec_fast_output_completion;
+/* Retain the full-path control for matched completion-cost ablations. */
+static bool exec_fast_output_completion = true;
 module_param(exec_fast_output_completion, bool, 0644);
 MODULE_PARM_DESC(exec_fast_output_completion,
 		 "Avoid guest FPU swaps for invocation-end fast OUT completion");
