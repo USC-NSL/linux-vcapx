@@ -330,6 +330,8 @@ struct kvm_exec_native_completion {
 	bool fault;
 	bool entry_pending;
 	bool entry_attempted;
+	/* Kernel-only completion scope; never authorizes guest entry. */
+	bool output_completion_only;
 };
 
 struct kvm_vcpu {

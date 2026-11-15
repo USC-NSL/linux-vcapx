@@ -150,6 +150,12 @@ EXPORT_STATIC_CALL_GPL(kvm_x86_cache_reg);
 static bool __read_mostly ignore_msrs = 0;
 module_param(ignore_msrs, bool, 0644);
 
+/* Opt-in ablation for registered invocation-end fast OUT completion. */
+static bool exec_fast_output_completion;
+module_param(exec_fast_output_completion, bool, 0644);
+MODULE_PARM_DESC(exec_fast_output_completion,
+		 "Avoid guest FPU swaps for invocation-end fast OUT completion");
+
 bool __read_mostly report_ignored_msrs = true;
 module_param(report_ignored_msrs, bool, 0644);
 EXPORT_SYMBOL_GPL(report_ignored_msrs);
@@ -11653,16 +11659,36 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
 {
 	struct kvm_queued_exception *ex = &vcpu->arch.exception;
 	struct kvm_run *kvm_run = vcpu->run;
+	bool output_only = vcpu->exec_native_completion &&
+		vcpu->exec_native_completion->output_completion_only;
+	bool load_fpu = true;
 	int r;
+
+	/*
+	 * These callbacks only retire OUT, update RIP/interruptibility and
+	 * report single-step/fault state. Vendor instruction skipping may
+	 * decode with EMULTYPE_SKIP, but never executes an FPU instruction.
+	 * Generic emulated I/O, nested guests and unusual pre-run state retain
+	 * the full path. The kernel-owned scope also forbids guest entry if
+	 * userspace changes the shared immediate_exit byte during this run.
+	 */
+	if (output_only && READ_ONCE(exec_fast_output_completion) &&
+	    vcpu->arch.mp_state == KVM_MP_STATE_RUNNABLE &&
+	    !is_guest_mode(vcpu) && !vcpu->arch.guest_state_protected &&
+	    !kvm_run->kvm_dirty_regs &&
+	    (vcpu->arch.complete_userspace_io == complete_fast_pio_out ||
+	     vcpu->arch.complete_userspace_io == complete_fast_pio_out_port_0x7e))
+		load_fpu = false;
 
 	vcpu_load(vcpu);
 	kvm_sigset_activate(vcpu);
 	kvm_run->flags = 0;
-	kvm_load_guest_fpu(vcpu);
+	if (load_fpu)
+		kvm_load_guest_fpu(vcpu);
 
 	kvm_vcpu_srcu_read_lock(vcpu);
 	if (unlikely(vcpu->arch.mp_state == KVM_MP_STATE_UNINITIALIZED)) {
-		if (kvm_run->immediate_exit) {
+		if (output_only || kvm_run->immediate_exit) {
 			r = -EINTR;
 			goto out;
 		}
@@ -11748,7 +11774,7 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
 		WARN_ON_ONCE(vcpu->mmio_needed);
 	}
 
-	if (kvm_run->immediate_exit) {
+	if (output_only || kvm_run->immediate_exit) {
 		r = -EINTR;
 		goto out;
 	}
@@ -11767,7 +11793,8 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
 	r = vcpu_run(vcpu);
 
 out:
-	kvm_put_guest_fpu(vcpu);
+	if (load_fpu)
+		kvm_put_guest_fpu(vcpu);
 	if (kvm_run->kvm_valid_regs)
 		store_regs(vcpu);
 	post_kvm_run_save(vcpu);

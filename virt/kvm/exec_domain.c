@@ -4574,7 +4574,9 @@ static int kvm_exec_finish_invocation(struct kvm_exec_executor *executor,
 	mutex_unlock(&domain->lock);
 
 	mutex_lock(&capsule->vcpu->mutex);
+	native->output_completion_only = true;
 	run_ret = kvm_exec_vcpu_complete_only(capsule, &runtime_cycles);
+	native->output_completion_only = false;
 	pending = kvm_arch_vcpu_exec_completion_pending(capsule->vcpu);
 	cpu = get_cpu();
 	put_cpu();
