@@ -341,8 +341,6 @@ struct kvm_exec_executor {
 	u32 flags;
 	bool pending_interrupt_handler_observed;
 	bool listed;
-	/* Private, notification-only monitor line; never execution authority. */
-	atomic64_t wait_sequence ____cacheline_aligned_in_smp;
 };
 
 struct kvm_exec_notification_runner {
@@ -710,13 +708,15 @@ static_assert(offsetof(struct kvm_exec_dispatch_header, last_entry_ns) ==
 	      KVM_EXEC_DISPATCH_LINE(4));
 static_assert(offsetof(struct kvm_exec_dispatch_header, command_tail) ==
 	      KVM_EXEC_DISPATCH_LINE(5));
-static_assert(offsetof(struct kvm_exec_dispatch_header, completion_head) ==
+static_assert(offsetof(struct kvm_exec_dispatch_header, exit_completion_tail) ==
 	      KVM_EXEC_DISPATCH_LINE(5) + 8);
 static_assert(offsetof(struct kvm_exec_dispatch_header, boundary_return_request) ==
 	      KVM_EXEC_DISPATCH_LINE(5) + 16);
-static_assert(offsetof(struct kvm_exec_dispatch_header, exit_request_head) ==
+static_assert(offsetof(struct kvm_exec_dispatch_header, dispatcher_doorbell) ==
+	      KVM_EXEC_DISPATCH_LINE(5) + 24);
+static_assert(offsetof(struct kvm_exec_dispatch_header, completion_head) ==
 	      KVM_EXEC_DISPATCH_LINE(6));
-static_assert(offsetof(struct kvm_exec_dispatch_header, exit_completion_tail) ==
+static_assert(offsetof(struct kvm_exec_dispatch_header, exit_request_head) ==
 	      KVM_EXEC_DISPATCH_LINE(6) + 8);
 
 static void kvm_exec_dispatch_init(struct kvm_exec_executor *executor)
@@ -814,9 +814,13 @@ u64 __weak kvm_arch_exec_supported_features(void)
 	return 0;
 }
 
-int __weak kvm_arch_exec_hardware_wait(atomic64_t *sequence, s64 expected)
+int __weak kvm_arch_exec_monitor(const void *line)
 {
 	return -EOPNOTSUPP;
+}
+
+void __weak kvm_arch_exec_mwait(void)
+{
 }
 
 int __weak kvm_arch_vcpu_exec_inject_interrupt(struct kvm_vcpu *vcpu,
@@ -1127,14 +1131,20 @@ static bool kvm_exec_control_valid(struct kvm_exec_domain_control *control)
 	       !memchr_inv(control->reserved, 0, sizeof(control->reserved));
 }
 
-/* Publication precedes this full-barrier store. A hardware waiter either
- * observes the publication on its readiness recheck or observes this sequence
- * change after MONITOR. Linux waiters keep their existing waitqueue wake.
+/* Publication precedes the doorbell store. A hardware waiter either observes
+ * the publication on its post-MONITOR readiness recheck or is woken by the
+ * store to its monitored wake line. Linux waiters keep their waitqueue wake.
  */
 static void kvm_exec_notify_dispatcher(struct kvm_exec_executor *executor)
 {
-	if (executor->domain->negotiated_features & KVM_EXEC_FEATURE_HARDWARE_WAIT)
-		atomic64_inc_return(&executor->wait_sequence);
+	if (executor->domain->negotiated_features & KVM_EXEC_FEATURE_HARDWARE_WAIT) {
+		struct kvm_exec_dispatch_header *header =
+			kvm_exec_dispatch_header(executor);
+
+		smp_mb();
+		WRITE_ONCE(header->dispatcher_doorbell,
+			   READ_ONCE(header->dispatcher_doorbell) + 1);
+	}
 	wake_up_interruptible(&executor->dispatch_wait);
 }
 
@@ -1770,7 +1780,6 @@ static int kvm_exec_create_executor(struct kvm_exec_domain *domain,
 	spin_lock_init(&executor->dispatch_lock);
 	spin_lock_init(&executor->interrupt_lock);
 	init_waitqueue_head(&executor->dispatch_wait);
-	atomic64_set(&executor->wait_sequence, 0);
 	atomic64_set(&executor->kick_epoch, 0);
 	atomic64_set(&executor->return_kick_epoch, 0);
 	atomic64_set(&executor->boundary_return_epoch, 0);
@@ -4632,13 +4641,17 @@ static enum hrtimer_restart kvm_exec_wait_tick(struct hrtimer *timer)
  * A one-millisecond pinned hard timer bounds the interval before returning to
  * the dispatcher for its full lifecycle/ownership recheck. It grants no entry.
  * The run_lock retains the executor; no domain/vCPU mutex is held here.
+ *
+ * MONITOR arms the header's wake line before the readiness recheck. A wake-line
+ * store that precedes the recheck is visible to it, and any later store, from
+ * a userspace publisher or kvm_exec_notify_dispatcher(), ends MWAIT.
  */
 static int kvm_exec_dispatch_hardware_wait(struct kvm_exec_executor *executor,
 					 u64 kick_epoch, bool boundary)
 {
+	struct kvm_exec_dispatch_header *header = kvm_exec_dispatch_header(executor);
 	struct kvm_exec_wait_timer wait = { .executor = executor };
 	unsigned long flags;
-	s64 sequence;
 	int ret = 0;
 
 	hrtimer_init_on_stack(&wait.timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_HARD);
@@ -4659,24 +4672,23 @@ static int kvm_exec_dispatch_hardware_wait(struct kvm_exec_executor *executor,
 			ret = -EINTR;
 			goto unlock;
 		}
-		sequence = atomic64_read(&executor->wait_sequence);
-		/* Readiness must be read after the notification epoch snapshot. */
+		ret = kvm_arch_exec_monitor(&header->command_tail);
+		if (ret)
+			goto unlock;
+		/* Readiness must be read after the monitor is armed. */
 		smp_mb();
 		if (READ_ONCE(wait.expired) ||
 		    kvm_exec_ready(executor, kick_epoch, boundary))
 			goto unlock;
-		ret = kvm_arch_exec_hardware_wait(&executor->wait_sequence, sequence);
+		/* Interrupt-break covers an IRQ, IPI or the bounded timer. */
+		if (!need_resched())
+			kvm_arch_exec_mwait();
 		local_irq_restore(flags);
 		preempt_enable();
-		if (ret < 0)
-			break;
-		ret = 0;
 	}
-	goto done;
 unlock:
 	local_irq_restore(flags);
 	preempt_enable();
-done:
 	hrtimer_cancel(&wait.timer);
 	destroy_hrtimer_on_stack(&wait.timer);
 	return ret;
@@ -4725,8 +4737,14 @@ static int kvm_exec_dispatch_sleep(struct kvm_exec_executor *executor,
 	else
 		ret = wait_event_interruptible(executor->dispatch_wait,
 					       kvm_exec_ready(executor, kick_epoch, boundary));
-	if (advertise)
+	if (advertise) {
 		WRITE_ONCE(header->dispatcher_state, 0);
+		/*
+		 * A publisher that still saw the advertisement skipped its kick;
+		 * pair with its fence so the next pass reads that publication.
+		 */
+		smp_mb();
+	}
 	return ret;
 }
 

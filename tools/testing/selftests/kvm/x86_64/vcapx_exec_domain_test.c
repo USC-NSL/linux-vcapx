@@ -171,9 +171,11 @@ static void test_dynamic_dispatch_uapi_layout(void)
 	TEST_ASSERT_EQ(offsetof(struct kvm_exec_dispatch_header, kernel_corruption_count), 192);
 	TEST_ASSERT_EQ(offsetof(struct kvm_exec_dispatch_header, last_entry_ns), 256);
 	TEST_ASSERT_EQ(offsetof(struct kvm_exec_dispatch_header, command_tail), 320);
-	TEST_ASSERT_EQ(offsetof(struct kvm_exec_dispatch_header, completion_head), 328);
-	TEST_ASSERT_EQ(offsetof(struct kvm_exec_dispatch_header, exit_request_head), 384);
-	TEST_ASSERT_EQ(offsetof(struct kvm_exec_dispatch_header, exit_completion_tail), 392);
+	TEST_ASSERT_EQ(offsetof(struct kvm_exec_dispatch_header, exit_completion_tail), 328);
+	TEST_ASSERT_EQ(offsetof(struct kvm_exec_dispatch_header, boundary_return_request), 336);
+	TEST_ASSERT_EQ(offsetof(struct kvm_exec_dispatch_header, dispatcher_doorbell), 344);
+	TEST_ASSERT_EQ(offsetof(struct kvm_exec_dispatch_header, completion_head), 384);
+	TEST_ASSERT_EQ(offsetof(struct kvm_exec_dispatch_header, exit_request_head), 392);
 	TEST_ASSERT_EQ(sizeof(struct kvm_exec_command), 96);
 	TEST_ASSERT_EQ(sizeof(struct kvm_exec_completion), 112);
 	TEST_ASSERT_EQ(sizeof(struct kvm_exec_exit_request), 128);
@@ -7756,6 +7758,107 @@ static void test_hardware_wait_idle(int kvm_fd)
 	close(executor_fd);
 }
 
+/*
+ * A hardware-waiting dispatcher monitors the header's wake line, so command
+ * publication alone wakes it without KVM_EXEC_KICK. The one-millisecond bound
+ * would also end each wait, so require wakes well inside that period.
+ */
+static int compare_u64(const void *a, const void *b)
+{
+	uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+
+	return x < y ? -1 : x > y;
+}
+
+static void test_hardware_wait_doorbell(int kvm_fd)
+{
+	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
+		KVM_EXEC_FEATURE_DYNAMIC_DISPATCH | KVM_EXEC_FEATURE_RETURN_KICK |
+		KVM_EXEC_FEATURE_HARDWARE_WAIT;
+	struct dispatch_run_arg arg = { };
+	struct dispatch_mapping mapping;
+	struct kvm_exec_completion completion;
+	struct timespec start, end;
+	uint64_t domain_generation, executor_generation, kicks, latency[21];
+	cpu_set_t allowed, mask;
+	pthread_attr_t attr;
+	pthread_t thread;
+	int domain_fd, i, round, cpu, waiter = -1, publisher = -1;
+
+	/* Like an executor, the waiter owns its CPU; the publisher runs elsewhere. */
+	TEST_ASSERT(!sched_getaffinity(0, sizeof(allowed), &allowed), "get affinity");
+	for (cpu = 0; cpu < CPU_SETSIZE && publisher < 0; cpu++) {
+		if (!CPU_ISSET(cpu, &allowed))
+			continue;
+		if (waiter < 0)
+			waiter = cpu;
+		else
+			publisher = cpu;
+	}
+	if (publisher < 0) {
+		printf("SKIP: hardware-wait doorbell requires two allowed CPUs\n");
+		return;
+	}
+	domain_fd = create_domain_with_features(kvm_fd, 1, 1, features, &domain_generation);
+	arg.executor_fd = create_executor(domain_fd, 0x8133, &executor_generation);
+	mapping = map_dispatch(arg.executor_fd);
+	arg.run = (struct kvm_exec_run_dispatch) {
+		.size = sizeof(arg.run),
+		.flags = KVM_EXEC_DISPATCH_F_HARDWARE_WAIT,
+		.domain_generation = domain_generation,
+		.executor_generation = executor_generation,
+	};
+	CPU_ZERO(&mask);
+	CPU_SET(publisher, &mask);
+	TEST_ASSERT(!sched_setaffinity(0, sizeof(mask), &mask), "pin publisher");
+	CPU_ZERO(&mask);
+	CPU_SET(waiter, &mask);
+	TEST_ASSERT(!pthread_attr_init(&attr), "pthread_attr_init");
+	TEST_ASSERT(!pthread_attr_setaffinity_np(&attr, sizeof(mask), &mask), "pin waiter");
+	TEST_ASSERT(!pthread_create(&thread, &attr, dispatch_runner, &arg), "pthread_create");
+	TEST_ASSERT(!pthread_attr_destroy(&attr), "pthread_attr_destroy");
+	kicks = __atomic_load_n(&mapping.header->kernel_kick_count, __ATOMIC_ACQUIRE);
+	for (round = 0; round < 21; round++) {
+		for (i = 0; i < 10000; i++) {
+			TEST_ASSERT(!__atomic_load_n(&arg.finished, __ATOMIC_ACQUIRE),
+				    "doorbell runner returned: ret=%d errno=%d reason=%u",
+				    arg.ret, arg.error, arg.run.return_reason);
+			if (__atomic_load_n(&mapping.header->dispatcher_state, __ATOMIC_ACQUIRE) &
+			    KVM_EXEC_DISPATCHER_F_HARDWARE_WAIT)
+				break;
+			usleep(100);
+		}
+		TEST_ASSERT(i < 10000, "hardware wait never armed");
+		TEST_ASSERT(!clock_gettime(CLOCK_MONOTONIC, &start), "clock_gettime");
+		TEST_ASSERT(publish_dispatch_command(&mapping, (struct kvm_exec_command) {
+			.opcode = KVM_EXEC_CMD_RELEASE,
+			.request_sequence = round + 1,
+			.domain_generation = domain_generation,
+			.executor_generation = executor_generation,
+		}), "doorbell command did not publish");
+		completion = consume_dispatch_completion(&mapping);
+		TEST_ASSERT(!clock_gettime(CLOCK_MONOTONIC, &end), "clock_gettime");
+		TEST_ASSERT_EQ(completion.request_sequence, round + 1);
+		latency[round] = (end.tv_sec - start.tv_sec) * NSEC_PER_SEC +
+				 end.tv_nsec - start.tv_nsec;
+	}
+	TEST_ASSERT_EQ(__atomic_load_n(&mapping.header->kernel_kick_count, __ATOMIC_ACQUIRE),
+		       kicks);
+	qsort(latency, 21, sizeof(latency[0]), compare_u64);
+	TEST_ASSERT(latency[10] < 300000,
+		    "median doorbell wake took %llu ns", (unsigned long long)latency[10]);
+	kick_dispatch_flags(arg.executor_fd, domain_generation, executor_generation,
+			    1, KVM_EXEC_KICK_F_RETURN_TO_VMM);
+	TEST_ASSERT(!pthread_join(thread, NULL), "pthread_join");
+	TEST_ASSERT(!arg.ret, "doorbell runner ret=%d errno=%d", arg.ret, arg.error);
+	TEST_ASSERT(!sched_setaffinity(0, sizeof(allowed), &allowed), "restore affinity");
+	munmap(mapping.header, KVM_EXEC_DISPATCH_MMAP_SIZE);
+	close(arg.executor_fd);
+	close(domain_fd);
+	printf("hardware-wait doorbell median wake %llu ns passed\n",
+	       (unsigned long long)latency[10]);
+}
+
 /* A resident task must still obey Linux migration and the caller's CPU contract. */
 static void test_hardware_wait_migration(int kvm_fd, bool strict)
 {
@@ -9148,6 +9251,7 @@ int main(int argc, char **argv)
 		TEST_ASSERT(capability & KVM_EXEC_FEATURE_HARDWARE_WAIT,
 			    "explicit hardware-wait test requires supported capability");
 		test_hardware_wait_idle(kvm_fd);
+		test_hardware_wait_doorbell(kvm_fd);
 		test_hardware_wait_migration(kvm_fd, false);
 		test_hardware_wait_migration(kvm_fd, true);
 		test_command_wait_halt(kvm_fd, false, false, true);

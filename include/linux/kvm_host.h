@@ -1510,8 +1510,13 @@ int kvm_arch_vcpu_exec_apply_entry(struct kvm_vcpu *vcpu,
 				  const struct kvm_exec_entry_state *state);
 int kvm_exec_vcpu_apply_entry(struct kvm_vcpu *vcpu);
 u64 kvm_arch_exec_supported_features(void);
-/* IRQs and preemption disabled; returns 1 after a hardware wait, 0 on a race. */
-int kvm_arch_exec_hardware_wait(atomic64_t *sequence, s64 expected);
+/*
+ * IRQs and preemption disabled. Arm MONITOR on @line (-EOPNOTSUPP without a
+ * supported shallow MWAIT on this CPU); the caller rechecks readiness before
+ * kvm_arch_exec_mwait(), which an interrupt ends.
+ */
+int kvm_arch_exec_monitor(const void *line);
+void kvm_arch_exec_mwait(void);
 int kvm_arch_vcpu_exec_inject_interrupt(struct kvm_vcpu *vcpu, u32 vector);
 bool kvm_arch_vcpu_exec_direct_pending(struct kvm_vcpu *vcpu, u32 vector);
 void kvm_arch_vcpu_exec_cancel_direct(struct kvm_vcpu *vcpu, u32 vector);

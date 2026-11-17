@@ -11461,24 +11461,22 @@ static bool kvm_exec_mwait_supported_this_cpu(void)
 	return supported > 0;
 }
 
-int kvm_arch_exec_hardware_wait(atomic64_t *sequence, s64 expected)
+/* The generic waiter rechecks readiness between arming and waiting. */
+int kvm_arch_exec_monitor(const void *line)
 {
 	lockdep_assert_irqs_disabled();
 	lockdep_assert_preemption_disabled();
 	if (!kvm_exec_mwait_supported_this_cpu())
 		return -EOPNOTSUPP;
-	/* The generic waiter already checked readiness after arming its epoch.
-	 * Recheck after MONITOR, so a store before arming cannot be missed.
-	 * Interrupt-break covers signals, rescheduling and the bounded timer,
-	 * including an interrupt arriving between the final check and MWAIT.
-	 */
-	__monitor(sequence, 0, 0);
-	smp_mb();
-	if (atomic64_read(sequence) != expected || need_resched() ||
-	    signal_pending(current))
-		return 0;
+	__monitor(line, 0, 0);
+	return 0;
+}
+
+/* Interrupt-break ends the wait for an IRQ even with interrupts disabled. */
+void kvm_arch_exec_mwait(void)
+{
+	lockdep_assert_irqs_disabled();
 	__mwait(0, MWAIT_ECX_INTERRUPT_BREAK);
-	return 1;
 }
 
 u64 kvm_arch_exec_supported_features(void)

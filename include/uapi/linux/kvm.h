@@ -970,7 +970,7 @@ struct kvm_ppc_resize_hpt {
 /* The requested hardware wait cannot continue on the current CPU. */
 #define KVM_EXEC_RETURN_WAIT_FAILED	14
 
-#define KVM_EXEC_DISPATCH_ABI_VERSION	3U
+#define KVM_EXEC_DISPATCH_ABI_VERSION	4U
 #define KVM_EXEC_DISPATCH_RING_ENTRIES	32U
 #define KVM_EXEC_DISPATCH_COMMAND_OFFSET	512U
 #define KVM_EXEC_DISPATCH_COMPLETION_OFFSET 4096U
@@ -1067,7 +1067,10 @@ struct kvm_ppc_resize_hpt {
 
 /* dispatcher_state: set by KVM while its dispatcher sleeps for work. */
 #define KVM_EXEC_DISPATCHER_F_SLEEPING	(1ULL << 0)
-/* Observational: set together with SLEEPING during an opted-in hardware wait. */
+/*
+ * Set together with SLEEPING during an opted-in hardware wait: the dispatcher
+ * monitors the header's wake line, so a wake-line store needs no kick.
+ */
 #define KVM_EXEC_DISPATCHER_F_HARDWARE_WAIT (1ULL << 1)
 
 #define KVM_EXEC_ENTRY_GROUP_GPRS	(1ULL << 0)
@@ -1451,18 +1454,23 @@ struct kvm_exec_run_trace {
  * acquire-load the tail before reading the entry and release-store the head
  * after consuming it.
  *
- * The header occupies eight 64-byte lines grouped by writer, so a store on
- * one side never invalidates a line the other side polls or reads on its own
- * hot path:
+ * The header occupies eight 64-byte lines grouped by writer and role, so a
+ * store on one side never invalidates a line the other side polls or reads on
+ * its own hot path:
  *
  *   line 0   layout description, written once when the executor is created
  *   line 1   tails KVM publishes and userspace polls
  *   line 2   heads KVM consumes and KVM's per-command progress record
  *   line 3   KVM counters
  *   line 4   KVM monotonic entry timestamps
- *   line 5   command tail and completion head userspace publishes
- *   line 6   exit-request head and exit-completion tail userspace publishes
+ *   line 5   wake line: every userspace cursor that can make a waiting
+ *            dispatcher ready, plus KVM's notification counter
+ *   line 6   heads userspace consumes
  *   line 7   reserved
+ *
+ * A hardware-waiting dispatcher monitors line 5, so a userspace store there
+ * wakes it without KVM_EXEC_KICK; KVM's own notifications store
+ * dispatcher_doorbell on the same line.
  *
  * Only the ring indices carry ordering semantics; every other field is a
  * diagnostic that the owner may update without a barrier.
@@ -1498,8 +1506,10 @@ struct kvm_exec_dispatch_header {
 	__u64 last_handoff_entry_sequence;
 	/*
 	 * KVM_EXEC_DISPATCHER_F_SLEEPING while the dispatcher waits for work,
-	 * with INVOCATION_END, COMMAND_WAIT or HARDWARE_WAIT negotiated; zero otherwise.  A publisher
-	 * release-stores command_tail, fences, and kicks only when it is set.
+	 * with INVOCATION_END, COMMAND_WAIT or HARDWARE_WAIT negotiated; zero
+	 * otherwise.  A publisher release-stores its wake-line cursor, fences,
+	 * and kicks only when SLEEPING is set without HARDWARE_WAIT: the store
+	 * itself wakes a hardware-waiting dispatcher.
 	 */
 	__u64 dispatcher_state;
 	/* line 3: KVM counters */
@@ -1515,15 +1525,17 @@ struct kvm_exec_dispatch_header {
 	__u64 last_entry_ns;
 	__u64 last_handoff_entry_ns;
 	__u64 reserved3[6];
-	/* line 5: userspace-published command tail and completion head */
+	/* line 5: wake line */
 	__u64 command_tail;
-	__u64 completion_head;
+	__u64 exit_completion_tail;
 	/* BOUNDARY_REQUEST: a change requests a boundary return. */
 	__u64 boundary_return_request;
-	__u64 reserved4[5];
-	/* line 6: userspace-published exit-request head and exit-completion tail */
+	/* KVM-written notification counter; its value carries no meaning. */
+	__u64 dispatcher_doorbell;
+	__u64 reserved4[4];
+	/* line 6: userspace-consumed completion and exit-request heads */
+	__u64 completion_head;
 	__u64 exit_request_head;
-	__u64 exit_completion_tail;
 	__u64 reserved5[6];
 	/* line 7 */
 	__u64 reserved6[8];
