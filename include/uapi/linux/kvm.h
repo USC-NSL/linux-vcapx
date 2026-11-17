@@ -940,12 +940,15 @@ struct kvm_ppc_resize_hpt {
 /* Ordinary HLT observations use the mapped request/ACK channel. */
 #define KVM_EXEC_FEATURE_MAPPED_HALT		(1ULL << 29)
 /*
- * A guest HLT of the current non-portable capsule completes at once, without
- * a boundary, when the dispatch header's VMM-written halt_wake_sequence moved
- * since that capsule's previous HLT (or its selection on the executor) and
- * the dispatcher has no work.
+ * A wait boundary of the current non-portable capsule completes without being
+ * reported when the dispatch header's VMM-written wait_wake_sequence moved
+ * since that capsule's previous wait boundary (or its selection on the
+ * executor) and the dispatcher has no work.  When the capsule's VM has an
+ * explicit halt-poll limit (KVM_CAP_HALT_POLL), the executor first polls the
+ * sequence for at most that long before it reports the boundary.  A guest HLT
+ * is the only wait boundary; later features may let a capsule register others.
  */
-#define KVM_EXEC_FEATURE_HALT_CONTINUE		(1ULL << 30)
+#define KVM_EXEC_FEATURE_WAIT_CONTINUE		(1ULL << 30)
 
 #define KVM_EXEC_INTERRUPT_DELIVERY_DIRECT_KICK	1U
 #define KVM_EXEC_INTERRUPT_DELIVERY_LOCAL_APIC_KICK 2U
@@ -1469,7 +1472,7 @@ struct kvm_exec_run_trace {
  *   line 1   tails KVM publishes and userspace polls
  *   line 2   heads KVM consumes and KVM's per-command progress record
  *   line 3   KVM counters
- *   line 4   KVM monotonic entry timestamps and halt continuations
+ *   line 4   KVM monotonic entry timestamps and wait continuations
  *   line 5   wake line: every userspace cursor that can make a waiting
  *            dispatcher ready, plus KVM's notification counter
  *   line 6   userspace heads and halt-wake sequence, which never wake it
@@ -1528,11 +1531,11 @@ struct kvm_exec_dispatch_header {
 	__u64 async_exit_request_count;
 	__u64 async_exit_completion_count;
 	__u64 async_exit_fallback_count;
-	/* line 4: KVM monotonic entry timestamps and halt continuations */
+	/* line 4: KVM monotonic entry timestamps and wait continuations */
 	__u64 last_entry_ns;
 	__u64 last_handoff_entry_ns;
-	/* HLTs completed at once under HALT_CONTINUE. */
-	__u64 halt_continue_count;
+	/* Wait boundaries completed without a report under WAIT_CONTINUE. */
+	__u64 wait_continue_count;
 	__u64 reserved3[5];
 	/* line 5: wake line */
 	__u64 command_tail;
@@ -1546,10 +1549,10 @@ struct kvm_exec_dispatch_header {
 	__u64 completion_head;
 	__u64 exit_request_head;
 	/*
-	 * HALT_CONTINUE: the VMM advances this when it has produced something
+	 * WAIT_CONTINUE: the VMM advances this when it has produced something
 	 * the current capsule may consume; its value carries no meaning.
 	 */
-	__u64 halt_wake_sequence;
+	__u64 wait_wake_sequence;
 	__u64 reserved5[5];
 	/* line 7 */
 	__u64 reserved6[8];
