@@ -939,6 +939,12 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_FEATURE_RESUME_HALT		(1ULL << 28)
 /* Ordinary HLT observations use the mapped request/ACK channel. */
 #define KVM_EXEC_FEATURE_MAPPED_HALT		(1ULL << 29)
+/*
+ * A guest HLT of the current non-portable capsule completes at once, without
+ * a boundary, when the dispatch header's VMM-written halt_wake_sequence moved
+ * since that capsule last entered the guest and the dispatcher has no work.
+ */
+#define KVM_EXEC_FEATURE_HALT_CONTINUE		(1ULL << 30)
 
 #define KVM_EXEC_INTERRUPT_DELIVERY_DIRECT_KICK	1U
 #define KVM_EXEC_INTERRUPT_DELIVERY_LOCAL_APIC_KICK 2U
@@ -1462,10 +1468,10 @@ struct kvm_exec_run_trace {
  *   line 1   tails KVM publishes and userspace polls
  *   line 2   heads KVM consumes and KVM's per-command progress record
  *   line 3   KVM counters
- *   line 4   KVM monotonic entry timestamps
+ *   line 4   KVM monotonic entry timestamps and halt continuations
  *   line 5   wake line: every userspace cursor that can make a waiting
  *            dispatcher ready, plus KVM's notification counter
- *   line 6   heads userspace consumes
+ *   line 6   userspace heads and halt-wake sequence, which never wake it
  *   line 7   reserved
  *
  * A hardware-waiting dispatcher monitors line 5, so a userspace store there
@@ -1521,10 +1527,12 @@ struct kvm_exec_dispatch_header {
 	__u64 async_exit_request_count;
 	__u64 async_exit_completion_count;
 	__u64 async_exit_fallback_count;
-	/* line 4: KVM monotonic entry timestamps */
+	/* line 4: KVM monotonic entry timestamps and halt continuations */
 	__u64 last_entry_ns;
 	__u64 last_handoff_entry_ns;
-	__u64 reserved3[6];
+	/* HLTs completed at once under HALT_CONTINUE. */
+	__u64 halt_continue_count;
+	__u64 reserved3[5];
 	/* line 5: wake line */
 	__u64 command_tail;
 	__u64 exit_completion_tail;
@@ -1533,10 +1541,15 @@ struct kvm_exec_dispatch_header {
 	/* KVM-written notification counter; its value carries no meaning. */
 	__u64 dispatcher_doorbell;
 	__u64 reserved4[4];
-	/* line 6: userspace-consumed completion and exit-request heads */
+	/* line 6: userspace-written, never a reason to wake the dispatcher */
 	__u64 completion_head;
 	__u64 exit_request_head;
-	__u64 reserved5[6];
+	/*
+	 * HALT_CONTINUE: the VMM advances this when it has produced something
+	 * the current capsule may consume; its value carries no meaning.
+	 */
+	__u64 halt_wake_sequence;
+	__u64 reserved5[5];
 	/* line 7 */
 	__u64 reserved6[8];
 };

@@ -33,7 +33,7 @@
 	 KVM_EXEC_FEATURE_TSC_TIMING | \
 	 KVM_EXEC_FEATURE_INTERRUPT_RESULT | KVM_EXEC_FEATURE_PORTABLE_EXITS | \
 	 KVM_EXEC_FEATURE_COMMAND_WAIT | KVM_EXEC_FEATURE_RESUME_HALT | \
-	 KVM_EXEC_FEATURE_MAPPED_HALT)
+	 KVM_EXEC_FEATURE_MAPPED_HALT | KVM_EXEC_FEATURE_HALT_CONTINUE)
 
 /*
  * An invocation-end output builds on these negotiated mechanisms.  Mapped
@@ -341,6 +341,8 @@ struct kvm_exec_executor {
 	u32 flags;
 	bool pending_interrupt_handler_observed;
 	bool listed;
+	/* HALT_CONTINUE: halt_wake_sequence when the current capsule last entered. */
+	u64 halt_wake_seen;
 };
 
 struct kvm_exec_notification_runner {
@@ -718,6 +720,10 @@ static_assert(offsetof(struct kvm_exec_dispatch_header, completion_head) ==
 	      KVM_EXEC_DISPATCH_LINE(6));
 static_assert(offsetof(struct kvm_exec_dispatch_header, exit_request_head) ==
 	      KVM_EXEC_DISPATCH_LINE(6) + 8);
+static_assert(offsetof(struct kvm_exec_dispatch_header, halt_wake_sequence) ==
+	      KVM_EXEC_DISPATCH_LINE(6) + 16);
+static_assert(offsetof(struct kvm_exec_dispatch_header, halt_continue_count) ==
+	      KVM_EXEC_DISPATCH_LINE(4) + 16);
 
 static void kvm_exec_dispatch_init(struct kvm_exec_executor *executor)
 {
@@ -4181,6 +4187,20 @@ static void kvm_exec_interrupt_clear_retained_halt(
 	spin_unlock_irqrestore(&executor->interrupt_lock, flags);
 }
 
+static bool kvm_exec_interrupt_retains_halt(struct kvm_exec_executor *executor,
+					    struct kvm_exec_capsule *capsule)
+{
+	unsigned long flags;
+	bool retain;
+
+	spin_lock_irqsave(&executor->interrupt_lock, flags);
+	retain = executor->retained_halt_capsule_id == capsule->capsule_id &&
+		executor->retained_halt_lifecycle_generation ==
+			capsule->lifecycle_generation;
+	spin_unlock_irqrestore(&executor->interrupt_lock, flags);
+	return retain;
+}
+
 static bool kvm_exec_interrupt_consume_retained_halt(
 	struct kvm_exec_executor *executor, struct kvm_exec_capsule *capsule)
 {
@@ -4197,6 +4217,32 @@ static bool kvm_exec_interrupt_consume_retained_halt(
 	}
 	spin_unlock_irqrestore(&executor->interrupt_lock, flags);
 	return retain;
+}
+
+/*
+ * HALT_CONTINUE: a guest HLT of the current capsule completes at once when the
+ * VMM advanced halt_wake_sequence since the capsule entered and nothing waits
+ * for the dispatcher. The capsule never stops being current, so this changes
+ * no ownership, records no exit and publishes no boundary. One continuation
+ * per advance: the next entry snapshots the sequence again.
+ */
+static bool kvm_exec_halt_continues(struct kvm_exec_executor *executor,
+				    struct kvm_exec_capsule *capsule,
+				    const struct kvm_exec_exit_state *exit,
+				    u64 kick_epoch)
+{
+	struct kvm_exec_dispatch_header *header = kvm_exec_dispatch_header(executor);
+
+	if (!(executor->domain->negotiated_features & KVM_EXEC_FEATURE_HALT_CONTINUE) ||
+	    capsule->portable || exit->reason != KVM_EXIT_HLT || exit->run_flags ||
+	    smp_load_acquire(&header->halt_wake_sequence) == executor->halt_wake_seen ||
+	    kvm_exec_ready(executor, kick_epoch, true) ||
+	    /* An exact interrupt publication waits for this HLT as its boundary. */
+	    kvm_exec_interrupt_retains_halt(executor, capsule))
+		return false;
+	WRITE_ONCE(header->halt_continue_count,
+		   READ_ONCE(header->halt_continue_count) + 1);
+	return true;
 }
 
 static void
@@ -4887,6 +4933,7 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 		bool interrupt_window_exit = false;
 		bool kick_pending;
 		bool retained_halt_exit = false;
+		bool halt_continued = false;
 		bool return_to_vmm;
 		bool strict_migrated;
 		u32 reported_exit_reason;
@@ -5319,6 +5366,9 @@ command_done:
 			reported_exit_reason = KVM_EXIT_INTR;
 		} else {
 			attempted_kvm_run = true;
+			if (domain->negotiated_features & KVM_EXEC_FEATURE_HALT_CONTINUE)
+				executor->halt_wake_seen =
+					smp_load_acquire(&header->halt_wake_sequence);
 			if (unlikely(run.flags & KVM_EXEC_DISPATCH_F_COMPLETION_ONLY))
 				run_ret = kvm_exec_vcpu_complete_only(capsule, &runtime_cycles);
 			else
@@ -5384,7 +5434,12 @@ command_done:
 		    capsule->portable->native_completion.attempted &&
 		    capsule->portable->native_completion.result >= 0)
 			capsule->portable->resolved_sequence = capsule->exit.sequence;
-		if (valid_exit && !interrupt_window_exit) {
+		halt_continued = valid_exit && !interrupt_window_exit &&
+			!strict_migrated &&
+			!(run.flags & KVM_EXEC_DISPATCH_F_COMPLETION_ONLY) &&
+			kvm_exec_halt_continues(executor, capsule, &observed_exit,
+						kick_epoch);
+		if (valid_exit && !interrupt_window_exit && !halt_continued) {
 			kvm_exec_account_exit(executor, capsule,
 					      observed_exit.reason);
 			kvm_exec_record_exit_locked(capsule, &observed_exit);
@@ -5447,6 +5502,7 @@ command_done:
 		 */
 		if (!completion_pending && !strict_migrated &&
 		    !retained_halt_exit && !interrupt_window_exit &&
+		    !halt_continued &&
 		    !async_published && !end_output && run_ret != -EINTR &&
 		    (run_ret || run.vcpu_exit_reason != KVM_EXIT_DEBUG ||
 		     capsule->portable || capsule->exit.run_flags)) {
@@ -5470,7 +5526,7 @@ command_done:
 			run.return_reason = KVM_EXEC_RETURN_CPU_MIGRATED;
 			break;
 		}
-		if (retained_halt_exit)
+		if (retained_halt_exit || halt_continued)
 			continue;
 		if (interrupt_window_exit)
 			continue;
@@ -7840,7 +7896,8 @@ int kvm_dev_ioctl_create_exec_domain(void __user *argp)
 	    ((create.requested_features & KVM_EXEC_FEATURE_REGISTERED_ENTRY_FPU) &&
 	     !(create.requested_features & KVM_EXEC_FEATURE_ENTRY_STATE_X86)) ||
 	    ((create.requested_features & (KVM_EXEC_FEATURE_COMMAND_WAIT |
-				  KVM_EXEC_FEATURE_HARDWARE_WAIT)) &&
+				  KVM_EXEC_FEATURE_HARDWARE_WAIT |
+				  KVM_EXEC_FEATURE_HALT_CONTINUE)) &&
 	     !(create.requested_features & KVM_EXEC_FEATURE_DYNAMIC_DISPATCH)) ||
 	    ((create.requested_features & KVM_EXEC_FEATURE_MAPPED_HALT) &&
 	     ((create.requested_features & (KVM_EXEC_FEATURE_ASYNC_PIO_WRITE |

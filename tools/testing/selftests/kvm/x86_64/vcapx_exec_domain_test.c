@@ -176,6 +176,8 @@ static void test_dynamic_dispatch_uapi_layout(void)
 	TEST_ASSERT_EQ(offsetof(struct kvm_exec_dispatch_header, dispatcher_doorbell), 344);
 	TEST_ASSERT_EQ(offsetof(struct kvm_exec_dispatch_header, completion_head), 384);
 	TEST_ASSERT_EQ(offsetof(struct kvm_exec_dispatch_header, exit_request_head), 392);
+	TEST_ASSERT_EQ(offsetof(struct kvm_exec_dispatch_header, halt_wake_sequence), 400);
+	TEST_ASSERT_EQ(offsetof(struct kvm_exec_dispatch_header, halt_continue_count), 272);
 	TEST_ASSERT_EQ(sizeof(struct kvm_exec_command), 96);
 	TEST_ASSERT_EQ(sizeof(struct kvm_exec_completion), 112);
 	TEST_ASSERT_EQ(sizeof(struct kvm_exec_exit_request), 128);
@@ -2174,6 +2176,20 @@ static void guest_halt_wake_handler(struct ex_regs *regs)
 {
 	WRITE_ONCE(halt_wake_interrupts,
 		   READ_ONCE(halt_wake_interrupts) + 1);
+}
+
+static uint64_t halt_continue_progress;
+static uint64_t halt_continue_release;
+
+/* Count each pass, wait for the host's release, then halt. */
+static void guest_halt_on_release(void)
+{
+	for (;;) {
+		WRITE_ONCE(halt_continue_progress, READ_ONCE(halt_continue_progress) + 1);
+		while (READ_ONCE(halt_continue_release) < READ_ONCE(halt_continue_progress))
+			asm volatile("pause");
+		asm volatile("hlt" ::: "memory");
+	}
 }
 
 static void guest_halt_then_spin(void)
@@ -7759,6 +7775,47 @@ static void test_hardware_wait_idle(int kvm_fd)
 }
 
 /*
+ * Like an executor, a dispatch runner owns its CPU while the test thread
+ * publishes from another: isolated CPUs are not load-balanced. Pins the
+ * calling thread to the second allowed CPU and records the first in
+ * arg->return_cpu for start_pinned_runner(); false with fewer than two.
+ */
+static bool split_runner_cpu(cpu_set_t *allowed, struct dispatch_run_arg *arg)
+{
+	cpu_set_t mask;
+	int cpu, runner = -1;
+
+	TEST_ASSERT(!sched_getaffinity(0, sizeof(*allowed), allowed), "get affinity");
+	for (cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+		if (!CPU_ISSET(cpu, allowed))
+			continue;
+		if (runner < 0) {
+			runner = cpu;
+			continue;
+		}
+		CPU_ZERO(&mask);
+		CPU_SET(cpu, &mask);
+		TEST_ASSERT(!sched_setaffinity(0, sizeof(mask), &mask), "pin publisher");
+		arg->return_cpu = runner;
+		return true;
+	}
+	return false;
+}
+
+static void start_pinned_runner(pthread_t *thread, struct dispatch_run_arg *arg)
+{
+	pthread_attr_t attr;
+	cpu_set_t mask;
+
+	CPU_ZERO(&mask);
+	CPU_SET(arg->return_cpu, &mask);
+	TEST_ASSERT(!pthread_attr_init(&attr), "pthread_attr_init");
+	TEST_ASSERT(!pthread_attr_setaffinity_np(&attr, sizeof(mask), &mask), "pin runner");
+	TEST_ASSERT(!pthread_create(thread, &attr, dispatch_runner, arg), "pthread_create");
+	TEST_ASSERT(!pthread_attr_destroy(&attr), "pthread_attr_destroy");
+}
+
+/*
  * A hardware-waiting dispatcher monitors the header's wake line, so command
  * publication alone wakes it without KVM_EXEC_KICK. The one-millisecond bound
  * would also end each wait, so require wakes well inside that period.
@@ -7780,22 +7837,11 @@ static void test_hardware_wait_doorbell(int kvm_fd)
 	struct kvm_exec_completion completion;
 	struct timespec start, end;
 	uint64_t domain_generation, executor_generation, kicks, latency[21];
-	cpu_set_t allowed, mask;
-	pthread_attr_t attr;
+	cpu_set_t allowed;
 	pthread_t thread;
-	int domain_fd, i, round, cpu, waiter = -1, publisher = -1;
+	int domain_fd, i, round;
 
-	/* Like an executor, the waiter owns its CPU; the publisher runs elsewhere. */
-	TEST_ASSERT(!sched_getaffinity(0, sizeof(allowed), &allowed), "get affinity");
-	for (cpu = 0; cpu < CPU_SETSIZE && publisher < 0; cpu++) {
-		if (!CPU_ISSET(cpu, &allowed))
-			continue;
-		if (waiter < 0)
-			waiter = cpu;
-		else
-			publisher = cpu;
-	}
-	if (publisher < 0) {
+	if (!split_runner_cpu(&allowed, &arg)) {
 		printf("SKIP: hardware-wait doorbell requires two allowed CPUs\n");
 		return;
 	}
@@ -7808,15 +7854,7 @@ static void test_hardware_wait_doorbell(int kvm_fd)
 		.domain_generation = domain_generation,
 		.executor_generation = executor_generation,
 	};
-	CPU_ZERO(&mask);
-	CPU_SET(publisher, &mask);
-	TEST_ASSERT(!sched_setaffinity(0, sizeof(mask), &mask), "pin publisher");
-	CPU_ZERO(&mask);
-	CPU_SET(waiter, &mask);
-	TEST_ASSERT(!pthread_attr_init(&attr), "pthread_attr_init");
-	TEST_ASSERT(!pthread_attr_setaffinity_np(&attr, sizeof(mask), &mask), "pin waiter");
-	TEST_ASSERT(!pthread_create(&thread, &attr, dispatch_runner, &arg), "pthread_create");
-	TEST_ASSERT(!pthread_attr_destroy(&attr), "pthread_attr_destroy");
+	start_pinned_runner(&thread, &arg);
 	kicks = __atomic_load_n(&mapping.header->kernel_kick_count, __ATOMIC_ACQUIRE);
 	for (round = 0; round < 21; round++) {
 		for (i = 0; i < 10000; i++) {
@@ -7857,6 +7895,94 @@ static void test_hardware_wait_doorbell(int kvm_fd)
 	close(domain_fd);
 	printf("hardware-wait doorbell median wake %llu ns passed\n",
 	       (unsigned long long)latency[10]);
+}
+
+/*
+ * HALT_CONTINUE: an HLT completes at once when the VMM advanced the sequence
+ * after the capsule entered, at most once per advance; otherwise, or when the
+ * feature is not negotiated, the HLT is an ordinary boundary.
+ */
+static void test_halt_continue(int kvm_fd, bool negotiated)
+{
+	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
+		KVM_EXEC_FEATURE_DYNAMIC_DISPATCH | KVM_EXEC_FEATURE_SYNC_EXITS |
+		KVM_EXEC_FEATURE_RETURN_KICK | KVM_EXEC_FEATURE_LIFECYCLE_STATE |
+		(negotiated ? KVM_EXEC_FEATURE_HALT_CONTINUE : 0);
+	struct kvm_exec_command command = {
+		.opcode = KVM_EXEC_CMD_SWITCH,
+		.request_sequence = 1,
+		.target_capsule_id = 82,
+		.target_lifecycle_generation = 7,
+	};
+	struct dispatch_run_arg arg = { };
+	struct dispatch_mapping mapping;
+	uint64_t *progress, *release;
+	uint64_t domain_generation, executor_generation;
+	struct kvm_vcpu *vcpu;
+	struct kvm_vm *vm;
+	cpu_set_t allowed;
+	pthread_t thread;
+	int domain_fd, i;
+
+	if (!split_runner_cpu(&allowed, &arg)) {
+		printf("SKIP: halt continuation requires two allowed CPUs\n");
+		return;
+	}
+	vm = __vm_create_without_irqchip(VM_SHAPE_DEFAULT, 1, 0);
+	vcpu = vm_vcpu_add(vm, 0, guest_halt_on_release);
+	disable_nested_cpuid(vcpu);
+	progress = addr_gva2hva(vm, (vm_vaddr_t)&halt_continue_progress);
+	release = addr_gva2hva(vm, (vm_vaddr_t)&halt_continue_release);
+	domain_fd = create_domain_with_features(kvm_fd, 1, 1, features, &domain_generation);
+	attach_vcpu(domain_fd, vcpu->fd, 82, 7);
+	arg.executor_fd = create_executor(domain_fd, 0x8134, &executor_generation);
+	mapping = map_dispatch(arg.executor_fd);
+	/* An advance before entry is already seen and continues nothing. */
+	__atomic_fetch_add(&mapping.header->halt_wake_sequence, 1, __ATOMIC_RELEASE);
+	command.domain_generation = domain_generation;
+	command.executor_generation = executor_generation;
+	TEST_ASSERT(publish_dispatch_command(&mapping, command), "switch publish");
+	arg.run = (struct kvm_exec_run_dispatch) {
+		.size = sizeof(arg.run),
+		.domain_generation = domain_generation,
+		.executor_generation = executor_generation,
+	};
+	start_pinned_runner(&thread, &arg);
+	wait_for_trace_progress(progress, 0);
+
+	/* Advance while the guest runs, then let it halt. */
+	__atomic_fetch_add(&mapping.header->halt_wake_sequence, 1, __ATOMIC_RELEASE);
+	WRITE_ONCE(*release, 1);
+	if (negotiated) {
+		wait_for_trace_progress(progress, 1);
+		TEST_ASSERT_EQ(READ_ONCE(*progress), 2);
+		TEST_ASSERT_EQ(__atomic_load_n(&mapping.header->halt_continue_count,
+					       __ATOMIC_ACQUIRE), 1);
+		TEST_ASSERT(!__atomic_load_n(&arg.finished, __ATOMIC_ACQUIRE),
+			    "continued HLT returned to the VMM");
+		/* Without another advance the next HLT is an ordinary boundary. */
+		WRITE_ONCE(*release, 2);
+	}
+	for (i = 0; i < 100000 && !__atomic_load_n(&arg.finished, __ATOMIC_ACQUIRE); i++)
+		usleep(100);
+	TEST_ASSERT(i < 100000, "HLT never returned to the VMM");
+	TEST_ASSERT(!pthread_join(thread, NULL), "pthread_join");
+	TEST_ASSERT(!arg.ret, "halt continuation run ret=%d errno=%d", arg.ret, arg.error);
+	TEST_ASSERT_EQ(arg.run.return_reason, KVM_EXEC_RETURN_VCPU_EXIT);
+	TEST_ASSERT_EQ(arg.run.vcpu_exit_reason, KVM_EXIT_HLT);
+	TEST_ASSERT_EQ(READ_ONCE(*progress), negotiated ? 2 : 1);
+	TEST_ASSERT_EQ(mapping.header->halt_continue_count, negotiated ? 1 : 0);
+	TEST_ASSERT_EQ(consume_dispatch_completion(&mapping).status, KVM_EXEC_COMPLETE_APPLIED);
+	TEST_ASSERT(!sched_setaffinity(0, sizeof(allowed), &allowed), "restore affinity");
+
+	control_domain(domain_fd, KVM_EXEC_PAUSE);
+	control_domain(domain_fd, KVM_EXEC_DRAIN);
+	detach_vcpu(domain_fd, 82, 7);
+	munmap(mapping.header, KVM_EXEC_DISPATCH_MMAP_SIZE);
+	close(arg.executor_fd);
+	close(domain_fd);
+	kvm_vm_free(vm);
+	printf("halt continuation negotiated=%d passed\n", negotiated);
 }
 
 /* A resident task must still obey Linux migration and the caller's CPU contract. */
@@ -9260,6 +9386,12 @@ int main(int argc, char **argv)
 		close(kvm_fd);
 		return 0;
 	}
+	if (argc == 2 && !strcmp(argv[1], "--halt-continue-only")) {
+		test_halt_continue(kvm_fd, true);
+		test_halt_continue(kvm_fd, false);
+		close(kvm_fd);
+		return 0;
+	}
 	if (argc == 2 && !strcmp(argv[1], "--dynamic-kick-cancel-only")) {
 		test_dynamic_return_kick(kvm_fd);
 		test_dynamic_kick_and_cancel(kvm_fd, false);
@@ -9430,6 +9562,8 @@ int main(int argc, char **argv)
 	test_mapped_halt_gate(kvm_fd);
 	test_command_wait_halt(kvm_fd, false, false, false);
 	test_command_wait_halt(kvm_fd, false, true, false);
+	test_halt_continue(kvm_fd, true);
+	test_halt_continue(kvm_fd, false);
 	test_command_wait_lifecycle(kvm_fd);
 	test_output_gate_resumes_after_nonmatching_output(kvm_fd, true, false);
 	test_halt_wake_dispatch_stress(kvm_fd);
