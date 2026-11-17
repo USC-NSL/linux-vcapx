@@ -942,7 +942,8 @@ struct kvm_ppc_resize_hpt {
 /*
  * A guest HLT of the current non-portable capsule completes at once, without
  * a boundary, when the dispatch header's VMM-written halt_wake_sequence moved
- * since that capsule last entered the guest and the dispatcher has no work.
+ * since that capsule's previous HLT (or its selection on the executor) and
+ * the dispatcher has no work.
  */
 #define KVM_EXEC_FEATURE_HALT_CONTINUE		(1ULL << 30)
 

@@ -341,7 +341,10 @@ struct kvm_exec_executor {
 	u32 flags;
 	bool pending_interrupt_handler_observed;
 	bool listed;
-	/* HALT_CONTINUE: halt_wake_sequence when the current capsule last entered. */
+	/*
+	 * HALT_CONTINUE: halt_wake_sequence at the current capsule's previous HLT
+	 * or selection. Read and written under the domain lock.
+	 */
 	u64 halt_wake_seen;
 };
 
@@ -635,7 +638,13 @@ static void kvm_exec_portable_release(struct kvm_exec_capsule *capsule)
 static void kvm_exec_set_current_capsule(struct kvm_exec_executor *executor,
 					 struct kvm_exec_capsule *capsule)
 {
+	struct kvm_exec_dispatch_header *header = executor->dispatch_region;
+
 	lockdep_assert_held(&executor->domain->lock);
+	/* HALT_CONTINUE counts advances from a new capsule's selection. */
+	if ((executor->domain->negotiated_features & KVM_EXEC_FEATURE_HALT_CONTINUE) &&
+	    capsule != rcu_access_pointer(executor->current_capsule))
+		executor->halt_wake_seen = smp_load_acquire(&header->halt_wake_sequence);
 	rcu_assign_pointer(executor->current_capsule, capsule);
 }
 
@@ -4221,10 +4230,12 @@ static bool kvm_exec_interrupt_consume_retained_halt(
 
 /*
  * HALT_CONTINUE: a guest HLT of the current capsule completes at once when the
- * VMM advanced halt_wake_sequence since the capsule entered and nothing waits
- * for the dispatcher. The capsule never stops being current, so this changes
- * no ownership, records no exit and publishes no boundary. One continuation
- * per advance: the next entry snapshots the sequence again.
+ * VMM advanced halt_wake_sequence since that capsule's previous HLT (or its
+ * selection on this executor) and nothing waits for the dispatcher. Work the
+ * VMM produced while the capsule was halted therefore keeps it resident at its
+ * next HLT too. The capsule never stops being current, so this changes no
+ * ownership, records no exit and publishes no boundary. Each HLT consumes the
+ * advances before it: one continuation per advance.
  */
 static bool kvm_exec_halt_continues(struct kvm_exec_executor *executor,
 				    struct kvm_exec_capsule *capsule,
@@ -4232,11 +4243,16 @@ static bool kvm_exec_halt_continues(struct kvm_exec_executor *executor,
 				    u64 kick_epoch)
 {
 	struct kvm_exec_dispatch_header *header = kvm_exec_dispatch_header(executor);
+	u64 sequence;
+	bool advanced;
 
 	if (!(executor->domain->negotiated_features & KVM_EXEC_FEATURE_HALT_CONTINUE) ||
-	    capsule->portable || exit->reason != KVM_EXIT_HLT || exit->run_flags ||
-	    smp_load_acquire(&header->halt_wake_sequence) == executor->halt_wake_seen ||
-	    kvm_exec_ready(executor, kick_epoch, true) ||
+	    capsule->portable || exit->reason != KVM_EXIT_HLT || exit->run_flags)
+		return false;
+	sequence = smp_load_acquire(&header->halt_wake_sequence);
+	advanced = sequence != executor->halt_wake_seen;
+	executor->halt_wake_seen = sequence;
+	if (!advanced || kvm_exec_ready(executor, kick_epoch, true) ||
 	    /* An exact interrupt publication waits for this HLT as its boundary. */
 	    kvm_exec_interrupt_retains_halt(executor, capsule))
 		return false;
@@ -5366,9 +5382,6 @@ command_done:
 			reported_exit_reason = KVM_EXIT_INTR;
 		} else {
 			attempted_kvm_run = true;
-			if (domain->negotiated_features & KVM_EXEC_FEATURE_HALT_CONTINUE)
-				executor->halt_wake_seen =
-					smp_load_acquire(&header->halt_wake_sequence);
 			if (unlikely(run.flags & KVM_EXEC_DISPATCH_F_COMPLETION_ONLY))
 				run_ret = kvm_exec_vcpu_complete_only(capsule, &runtime_cycles);
 			else

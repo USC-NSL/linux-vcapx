@@ -7899,14 +7899,30 @@ static void test_hardware_wait_doorbell(int kvm_fd)
 
 /*
  * HALT_CONTINUE: an HLT completes at once when the VMM advanced the sequence
- * after the capsule entered, at most once per advance; otherwise, or when the
- * feature is not negotiated, the HLT is an ordinary boundary.
+ * since the capsule's previous HLT or selection, at most once per advance; an
+ * advance while the capsule waits at a boundary continues its next HLT after
+ * an exact resume. Otherwise, or without negotiation, HLT is a boundary.
  */
+/* Join a runner that must return to the VMM at an ordinary HLT boundary. */
+static void wait_for_halt_boundary(pthread_t *thread, struct dispatch_run_arg *arg)
+{
+	int i;
+
+	for (i = 0; i < 100000 && !__atomic_load_n(&arg->finished, __ATOMIC_ACQUIRE); i++)
+		usleep(100);
+	TEST_ASSERT(i < 100000, "HLT never returned to the VMM");
+	TEST_ASSERT(!pthread_join(*thread, NULL), "pthread_join");
+	TEST_ASSERT(!arg->ret, "halt continuation run ret=%d errno=%d", arg->ret, arg->error);
+	TEST_ASSERT_EQ(arg->run.return_reason, KVM_EXEC_RETURN_VCPU_EXIT);
+	TEST_ASSERT_EQ(arg->run.vcpu_exit_reason, KVM_EXIT_HLT);
+}
+
 static void test_halt_continue(int kvm_fd, bool negotiated)
 {
 	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
 		KVM_EXEC_FEATURE_DYNAMIC_DISPATCH | KVM_EXEC_FEATURE_SYNC_EXITS |
 		KVM_EXEC_FEATURE_RETURN_KICK | KVM_EXEC_FEATURE_LIFECYCLE_STATE |
+		KVM_EXEC_FEATURE_RESUME_HALT |
 		(negotiated ? KVM_EXEC_FEATURE_HALT_CONTINUE : 0);
 	struct kvm_exec_command command = {
 		.opcode = KVM_EXEC_CMD_SWITCH,
@@ -7922,7 +7938,7 @@ static void test_halt_continue(int kvm_fd, bool negotiated)
 	struct kvm_vm *vm;
 	cpu_set_t allowed;
 	pthread_t thread;
-	int domain_fd, i;
+	int domain_fd;
 
 	if (!split_runner_cpu(&allowed, &arg)) {
 		printf("SKIP: halt continuation requires two allowed CPUs\n");
@@ -7937,7 +7953,7 @@ static void test_halt_continue(int kvm_fd, bool negotiated)
 	attach_vcpu(domain_fd, vcpu->fd, 82, 7);
 	arg.executor_fd = create_executor(domain_fd, 0x8134, &executor_generation);
 	mapping = map_dispatch(arg.executor_fd);
-	/* An advance before entry is already seen and continues nothing. */
+	/* An advance before selection is already seen and continues nothing. */
 	__atomic_fetch_add(&mapping.header->halt_wake_sequence, 1, __ATOMIC_RELEASE);
 	command.domain_generation = domain_generation;
 	command.executor_generation = executor_generation;
@@ -7963,16 +7979,39 @@ static void test_halt_continue(int kvm_fd, bool negotiated)
 		/* Without another advance the next HLT is an ordinary boundary. */
 		WRITE_ONCE(*release, 2);
 	}
-	for (i = 0; i < 100000 && !__atomic_load_n(&arg.finished, __ATOMIC_ACQUIRE); i++)
-		usleep(100);
-	TEST_ASSERT(i < 100000, "HLT never returned to the VMM");
-	TEST_ASSERT(!pthread_join(thread, NULL), "pthread_join");
-	TEST_ASSERT(!arg.ret, "halt continuation run ret=%d errno=%d", arg.ret, arg.error);
-	TEST_ASSERT_EQ(arg.run.return_reason, KVM_EXEC_RETURN_VCPU_EXIT);
-	TEST_ASSERT_EQ(arg.run.vcpu_exit_reason, KVM_EXIT_HLT);
+	wait_for_halt_boundary(&thread, &arg);
 	TEST_ASSERT_EQ(READ_ONCE(*progress), negotiated ? 2 : 1);
 	TEST_ASSERT_EQ(mapping.header->halt_continue_count, negotiated ? 1 : 0);
 	TEST_ASSERT_EQ(consume_dispatch_completion(&mapping).status, KVM_EXEC_COMPLETE_APPLIED);
+
+	if (negotiated) {
+		/* Work produced while halted continues the next HLT after resume. */
+		__atomic_fetch_add(&mapping.header->halt_wake_sequence, 1, __ATOMIC_RELEASE);
+		command.request_sequence = 2;
+		command.flags = KVM_EXEC_CMD_F_RESUME_HALT;
+		command.reserved = arg.run.exit_sequence;
+		command.expected_current_id = 82;
+		command.expected_current_generation = 7;
+		TEST_ASSERT(publish_dispatch_command(&mapping, command), "resume publish");
+		arg.run = (struct kvm_exec_run_dispatch) {
+			.size = sizeof(arg.run),
+			.domain_generation = domain_generation,
+			.executor_generation = executor_generation,
+		};
+		arg.finished = false;
+		start_pinned_runner(&thread, &arg);
+		wait_for_trace_progress(progress, 2);
+		WRITE_ONCE(*release, 3);
+		wait_for_trace_progress(progress, 3);
+		TEST_ASSERT_EQ(READ_ONCE(*progress), 4);
+		TEST_ASSERT_EQ(__atomic_load_n(&mapping.header->halt_continue_count,
+					       __ATOMIC_ACQUIRE), 2);
+		WRITE_ONCE(*release, 4);
+		wait_for_halt_boundary(&thread, &arg);
+		TEST_ASSERT_EQ(mapping.header->halt_continue_count, 2);
+		TEST_ASSERT_EQ(consume_dispatch_completion(&mapping).status,
+			       KVM_EXEC_COMPLETE_APPLIED);
+	}
 	TEST_ASSERT(!sched_setaffinity(0, sizeof(allowed), &allowed), "restore affinity");
 
 	control_domain(domain_fd, KVM_EXEC_PAUSE);
