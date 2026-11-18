@@ -4242,8 +4242,7 @@ static bool kvm_exec_wait_boundary(struct kvm_exec_executor *executor,
 {
 	return (executor->domain->negotiated_features &
 		KVM_EXEC_FEATURE_WAIT_CONTINUE) &&
-	       !capsule->portable && exit->reason == KVM_EXIT_HLT &&
-	       !exit->run_flags;
+	       exit->reason == KVM_EXIT_HLT && !exit->run_flags;
 }
 
 /*

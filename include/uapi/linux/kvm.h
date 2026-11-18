@@ -940,10 +940,10 @@ struct kvm_ppc_resize_hpt {
 /* Ordinary HLT observations use the mapped request/ACK channel. */
 #define KVM_EXEC_FEATURE_MAPPED_HALT		(1ULL << 29)
 /*
- * A wait boundary of the current non-portable capsule completes without being
- * reported when the dispatch header's VMM-written wait_wake_sequence moved
- * since that capsule's previous wait boundary (or its selection on the
- * executor) and the dispatcher has no work.  When the capsule's VM has an
+ * A wait boundary of the current capsule completes without being reported
+ * when the dispatch header's VMM-written wait_wake_sequence moved since that
+ * capsule's previous wait boundary (or its selection on the executor) and the
+ * dispatcher has no work.  When the capsule's VM has an
  * explicit halt-poll limit (KVM_CAP_HALT_POLL), the executor first polls the
  * sequence for at most that long before it reports the boundary.  A guest HLT
  * is the only wait boundary; later features may let a capsule register others.
