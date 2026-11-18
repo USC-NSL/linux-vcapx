@@ -4964,6 +4964,9 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 		if (ret)
 			goto out_domain;
 		kvm_exec_portable_accept(capsule);
+		/* Like a selection, the accepted resume ends the VMM-exit block. */
+		atomic_cmpxchg(&capsule->block_reason, KVM_EXEC_BLOCK_VMM_EXIT,
+			       KVM_EXEC_BLOCK_NONE);
 	}
 	atomic_inc(&domain->active_runs);
 	active = true;
