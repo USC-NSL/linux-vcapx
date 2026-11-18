@@ -4762,8 +4762,41 @@ static enum hrtimer_restart kvm_exec_wait_tick(struct hrtimer *timer)
  * store that precedes the recheck is visible to it, and any later store, from
  * a userspace publisher or kvm_exec_notify_dispatcher(), ends MWAIT.
  */
+/*
+ * An armed output gate is the command that lets its source run to the gated
+ * output.  A portable source that stops at some other exit first resumes once
+ * its service owner has published that exit's response: the gate's executor
+ * accepts the response itself, as it consumes an executor-bound source's exit
+ * completion.  This is the wait condition; the dispatcher validates and
+ * accepts under the domain lock.  A capsule is freed only with its domain.
+ */
+static bool kvm_exec_gated_response_published(struct kvm_exec_executor *executor,
+					      struct kvm_exec_capsule *capsule)
+{
+	struct kvm_exec_capsule_response *shared;
+
+	if (!capsule || !capsule->portable ||
+	    !READ_ONCE(executor->gated_command_waiting) ||
+	    !READ_ONCE(capsule->portable->service_pending) ||
+	    kvm_exec_entry_pending(capsule))
+		return false;
+	shared = (void *)(capsule->portable->control + 1);
+	/* Pairs with the service owner's release publication. */
+	return smp_load_acquire(&shared->sequence) ==
+	       READ_ONCE(capsule->exit.sequence);
+}
+
+static bool kvm_exec_sleep_ready(struct kvm_exec_executor *executor,
+				 u64 kick_epoch, bool boundary,
+				 struct kvm_exec_capsule *capsule)
+{
+	return kvm_exec_ready(executor, kick_epoch, boundary) ||
+	       kvm_exec_gated_response_published(executor, capsule);
+}
+
 static int kvm_exec_dispatch_hardware_wait(struct kvm_exec_executor *executor,
-					 u64 kick_epoch, bool boundary)
+					 u64 kick_epoch, bool boundary,
+					 struct kvm_exec_capsule *capsule)
 {
 	struct kvm_exec_dispatch_header *header = kvm_exec_dispatch_header(executor);
 	struct kvm_exec_wait_timer wait = { .executor = executor };
@@ -4794,7 +4827,7 @@ static int kvm_exec_dispatch_hardware_wait(struct kvm_exec_executor *executor,
 		/* Readiness must be read after the monitor is armed. */
 		smp_mb();
 		if (READ_ONCE(wait.expired) ||
-		    kvm_exec_ready(executor, kick_epoch, boundary))
+		    kvm_exec_sleep_ready(executor, kick_epoch, boundary, capsule))
 			goto unlock;
 		/* Interrupt-break covers an IRQ, IPI or the bounded timer. */
 		if (!need_resched())
@@ -4849,10 +4882,12 @@ static int kvm_exec_dispatch_sleep(struct kvm_exec_executor *executor,
 		smp_mb();
 	}
 	if (hardware_wait)
-		ret = kvm_exec_dispatch_hardware_wait(executor, kick_epoch, boundary);
+		ret = kvm_exec_dispatch_hardware_wait(executor, kick_epoch, boundary,
+						      capsule);
 	else
 		ret = wait_event_interruptible(executor->dispatch_wait,
-					       kvm_exec_ready(executor, kick_epoch, boundary));
+					       kvm_exec_sleep_ready(executor, kick_epoch,
+								    boundary, capsule));
 	if (advertise) {
 		WRITE_ONCE(header->dispatcher_state, 0);
 		/*
@@ -5256,6 +5291,32 @@ command_done:
 				break;
 			}
 			continue;
+		}
+		/*
+		 * An armed gate lets its source run to the gated output.  A
+		 * portable source that stopped at some other exit continues once
+		 * its service owner has published that exit's response; the
+		 * executor-bound form of this rule follows the halt check.
+		 */
+		if (READ_ONCE(executor->gated_command_waiting) &&
+		    capsule->owner == executor && capsule->portable &&
+		    capsule->portable->service_pending &&
+		    !kvm_exec_entry_pending(capsule)) {
+			int accept_ret = kvm_exec_portable_preflight(capsule);
+
+			if (!accept_ret) {
+				kvm_exec_portable_accept(capsule);
+				/* As a selection does, end the VMM-exit block. */
+				atomic_cmpxchg(&capsule->block_reason,
+					       KVM_EXEC_BLOCK_VMM_EXIT,
+					       KVM_EXEC_BLOCK_NONE);
+			} else if (accept_ret != -EAGAIN) {
+				mutex_unlock(&domain->lock);
+				run.return_reason =
+					KVM_EXEC_RETURN_INVALID_COMPLETION;
+				run.run_result = accept_ret;
+				break;
+			}
 		}
 		if ((domain->negotiated_features &
 		     KVM_EXEC_FEATURE_LIFECYCLE_STATE) &&

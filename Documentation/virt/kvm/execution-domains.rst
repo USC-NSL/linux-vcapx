@@ -110,8 +110,12 @@ width and value.  The command must name an exact current capsule.  KVM leaves
 the command at the head of the ring and continues that capsule until its fully
 snapshotted, single non-string output PIO matches all three fields.  A
 nonmatching output follows the normal exit path and does not consume the
-command.  Cancellation remains ordered against the normal ownership apply
-point.
+command.  Once that exit is answered, the gate's executor continues the same
+capsule toward the gated output: the answer is the exit completion on an
+executor-bound domain and the capsule's published response on a
+``PORTABLE_EXITS`` domain, whose service owner follows the publication with
+``KVM_EXEC_KICK_F_COMPLETION_AVAILABLE``.  Cancellation remains ordered against
+the normal ownership apply point.
 
 Mapped transport
 ================
