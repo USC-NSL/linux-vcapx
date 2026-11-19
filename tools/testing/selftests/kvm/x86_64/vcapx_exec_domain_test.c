@@ -2700,6 +2700,23 @@ static void guest_sync_pio(void)
 	asm volatile("hlt");
 }
 
+static void guest_sync_pio_then_exact_interrupt(void)
+{
+	uint32_t value;
+
+	asm volatile("inl %w1, %0"
+		     : "=a" (value)
+		     : "d" (SYNC_EXIT_PIO_PORT));
+	WRITE_ONCE(sync_exit_pio_value, value);
+	WRITE_ONCE(sync_exit_pio_progress, 1);
+	asm volatile("sti" ::: "memory");
+	while (!READ_ONCE(exact_interrupt_count))
+		asm volatile("pause");
+	WRITE_ONCE(sync_exit_pio_progress, 2);
+	for (;;)
+		asm volatile("pause");
+}
+
 static void guest_sync_mmio(void)
 {
 	uint64_t value = READ_ONCE(*(uint64_t *)TRACE_MMIO_GPA);
@@ -3188,6 +3205,116 @@ static void test_sync_exit_kick_preserves_completion(int kvm_fd)
 	munmap(mapping.header, KVM_EXEC_DISPATCH_MMAP_SIZE);
 	close(executor_fd);
 	detach_vcpu(domain_fd, 65, 38);
+	close(domain_fd);
+	kvm_vm_free(vm);
+}
+
+/*
+ * A capsule that resumes from a synchronous read keeps that exit marked
+ * pending until its next exit.  A compute-bound guest takes none, so an exact
+ * interrupt has to be accepted while it runs: nothing else creates a boundary.
+ */
+static void test_exact_interrupt_after_sync_completion(int kvm_fd)
+{
+	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
+				  KVM_EXEC_FEATURE_DYNAMIC_DISPATCH |
+				  KVM_EXEC_FEATURE_SYNC_EXITS |
+				  KVM_EXEC_FEATURE_EXACT_INTERRUPT |
+				  KVM_EXEC_FEATURE_INTERRUPT_PUBLICATION;
+	struct kvm_exec_command command = {
+		.opcode = KVM_EXEC_CMD_SWITCH,
+		.request_sequence = 1,
+		.target_capsule_id = 66,
+		.target_lifecycle_generation = 39,
+	};
+	struct kvm_exec_interrupt interrupt = {
+		.size = sizeof(interrupt),
+		.request_sequence = 100,
+		.capsule_id = 66,
+		.lifecycle_generation = 39,
+		.vector = HALT_WAKE_VECTOR,
+		.flags = KVM_EXEC_INTERRUPT_F_RETAIN_HLT,
+	};
+	struct kvm_exec_run_dispatch run;
+	struct kvm_exec_completion completion;
+	struct dispatch_mapping mapping;
+	struct dispatch_run_arg run_arg;
+	struct kvm_vcpu *vcpu;
+	struct kvm_vm *vm;
+	uint64_t *pio_value, *pio_progress, *interrupts;
+	uint64_t domain_generation, executor_generation;
+	uint32_t response = 0x5ac391e7;
+	pthread_t thread;
+	int domain_fd, executor_fd;
+	int ret;
+
+	vm = __vm_create_without_irqchip(VM_SHAPE_DEFAULT, 1, 0);
+	vcpu = vm_vcpu_add(vm, 0, guest_sync_pio_then_exact_interrupt);
+	vm_init_descriptor_tables(vm);
+	vcpu_init_descriptor_tables(vcpu);
+	vm_install_exception_handler(vm, HALT_WAKE_VECTOR,
+				     guest_exact_interrupt_handler);
+	disable_nested_cpuid(vcpu);
+	pio_value = addr_gva2hva(vm, (vm_vaddr_t)&sync_exit_pio_value);
+	pio_progress = addr_gva2hva(vm,
+				    (vm_vaddr_t)&sync_exit_pio_progress);
+	interrupts = addr_gva2hva(vm, (vm_vaddr_t)&exact_interrupt_count);
+	WRITE_ONCE(*pio_progress, 0);
+	WRITE_ONCE(*interrupts, 0);
+	domain_fd = create_domain_with_features(kvm_fd, 1, 1, features,
+						&domain_generation);
+	attach_vcpu(domain_fd, vcpu->fd, 66, 39);
+	executor_fd = create_executor(domain_fd, 0x80b, &executor_generation);
+	mapping = map_dispatch(executor_fd);
+	command.domain_generation = domain_generation;
+	command.executor_generation = executor_generation;
+	TEST_ASSERT(publish_dispatch_command(&mapping, command),
+		    "synchronous-read selection did not publish");
+	run = run_dispatch_once(executor_fd, domain_generation,
+				executor_generation);
+	completion = consume_dispatch_completion(&mapping);
+	TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_APPLIED);
+	TEST_ASSERT_EQ(run.return_reason, KVM_EXEC_RETURN_VCPU_EXIT);
+	TEST_ASSERT_EQ(run.vcpu_exit_reason, KVM_EXIT_IO);
+	TEST_ASSERT_EQ(run.exit_flags, KVM_EXEC_EXIT_F_COMPLETION_PENDING);
+
+	memcpy((uint8_t *)vcpu->run + vcpu->run->io.data_offset,
+	       &response, sizeof(response));
+	run_arg = (struct dispatch_run_arg) {
+		.executor_fd = executor_fd,
+		.run = {
+			.size = sizeof(run_arg.run),
+			.domain_generation = domain_generation,
+			.executor_generation = executor_generation,
+		},
+	};
+	__atomic_store_n(&run_arg.finished, false, __ATOMIC_RELEASE);
+	TEST_ASSERT(!pthread_create(&thread, NULL, dispatch_runner, &run_arg),
+		    "pthread_create failed");
+	wait_for_trace_progress(pio_progress, 0);
+	TEST_ASSERT_EQ(READ_ONCE(*pio_value), response);
+
+	interrupt.domain_generation = domain_generation;
+	interrupt.executor_generation = executor_generation;
+	ret = ioctl(executor_fd, KVM_EXEC_INTERRUPT, &interrupt);
+	TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_EXEC_INTERRUPT, ret));
+	wait_for_trace_progress(interrupts, 0);
+	wait_for_trace_progress(pio_progress, 1);
+	TEST_ASSERT(!__atomic_load_n(&run_arg.finished, __ATOMIC_ACQUIRE),
+		    "interrupt after a synchronous read returned the executor");
+	control_domain(domain_fd, KVM_EXEC_PAUSE);
+	pthread_join(thread, NULL);
+	TEST_ASSERT(!run_arg.ret,
+		    "synchronous-read runner failed, ret %d errno %d",
+		    run_arg.ret, run_arg.error);
+	TEST_ASSERT_EQ(run_arg.run.return_reason, KVM_EXEC_RETURN_DOMAIN_PAUSED);
+	TEST_ASSERT_EQ(READ_ONCE(*interrupts), 1);
+	TEST_ASSERT_EQ(READ_ONCE(*pio_progress), 2);
+
+	control_domain(domain_fd, KVM_EXEC_DRAIN);
+	munmap(mapping.header, KVM_EXEC_DISPATCH_MMAP_SIZE);
+	close(executor_fd);
+	detach_vcpu(domain_fd, 66, 39);
 	close(domain_fd);
 	kvm_vm_free(vm);
 }
@@ -9585,6 +9712,7 @@ int main(int argc, char **argv)
 	if (argc == 2 && !strcmp(argv[1], "--sync-exits-only")) {
 		test_dynamic_synchronous_exits(kvm_fd);
 		test_sync_exit_kick_preserves_completion(kvm_fd);
+		test_exact_interrupt_after_sync_completion(kvm_fd);
 		test_sync_domain_close_pending(kvm_fd, false);
 		test_sync_domain_close_pending(kvm_fd, true);
 		close(kvm_fd);
@@ -9685,6 +9813,7 @@ int main(int argc, char **argv)
 	test_dynamic_ring_backpressure_and_corruption(kvm_fd);
 	test_dynamic_synchronous_exits(kvm_fd);
 	test_sync_exit_kick_preserves_completion(kvm_fd);
+	test_exact_interrupt_after_sync_completion(kvm_fd);
 	test_async_pio_write_switch(kvm_fd);
 	test_async_pio_handoff_before_completion(kvm_fd);
 	test_output_gate_holds_across_dispatcher_iterations(kvm_fd);

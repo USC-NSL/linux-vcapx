@@ -3357,6 +3357,18 @@ kvm_exec_async_completion_inflight(struct kvm_exec_executor *executor,
 		       !capsule->portable->service_pending && !capsule->portable->blocked;
 
 	/*
+	 * A synchronous response is applied by the KVM_RUN its capsule has
+	 * entered, and the exit stays marked pending until the capsule's next
+	 * exit is recorded.  The caller has established that the capsule is
+	 * running, so that run retires the instruction before it delivers
+	 * anything.
+	 */
+	if (capsule->exit.completion_pending &&
+	    !capsule->exit.async_completion_ready &&
+	    !capsule->exit.async_reentry_required)
+		return true;
+
+	/*
 	 * Once a saved response has authorized entry, KVM_RUN first retires the
 	 * completed PIO instruction and then resumes guest execution.  Keep the
 	 * exit marked pending until the architecture confirms that retirement,
@@ -5500,6 +5512,14 @@ command_done:
 			reported_exit_reason = KVM_EXIT_INTR;
 		} else {
 			attempted_kvm_run = true;
+			/*
+			 * A capsule that enters is no longer stopped at a VMM
+			 * exit, whichever rule admitted it: a source continued
+			 * behind an armed gate is admitted by no selection.
+			 */
+			atomic_cmpxchg(&capsule->block_reason,
+				       KVM_EXEC_BLOCK_VMM_EXIT,
+				       KVM_EXEC_BLOCK_NONE);
 			if (unlikely(run.flags & KVM_EXEC_DISPATCH_F_COMPLETION_ONLY))
 				run_ret = kvm_exec_vcpu_complete_only(capsule, &runtime_cycles);
 			else
