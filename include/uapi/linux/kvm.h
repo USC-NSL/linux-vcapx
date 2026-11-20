@@ -902,7 +902,12 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_FEATURE_PORTABLE_EXITS		(1ULL << 18)
 #define KVM_EXEC_FEATURE_ENTRY_STATE_X86		(1ULL << 19)
 #define KVM_EXEC_FEATURE_INSPECTION_X86		(1ULL << 20)
-/* A capsule may register the exact output PIO that ends its invocation. */
+/*
+ * A capsule may register exact output PIOs that KVM consumes itself.  The
+ * capsule then waits at that output, owing nothing, until an exact command
+ * selects it or moves its executor.  Requires DYNAMIC_DISPATCH and
+ * PORTABLE_EXITS.
+ */
 #define KVM_EXEC_FEATURE_CONSUMED_OUTPUT		(1ULL << 21)
 /*
  * User space may wake a capsule's end waiter; requires CONSUMED_OUTPUT.  Such
@@ -975,7 +980,7 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_RETURN_DISPATCH_CORRUPT	10
 #define KVM_EXEC_RETURN_INVALID_COMPLETION 11
 #define KVM_EXEC_RETURN_INTERRUPT_FAILED 12
-/* The current capsule's invocation ended and no command selected work. */
+/* The current capsule waits at a consumed output and no command selected work. */
 #define KVM_EXEC_RETURN_CONSUMED_OUTPUT	13
 /* The requested hardware wait cannot continue on the current CPU. */
 #define KVM_EXEC_RETURN_WAIT_FAILED	14
@@ -1004,7 +1009,7 @@ struct kvm_ppc_resize_hpt {
 /* Wait in hardware while remaining schedulable; requires HARDWARE_WAIT. */
 #define KVM_EXEC_DISPATCH_F_HARDWARE_WAIT (1U << 4)
 #define KVM_EXEC_COMPLETE_F_ASYNC_PIO_HANDOFF (1U << 0)
-/* Applied at its expected-current capsule's invocation end. */
+/* Applied while its expected-current capsule waited at a consumed output. */
 #define KVM_EXEC_COMPLETE_F_AT_CONSUMED_OUTPUT (1U << 1)
 
 #define KVM_EXEC_NOTIFICATION_ABI_VERSION	1U
@@ -1045,17 +1050,25 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_CMD_F_SET_ENTRY		(1U << 2)
 #define KVM_EXEC_CMD_F_CONTINUE_ENTRY	(1U << 3)
 /*
- * The expected-current capsule's open invocation ends here without its end
- * output.  Valid only when the expected-current capsule has an invocation-end
- * output registered; the command then applies without waiting for that output.
+ * The expected-current capsule's open entry scope closes here without a
+ * consumed output.  Valid only when the expected-current capsule has an output
+ * registered; the command then applies without waiting for that output.
  */
 #define KVM_EXEC_CMD_F_SKIP_CONSUMED_OUTPUT	(1U << 4)
+/*
+ * The command applies when its expected-current capsule consumes the output
+ * that gate_port, gate_width and gate_value name, after the capsule boundary
+ * epoch in reserved.  Published after the capsule already waits at such an
+ * output, it applies at once.  The output must be registered for that capsule
+ * without ENTRY_SCOPED.  Mutually exclusive with every other command flag.
+ */
+#define KVM_EXEC_CMD_F_AT_CONSUMED_OUTPUT	(1U << 6)
 /* RESUME_HALT: reserved names the target's exact HLT exit sequence.
  * No interrupt is injected. Mutually exclusive with every other command flag.
  */
 #define KVM_EXEC_CMD_F_RESUME_HALT	(1U << 5)
 
-#define KVM_EXEC_PORTABLE_ABI_VERSION	2U
+#define KVM_EXEC_PORTABLE_ABI_VERSION	3U
 #define KVM_EXEC_CAPSULE_CONTROL_SIZE	128U
 #define KVM_EXEC_CAPSULE_ENTRY_CONTROL_SIZE 256U
 #define KVM_EXEC_ENTRY_STATE_SIZE	640U
@@ -1071,8 +1084,18 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_CAPSULE_CONSUMED_STATUS_OFFSET	256U
 #define KVM_EXEC_CAPSULE_CONSUMED_WAITER_OFFSET	320U
 
+#define KVM_EXEC_CONSUMED_OUTPUTS_MAX	8U
 #define KVM_EXEC_CONSUMED_OUTPUT_ENABLE	(1U << 0)
 #define KVM_EXEC_CONSUMED_OUTPUT_DISABLE	(1U << 1)
+/*
+ * With ENABLE: the capsule consumes its outputs only inside an entry scope,
+ * which a SET_ENTRY command opens and the next consumed output closes, and
+ * every command naming the capsule waits for that output while the scope is
+ * open.  Requires ENTRY_STATE_X86.  Without it an output is consumed whenever
+ * the capsule executes it and only AT_CONSUMED_OUTPUT commands wait for it.
+ * All registrations of one capsule carry the same choice.
+ */
+#define KVM_EXEC_CONSUMED_OUTPUT_ENTRY_SCOPED	(1U << 2)
 #define KVM_EXEC_CONSUMED_STATUS_F_REGISTERED (1U << 0)
 
 /* dispatcher_state: set by KVM while its dispatcher sleeps for work. */
@@ -1215,7 +1238,7 @@ struct kvm_exec_entry_observation {
 
 /*
  * KVM is the only writer.  Registration writes the output and flags; each
- * invocation end writes exit_sequence and then release-stores consumed_sequence
+ * consumed output writes exit_sequence and then release-stores consumed_sequence
  * after the capsule's run page holds the complete end view.  A reader
  * acquire-loads consumed_sequence and checks lifecycle_generation first.  With
  * KVM_EXEC_FEATURE_CONSUMED_OUTPUT_WAKE, each KVM_EXEC_WAKE_CONSUMED_OUTPUT_WAITER
@@ -1697,13 +1720,13 @@ struct kvm_exec_kick {
 #define KVM_EXEC_KICK_F_RETURN_TO_VMM	(1U << 0)
 #define KVM_EXEC_KICK_F_COMPLETION_AVAILABLE (1U << 1)
 /*
- * With invocation-end output: return at the dispatcher's next pass boundary
+ * With consumed outputs: return at the dispatcher's next pass boundary
  * (the running guest's next exit or end, or a sleep) without interrupting a
  * running guest or a selected entry.
  */
 #define KVM_EXEC_KICK_F_RETURN_AT_BOUNDARY (1U << 2)
 /*
- * With invocation-end output: wake a dispatcher sleeping for work after
+ * With consumed outputs: wake a dispatcher sleeping for work after
  * publishing a command, without stopping a running guest or a selected entry.
  */
 #define KVM_EXEC_KICK_F_WAKE_SLEEPING (1U << 3)
