@@ -3964,6 +3964,207 @@ static void test_output_gate_holds_across_dispatcher_iterations(int kvm_fd)
 	kvm_vm_free(donor_vm);
 }
 
+#define HALT_RACE_ROUNDS 20000
+
+static uint64_t halt_race_spin;
+
+/* Halt after a varying spin so exact interrupts land on both sides of HLT. */
+static void guest_halt_race(void)
+{
+	uint64_t round, spin;
+
+	asm volatile("sti" ::: "memory");
+	for (round = 0;; round++) {
+		for (spin = round % READ_ONCE(halt_race_spin); spin; spin--)
+			asm volatile("pause");
+		asm volatile("hlt" ::: "memory");
+	}
+}
+
+struct exact_interrupt_flood {
+	int executor_fd;
+	struct kvm_exec_interrupt interrupt;
+	bool stop;
+	uint64_t accepted;
+};
+
+static void *flood_exact_interrupts(void *data)
+{
+	struct exact_interrupt_flood *flood = data;
+	struct kvm_exec_interrupt interrupt = flood->interrupt;
+
+	while (!__atomic_load_n(&flood->stop, __ATOMIC_ACQUIRE)) {
+		if (!ioctl(flood->executor_fd, KVM_EXEC_INTERRUPT, &interrupt)) {
+			flood->accepted++;
+			interrupt.request_sequence++;
+			continue;
+		}
+		/* Not running, or the previous request is still outstanding. */
+		TEST_ASSERT(errno == EAGAIN || errno == EBUSY,
+			    "exact interrupt failed, errno %d", errno);
+		sched_yield();
+	}
+	return NULL;
+}
+
+struct capsule_query_watch {
+	int domain_fd;
+	struct kvm_exec_query_capsule query;
+	bool stop;
+	uint64_t queries;
+	uint64_t running;
+	uint64_t running_blocked;
+};
+
+static void *watch_capsule_queries(void *data)
+{
+	struct capsule_query_watch *watch = data;
+	struct kvm_exec_query_capsule query;
+
+	while (!__atomic_load_n(&watch->stop, __ATOMIC_ACQUIRE)) {
+		query = watch->query;
+		TEST_ASSERT(!ioctl(watch->domain_fd, KVM_EXEC_QUERY_CAPSULE, &query),
+			    "capsule query failed, errno %d", errno);
+		watch->queries++;
+		if (query.state != KVM_EXEC_CAPSULE_STATE_RUNNING)
+			continue;
+		watch->running++;
+		if (query.block_reason != KVM_EXEC_BLOCK_NONE)
+			watch->running_blocked++;
+	}
+	return NULL;
+}
+
+/*
+ * An exact interrupt accepted while the guest runs can find it halted before
+ * the kick: the dispatcher returns the HLT with the interrupt pending, and the
+ * next dispatch re-enters the HLT-blocked capsule for it.  KVM marks it
+ * running before it takes the vCPU mutex and ends the HLT block only when it
+ * injects the interrupt after that.  A concurrent query must never see a
+ * running capsule reported as blocked.
+ */
+static void test_entering_capsule_reports_no_block(int kvm_fd)
+{
+	const uint64_t features = KVM_EXEC_FEATURE_BASE_OBJECTS |
+				  KVM_EXEC_FEATURE_DYNAMIC_DISPATCH |
+				  KVM_EXEC_FEATURE_SYNC_EXITS |
+				  KVM_EXEC_FEATURE_RETURN_KICK |
+				  KVM_EXEC_FEATURE_LIFECYCLE_STATE |
+				  KVM_EXEC_FEATURE_EXACT_INTERRUPT |
+				  KVM_EXEC_FEATURE_INTERRUPT_PUBLICATION;
+	struct kvm_exec_command command = {
+		.opcode = KVM_EXEC_CMD_SWITCH,
+		.target_capsule_id = 93,
+		.target_lifecycle_generation = 7,
+	};
+	struct exact_interrupt_flood flood = {
+		.interrupt = {
+			.size = sizeof(flood.interrupt),
+			.request_sequence = 1000,
+			.capsule_id = 93,
+			.lifecycle_generation = 7,
+			.vector = HALT_WAKE_VECTOR,
+		},
+	};
+	struct capsule_query_watch watch = {
+		.query = {
+			.size = sizeof(watch.query),
+			.capsule_id = 93,
+			.lifecycle_generation = 7,
+		},
+	};
+	struct kvm_exec_query_executor executor;
+	struct kvm_interrupt irq = { .irq = HALT_WAKE_VECTOR };
+	struct dispatch_mapping mapping;
+	struct kvm_exec_completion completion;
+	struct kvm_exec_run_dispatch run;
+	struct kvm_vcpu *vcpu;
+	struct kvm_vm *vm;
+	uint64_t domain_generation, executor_generation, sequence = 0;
+	uint64_t round, pending_reentries = 0;
+	pthread_t flooder, watcher;
+	int domain_fd, executor_fd, ret;
+
+	vm = __vm_create_without_irqchip(VM_SHAPE_DEFAULT, 1, 0);
+	vcpu = vm_vcpu_add(vm, 0, guest_halt_race);
+	disable_nested_cpuid(vcpu);
+	vm_init_descriptor_tables(vm);
+	vcpu_init_descriptor_tables(vcpu);
+	vm_install_exception_handler(vm, HALT_WAKE_VECTOR,
+				     guest_exact_interrupt_handler);
+	WRITE_ONCE(*(uint64_t *)addr_gva2hva(vm, (vm_vaddr_t)&halt_race_spin), 2000);
+
+	domain_fd = create_domain_with_features(kvm_fd, 1, 1, features,
+						&domain_generation);
+	attach_vcpu(domain_fd, vcpu->fd, 93, 7);
+	executor_fd = create_executor(domain_fd, 0x937, &executor_generation);
+	mapping = map_dispatch(executor_fd);
+	command.domain_generation = domain_generation;
+	command.executor_generation = executor_generation;
+	flood.executor_fd = executor_fd;
+	flood.interrupt.domain_generation = domain_generation;
+	flood.interrupt.executor_generation = executor_generation;
+	watch.domain_fd = domain_fd;
+	watch.query.domain_generation = domain_generation;
+	TEST_ASSERT(!pthread_create(&flooder, NULL, flood_exact_interrupts, &flood),
+		    "pthread_create failed");
+	TEST_ASSERT(!pthread_create(&watcher, NULL, watch_capsule_queries, &watch),
+		    "pthread_create failed");
+	command.request_sequence = ++sequence;
+	TEST_ASSERT(publish_dispatch_command(&mapping, command),
+		    "HLT-race selection did not publish");
+	for (round = 0; round < HALT_RACE_ROUNDS; round++) {
+		run = run_dispatch_once(executor_fd, domain_generation,
+					executor_generation);
+		TEST_ASSERT(run.return_reason == KVM_EXEC_RETURN_VCPU_EXIT &&
+			    run.vcpu_exit_reason == KVM_EXIT_HLT,
+			    "round %lu returned %u exit %u", round,
+			    run.return_reason, run.vcpu_exit_reason);
+		while (mapping.header->completion_tail != mapping.header->completion_head) {
+			completion = consume_dispatch_completion(&mapping);
+			TEST_ASSERT_EQ(completion.status, KVM_EXEC_COMPLETE_APPLIED);
+		}
+		executor = (struct kvm_exec_query_executor) {
+			.size = sizeof(executor),
+			.domain_generation = domain_generation,
+			.executor_generation = executor_generation,
+		};
+		ret = ioctl(executor_fd, KVM_EXEC_QUERY_EXECUTOR, &executor);
+		TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_EXEC_QUERY_EXECUTOR, ret));
+		/* A pending exact interrupt re-enters the halted capsule itself. */
+		if (executor.pending_interrupt_sequence) {
+			pending_reentries++;
+			continue;
+		}
+		ret = ioctl(vcpu->fd, KVM_INTERRUPT, &irq);
+		TEST_ASSERT(!ret, KVM_IOCTL_ERROR(KVM_INTERRUPT, ret));
+		command.expected_current_id = 93;
+		command.expected_current_generation = 7;
+		command.request_sequence = ++sequence;
+		TEST_ASSERT(publish_dispatch_command(&mapping, command),
+			    "HLT-race wake command did not publish");
+	}
+	__atomic_store_n(&flood.stop, true, __ATOMIC_RELEASE);
+	__atomic_store_n(&watch.stop, true, __ATOMIC_RELEASE);
+	pthread_join(flooder, NULL);
+	pthread_join(watcher, NULL);
+	pr_info("HLT race rounds %u: %lu exact interrupts, %lu pending re-entries, %lu queries, %lu running, %lu running and blocked\n",
+		HALT_RACE_ROUNDS, flood.accepted, pending_reentries, watch.queries,
+		watch.running, watch.running_blocked);
+	TEST_ASSERT(pending_reentries, "no HLT returned with an exact interrupt pending");
+	TEST_ASSERT(!watch.running_blocked,
+		    "%lu queries reported a running capsule as blocked",
+		    watch.running_blocked);
+
+	control_domain(domain_fd, KVM_EXEC_PAUSE);
+	control_domain(domain_fd, KVM_EXEC_DRAIN);
+	munmap(mapping.header, KVM_EXEC_DISPATCH_MMAP_SIZE);
+	close(executor_fd);
+	detach_vcpu(domain_fd, 93, 7);
+	close(domain_fd);
+	kvm_vm_free(vm);
+}
+
 static void test_output_gate_resumes_after_nonmatching_output(int kvm_fd, bool command_wait,
 						      bool hardware_wait)
 {
@@ -9725,6 +9926,11 @@ int main(int argc, char **argv)
 		close(kvm_fd);
 		return 0;
 	}
+	if (argc == 2 && !strcmp(argv[1], "--running-capsule-query-only")) {
+		test_entering_capsule_reports_no_block(kvm_fd);
+		close(kvm_fd);
+		return 0;
+	}
 	if (argc == 2 && !strcmp(argv[1], "--output-gate-reentry-only")) {
 		test_output_gate_resumes_after_nonmatching_output(kvm_fd, false, false);
 		close(kvm_fd);
@@ -9818,6 +10024,7 @@ int main(int argc, char **argv)
 	test_async_pio_handoff_before_completion(kvm_fd);
 	test_output_gate_holds_across_dispatcher_iterations(kvm_fd);
 	test_output_gate_resumes_after_nonmatching_output(kvm_fd, false, false);
+	test_entering_capsule_reports_no_block(kvm_fd);
 	test_output_gated_handoff_with_completion_backlog(kvm_fd);
 	test_async_pio_handoff_fallback(kvm_fd, KVM_EXEC_CMD_SWITCH);
 	test_async_pio_handoff_fallback(kvm_fd, KVM_EXEC_CMD_RELEASE);

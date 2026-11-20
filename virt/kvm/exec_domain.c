@@ -1657,7 +1657,13 @@ static long kvm_exec_query_capsule(struct kvm_exec_domain *domain,
 		query.state = KVM_EXEC_CAPSULE_STATE_BLOCKED_HLT;
 	else if (block_reason == KVM_EXEC_BLOCK_VMM_EXIT)
 		query.state = KVM_EXEC_CAPSULE_STATE_BLOCKED_VMM;
-	query.block_reason = block_reason;
+	/*
+	 * The dispatcher marks a capsule running before it takes the vCPU mutex
+	 * to enter it, and entry ends an HLT block only when it injects the
+	 * pending interrupt after that.  A running capsule is not blocked.
+	 */
+	query.block_reason = query.state == KVM_EXEC_CAPSULE_STATE_RUNNING ?
+			     KVM_EXEC_BLOCK_NONE : block_reason;
 	query.owner_executor_generation = capsule->owner ?
 		capsule->owner->generation : 0;
 	query.owner_cookie = capsule->owner ? capsule->owner->cookie : 0;
