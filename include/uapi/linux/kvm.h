@@ -903,23 +903,23 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_FEATURE_ENTRY_STATE_X86		(1ULL << 19)
 #define KVM_EXEC_FEATURE_INSPECTION_X86		(1ULL << 20)
 /* A capsule may register the exact output PIO that ends its invocation. */
-#define KVM_EXEC_FEATURE_INVOCATION_END		(1ULL << 21)
+#define KVM_EXEC_FEATURE_CONSUMED_OUTPUT		(1ULL << 21)
 /*
- * User space may wake a capsule's end waiter; requires INVOCATION_END.  Such
+ * User space may wake a capsule's end waiter; requires CONSUMED_OUTPUT.  Such
  * kernels also keep an ended capsule's boundary epoch until it runs again.
  */
-#define KVM_EXEC_FEATURE_INVOCATION_WAKE	(1ULL << 22)
+#define KVM_EXEC_FEATURE_CONSUMED_OUTPUT_WAKE	(1ULL << 22)
 /*
- * Requires INVOCATION_WAKE.  A capsule's end waiter may sleep on a futex word
+ * Requires CONSUMED_OUTPUT_WAKE.  A capsule's end waiter may sleep on a futex word
  * in its waiter record: KVM increments the word and wakes the registered user
  * address (a process-private futex) at each end, and when a selection of the
  * capsule completes rejected, stale, busy or blocked (not cancelled before
  * apply, nor a current mismatch, which follow a withdrawal), naming that
  * selection in the end record.
  */
-#define KVM_EXEC_FEATURE_INVOCATION_FUTEX	(1ULL << 23)
+#define KVM_EXEC_FEATURE_CONSUMED_OUTPUT_FUTEX	(1ULL << 23)
 /*
- * Requires INVOCATION_END.  The dispatch header's boundary_return_request is a
+ * Requires CONSUMED_OUTPUT.  The dispatch header's boundary_return_request is a
  * user-written counter: a change requests the boundary return that
  * KVM_EXEC_KICK_F_RETURN_AT_BOUNDARY requests, without a syscall unless the
  * dispatcher advertises sleep.
@@ -976,7 +976,7 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_RETURN_INVALID_COMPLETION 11
 #define KVM_EXEC_RETURN_INTERRUPT_FAILED 12
 /* The current capsule's invocation ended and no command selected work. */
-#define KVM_EXEC_RETURN_INVOCATION_END	13
+#define KVM_EXEC_RETURN_CONSUMED_OUTPUT	13
 /* The requested hardware wait cannot continue on the current CPU. */
 #define KVM_EXEC_RETURN_WAIT_FAILED	14
 
@@ -1005,7 +1005,7 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_DISPATCH_F_HARDWARE_WAIT (1U << 4)
 #define KVM_EXEC_COMPLETE_F_ASYNC_PIO_HANDOFF (1U << 0)
 /* Applied at its expected-current capsule's invocation end. */
-#define KVM_EXEC_COMPLETE_F_AT_INVOCATION_END (1U << 1)
+#define KVM_EXEC_COMPLETE_F_AT_CONSUMED_OUTPUT (1U << 1)
 
 #define KVM_EXEC_NOTIFICATION_ABI_VERSION	1U
 #define KVM_EXEC_NOTIFICATION_RING_ENTRIES	32U
@@ -1049,7 +1049,7 @@ struct kvm_ppc_resize_hpt {
  * output.  Valid only when the expected-current capsule has an invocation-end
  * output registered; the command then applies without waiting for that output.
  */
-#define KVM_EXEC_CMD_F_END_INVOCATION	(1U << 4)
+#define KVM_EXEC_CMD_F_SKIP_CONSUMED_OUTPUT	(1U << 4)
 /* RESUME_HALT: reserved names the target's exact HLT exit sequence.
  * No interrupt is injected. Mutually exclusive with every other command flag.
  */
@@ -1063,17 +1063,17 @@ struct kvm_ppc_resize_hpt {
 #define KVM_EXEC_ENTRY_STATE_REGION_SIZE	20480U
 #define KVM_EXEC_ENTRY_STATE_MMAP_SIZE	40960U
 /*
- * KVM_EXEC_FEATURE_INVOCATION_END control records add two 64-byte lines to
+ * KVM_EXEC_FEATURE_CONSUMED_OUTPUT control records add two 64-byte lines to
  * the entry-state record: the KVM-written end status and the waiter word that
  * only the capsule's single end waiter writes.
  */
-#define KVM_EXEC_CAPSULE_END_CONTROL_SIZE	384U
-#define KVM_EXEC_CAPSULE_END_STATUS_OFFSET	256U
-#define KVM_EXEC_CAPSULE_END_WAITER_OFFSET	320U
+#define KVM_EXEC_CAPSULE_CONSUMED_CONTROL_SIZE	384U
+#define KVM_EXEC_CAPSULE_CONSUMED_STATUS_OFFSET	256U
+#define KVM_EXEC_CAPSULE_CONSUMED_WAITER_OFFSET	320U
 
-#define KVM_EXEC_INVOCATION_END_ENABLE	(1U << 0)
-#define KVM_EXEC_INVOCATION_END_DISABLE	(1U << 1)
-#define KVM_EXEC_END_STATUS_F_REGISTERED (1U << 0)
+#define KVM_EXEC_CONSUMED_OUTPUT_ENABLE	(1U << 0)
+#define KVM_EXEC_CONSUMED_OUTPUT_DISABLE	(1U << 1)
+#define KVM_EXEC_CONSUMED_STATUS_F_REGISTERED (1U << 0)
 
 /* dispatcher_state: set by KVM while its dispatcher sleeps for work. */
 #define KVM_EXEC_DISPATCHER_F_SLEEPING	(1ULL << 0)
@@ -1215,15 +1215,15 @@ struct kvm_exec_entry_observation {
 
 /*
  * KVM is the only writer.  Registration writes the output and flags; each
- * invocation end writes exit_sequence and then release-stores end_sequence
+ * invocation end writes exit_sequence and then release-stores consumed_sequence
  * after the capsule's run page holds the complete end view.  A reader
- * acquire-loads end_sequence and checks lifecycle_generation first.  With
- * KVM_EXEC_FEATURE_INVOCATION_WAKE, each KVM_EXEC_WAKE_INVOCATION_WAITER
+ * acquire-loads consumed_sequence and checks lifecycle_generation first.  With
+ * KVM_EXEC_FEATURE_CONSUMED_OUTPUT_WAKE, each KVM_EXEC_WAKE_CONSUMED_OUTPUT_WAITER
  * release-stores an incremented wake_sequence.
  */
-struct kvm_exec_invocation_end_status {
+struct kvm_exec_consumed_output_status {
 	__u64 lifecycle_generation;
-	__u64 end_sequence;
+	__u64 consumed_sequence;
 	__u64 exit_sequence;
 	__u16 port;
 	__u8 width;
@@ -1231,7 +1231,7 @@ struct kvm_exec_invocation_end_status {
 	__u32 value;
 	__u64 wake_sequence;
 	/*
-	 * INVOCATION_FUTEX: the last selection of this capsule that completed
+	 * CONSUMED_OUTPUT_FUTEX: the last selection of this capsule that completed
 	 * without applying (rejected, stale, busy or blocked), by request
 	 * sequence and executor generation, and its completion status.
 	 * failed_selection is release-stored after the other two.
@@ -1244,16 +1244,16 @@ struct kvm_exec_invocation_end_status {
 
 /*
  * Written only by the capsule's single end waiter: nonzero while it may sleep
- * in KVM_EXEC_WAIT_INVOCATION_END.  KVM wakes at an end only for a waiter.
+ * in KVM_EXEC_WAIT_CONSUMED_OUTPUT.  KVM wakes at an end only for a waiter.
  */
-struct kvm_exec_invocation_end_waiter {
+struct kvm_exec_consumed_output_waiter {
 	__u64 waiting;
 	/*
-	 * INVOCATION_FUTEX: KVM increments wake_word at each end and failed
+	 * CONSUMED_OUTPUT_FUTEX: KVM increments wake_word at each end and failed
 	 * selection, then wakes wake_address, the user address of wake_word in
 	 * the caller's mapping (zero: no futex wake).  Other user threads may
 	 * increment and wake it too.  The waiter reads the word before checking
-	 * end_sequence and sleeps only while it is unchanged.
+	 * consumed_sequence and sleeps only while it is unchanged.
 	 */
 	__u32 wake_word;
 	__u32 reserved0;
@@ -1261,8 +1261,8 @@ struct kvm_exec_invocation_end_waiter {
 	__u64 reserved[5];
 };
 
-/* KVM_EXEC_SET_INVOCATION_END on the domain fd: a cold capsule only. */
-struct kvm_exec_invocation_end {
+/* KVM_EXEC_SET_CONSUMED_OUTPUT on the domain fd: a cold capsule only. */
+struct kvm_exec_consumed_output {
 	__u64 capsule_id;
 	__u64 lifecycle_generation;
 	__u16 port;
@@ -1272,16 +1272,16 @@ struct kvm_exec_invocation_end {
 	__u64 reserved[2];
 };
 
-/* KVM_EXEC_WAIT_INVOCATION_END on the domain fd. */
-struct kvm_exec_wait_invocation_end {
+/* KVM_EXEC_WAIT_CONSUMED_OUTPUT on the domain fd. */
+struct kvm_exec_wait_consumed_output {
 	__u64 capsule_id;
 	__u64 lifecycle_generation;
 	__u64 after_sequence;
 	/* Zero waits without a timeout. */
 	__u64 timeout_ns;
-	__u64 end_sequence;
+	__u64 consumed_sequence;
 	/*
-	 * With KVM_EXEC_FEATURE_INVOCATION_WAKE the wait also returns, without
+	 * With KVM_EXEC_FEATURE_CONSUMED_OUTPUT_WAKE the wait also returns, without
 	 * an end, once the capsule's wake_sequence passes after_wake, which the
 	 * waiter reads before checking its own state.  KVM returns the current
 	 * wake_sequence.  Both are zero without the feature.
@@ -1290,8 +1290,8 @@ struct kvm_exec_wait_invocation_end {
 	__u64 wake_sequence;
 };
 
-/* KVM_EXEC_WAKE_INVOCATION_WAITER on the domain fd. */
-struct kvm_exec_wake_invocation_waiter {
+/* KVM_EXEC_WAKE_CONSUMED_OUTPUT_WAITER on the domain fd. */
+struct kvm_exec_wake_consumed_output_waiter {
 	__u64 capsule_id;
 	__u64 lifecycle_generation;
 	/* Out: the capsule's wake_sequence after this wake. */
@@ -1516,7 +1516,7 @@ struct kvm_exec_dispatch_header {
 	__u64 last_handoff_entry_sequence;
 	/*
 	 * KVM_EXEC_DISPATCHER_F_SLEEPING while the dispatcher waits for work,
-	 * with INVOCATION_END, COMMAND_WAIT or HARDWARE_WAIT negotiated; zero
+	 * with CONSUMED_OUTPUT, COMMAND_WAIT or HARDWARE_WAIT negotiated; zero
 	 * otherwise.  A publisher release-stores its wake-line cursor, fences,
 	 * and kicks only when SLEEPING is set without HARDWARE_WAIT: the store
 	 * itself wakes a hardware-waiting dispatcher.
@@ -2079,12 +2079,12 @@ struct kvm_exec_query_interrupt_publication {
 				      struct kvm_exec_interrupt_result)
 #define KVM_EXEC_DISCARD_ENTRY \
 				_IOWR(KVMIO, 0xee, struct kvm_exec_discard_entry)
-#define KVM_EXEC_SET_INVOCATION_END \
-				_IOW(KVMIO, 0xe6, struct kvm_exec_invocation_end)
-#define KVM_EXEC_WAIT_INVOCATION_END \
-				_IOWR(KVMIO, 0xe7, struct kvm_exec_wait_invocation_end)
-#define KVM_EXEC_WAKE_INVOCATION_WAITER \
-				_IOWR(KVMIO, 0xe5, struct kvm_exec_wake_invocation_waiter)
+#define KVM_EXEC_SET_CONSUMED_OUTPUT \
+				_IOW(KVMIO, 0xe6, struct kvm_exec_consumed_output)
+#define KVM_EXEC_WAIT_CONSUMED_OUTPUT \
+				_IOWR(KVMIO, 0xe7, struct kvm_exec_wait_consumed_output)
+#define KVM_EXEC_WAKE_CONSUMED_OUTPUT_WAITER \
+				_IOWR(KVMIO, 0xe5, struct kvm_exec_wake_consumed_output_waiter)
 #define KVM_EXEC_REGISTER_ENTRY_FPU \
 				_IOW(KVMIO, 0xe4, struct kvm_exec_register_entry_fpu)
 

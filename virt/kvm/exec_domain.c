@@ -40,26 +40,26 @@
  * output is optional: without it a capsule's other outputs return to its
  * runner, which can then sleep in the dispatcher between invocations.
  */
-#define KVM_EXEC_INVOCATION_END_REQUIRED \
+#define KVM_EXEC_CONSUMED_OUTPUT_REQUIRED \
 	(KVM_EXEC_FEATURE_DYNAMIC_DISPATCH | KVM_EXEC_FEATURE_PORTABLE_EXITS | \
 	 KVM_EXEC_FEATURE_ENTRY_STATE_X86)
 
-static_assert(sizeof(struct kvm_exec_invocation_end_status) == 64);
-static_assert(sizeof(struct kvm_exec_invocation_end_waiter) == 64);
-static_assert(offsetof(struct kvm_exec_invocation_end_status, failed_selection) == 40);
-static_assert(offsetof(struct kvm_exec_invocation_end_status, failed_status) == 56);
-static_assert(offsetof(struct kvm_exec_invocation_end_waiter, wake_word) == 8);
-static_assert(offsetof(struct kvm_exec_invocation_end_waiter, wake_address) == 16);
-static_assert(KVM_EXEC_CAPSULE_END_STATUS_OFFSET ==
+static_assert(sizeof(struct kvm_exec_consumed_output_status) == 64);
+static_assert(sizeof(struct kvm_exec_consumed_output_waiter) == 64);
+static_assert(offsetof(struct kvm_exec_consumed_output_status, failed_selection) == 40);
+static_assert(offsetof(struct kvm_exec_consumed_output_status, failed_status) == 56);
+static_assert(offsetof(struct kvm_exec_consumed_output_waiter, wake_word) == 8);
+static_assert(offsetof(struct kvm_exec_consumed_output_waiter, wake_address) == 16);
+static_assert(KVM_EXEC_CAPSULE_CONSUMED_STATUS_OFFSET ==
 	      KVM_EXEC_CAPSULE_ENTRY_CONTROL_SIZE);
 static_assert(KVM_EXEC_CAPSULE_ENTRY_CONTROL_SIZE ==
 	      KVM_EXEC_CAPSULE_CONTROL_SIZE +
 	      sizeof(struct kvm_exec_entry_progress) +
 	      sizeof(struct kvm_exec_entry_observation));
-static_assert(KVM_EXEC_CAPSULE_END_WAITER_OFFSET ==
-	      KVM_EXEC_CAPSULE_END_STATUS_OFFSET + 64);
-static_assert(KVM_EXEC_CAPSULE_END_CONTROL_SIZE ==
-	      KVM_EXEC_CAPSULE_END_WAITER_OFFSET + 64);
+static_assert(KVM_EXEC_CAPSULE_CONSUMED_WAITER_OFFSET ==
+	      KVM_EXEC_CAPSULE_CONSUMED_STATUS_OFFSET + 64);
+static_assert(KVM_EXEC_CAPSULE_CONSUMED_CONTROL_SIZE ==
+	      KVM_EXEC_CAPSULE_CONSUMED_WAITER_OFFSET + 64);
 /* The sleeping word sits on the KVM-written progress line of the header. */
 static_assert(offsetof(struct kvm_exec_dispatch_header, dispatcher_state) ==
 	      2 * 64 + 7 * sizeof(__u64));
@@ -185,23 +185,23 @@ struct kvm_exec_portable_state {
 	bool service_pending;
 	bool blocked;
 	/*
-	 * KVM_EXEC_FEATURE_INVOCATION_END, under domain->lock.  end_sequence is
+	 * KVM_EXEC_FEATURE_CONSUMED_OUTPUT, under domain->lock.  consumed_sequence is
 	 * also read by end waiters through READ_ONCE().
 	 */
-	wait_queue_head_t end_wait;
-	u64 end_sequence;
+	wait_queue_head_t consumed_wait;
+	u64 consumed_sequence;
 	u32 end_value;
 	u16 end_port;
 	u8 end_width;
-	bool end_registered;
+	bool consumed_registered;
 	/* A SET_ENTRY command applied, and its end output has not fired. */
-	bool invocation_open;
+	bool entry_scope_open;
 	/* Its end output fired: no entry until a command selects it again. */
-	bool invocation_ended;
+	bool at_consumed_output;
 	/* Detach or domain stop: end waiters return. */
-	bool end_cancelled;
+	bool consumed_cancelled;
 	/*
-	 * KVM_EXEC_FEATURE_INVOCATION_WAKE, under domain->lock; end waiters read
+	 * KVM_EXEC_FEATURE_CONSUMED_OUTPUT_WAKE, under domain->lock; end waiters read
 	 * it through READ_ONCE().
 	 */
 	u64 wake_sequence;
@@ -210,8 +210,8 @@ struct kvm_exec_portable_state {
 	 * observes it: its applied phase needs no separate observation before
 	 * the capsule's next image, so ended invocations can be chained.
 	 */
-	u64 end_entry_executor;
-	u64 end_entry_command;
+	u64 consumed_entry_executor;
+	u64 consumed_entry_command;
 };
 
 struct kvm_exec_capsule {
@@ -427,19 +427,19 @@ kvm_exec_current_capsule(struct kvm_exec_executor *executor)
 					 lockdep_is_held(&executor->domain->lock));
 }
 
-static bool kvm_exec_invocation_end_negotiated(struct kvm_exec_domain *domain)
+static bool kvm_exec_consumed_output_negotiated(struct kvm_exec_domain *domain)
 {
-	return domain->negotiated_features & KVM_EXEC_FEATURE_INVOCATION_END;
+	return domain->negotiated_features & KVM_EXEC_FEATURE_CONSUMED_OUTPUT;
 }
 
-static bool kvm_exec_invocation_wake_negotiated(struct kvm_exec_domain *domain)
+static bool kvm_exec_consumed_wake_negotiated(struct kvm_exec_domain *domain)
 {
-	return domain->negotiated_features & KVM_EXEC_FEATURE_INVOCATION_WAKE;
+	return domain->negotiated_features & KVM_EXEC_FEATURE_CONSUMED_OUTPUT_WAKE;
 }
 
-static bool kvm_exec_invocation_futex_negotiated(struct kvm_exec_domain *domain)
+static bool kvm_exec_consumed_futex_negotiated(struct kvm_exec_domain *domain)
 {
-	return domain->negotiated_features & KVM_EXEC_FEATURE_INVOCATION_FUTEX;
+	return domain->negotiated_features & KVM_EXEC_FEATURE_CONSUMED_OUTPUT_FUTEX;
 }
 
 static bool kvm_exec_boundary_request_negotiated(struct kvm_exec_domain *domain)
@@ -450,34 +450,34 @@ static bool kvm_exec_boundary_request_negotiated(struct kvm_exec_domain *domain)
 static bool kvm_exec_sleep_state_negotiated(struct kvm_exec_domain *domain)
 {
 	return domain->negotiated_features &
-		(KVM_EXEC_FEATURE_INVOCATION_END | KVM_EXEC_FEATURE_COMMAND_WAIT |
+		(KVM_EXEC_FEATURE_CONSUMED_OUTPUT | KVM_EXEC_FEATURE_COMMAND_WAIT |
 		 KVM_EXEC_FEATURE_HARDWARE_WAIT);
 }
 
-static bool kvm_exec_end_registered(struct kvm_exec_capsule *capsule)
+static bool kvm_exec_consumed_registered(struct kvm_exec_capsule *capsule)
 {
-	return capsule && capsule->portable && capsule->portable->end_registered;
+	return capsule && capsule->portable && capsule->portable->consumed_registered;
 }
 
-static bool kvm_exec_invocation_open(struct kvm_exec_capsule *capsule)
+static bool kvm_exec_entry_scope_open(struct kvm_exec_capsule *capsule)
 {
-	return kvm_exec_end_registered(capsule) && capsule->portable->invocation_open;
+	return kvm_exec_consumed_registered(capsule) && capsule->portable->entry_scope_open;
 }
 
-static struct kvm_exec_invocation_end_status *
-kvm_exec_end_status(struct kvm_exec_capsule *capsule)
+static struct kvm_exec_consumed_output_status *
+kvm_exec_consumed_status(struct kvm_exec_capsule *capsule)
 {
-	return (void *)capsule->portable->control + KVM_EXEC_CAPSULE_END_STATUS_OFFSET;
+	return (void *)capsule->portable->control + KVM_EXEC_CAPSULE_CONSUMED_STATUS_OFFSET;
 }
 
-static struct kvm_exec_invocation_end_waiter *
-kvm_exec_end_waiter(struct kvm_exec_capsule *capsule)
+static struct kvm_exec_consumed_output_waiter *
+kvm_exec_consumed_waiter(struct kvm_exec_capsule *capsule)
 {
-	return (void *)capsule->portable->control + KVM_EXEC_CAPSULE_END_WAITER_OFFSET;
+	return (void *)capsule->portable->control + KVM_EXEC_CAPSULE_CONSUMED_WAITER_OFFSET;
 }
 
 /*
- * INVOCATION_FUTEX: wake a futex waiter of the capsule's end.  Bump the wake
+ * CONSUMED_OUTPUT_FUTEX: wake a futex waiter of the capsule's end.  Bump the wake
  * word, which the waiter reads before it rechecks its conditions and sleeps
  * only while unchanged, then wake the user address it registered.  Both are
  * user-written words of the control record: a wrong address only fails the
@@ -485,12 +485,12 @@ kvm_exec_end_waiter(struct kvm_exec_capsule *capsule)
  * wake is keyed by current->mm, which domain access requires to be the
  * domain's.  futex_wake orders the bump before its check for waiters.
  */
-static void kvm_exec_wake_end_futex(struct kvm_exec_capsule *capsule)
+static void kvm_exec_wake_consumed_futex(struct kvm_exec_capsule *capsule)
 {
-	struct kvm_exec_invocation_end_waiter *waiter = kvm_exec_end_waiter(capsule);
+	struct kvm_exec_consumed_output_waiter *waiter = kvm_exec_consumed_waiter(capsule);
 	u64 address;
 
-	if (!kvm_exec_invocation_futex_negotiated(capsule->domain))
+	if (!kvm_exec_consumed_futex_negotiated(capsule->domain))
 		return;
 	atomic_inc((atomic_t *)&waiter->wake_word);
 	address = READ_ONCE(waiter->wake_address);
@@ -501,36 +501,36 @@ static void kvm_exec_wake_end_futex(struct kvm_exec_capsule *capsule)
 /*
  * Implicit gating: while a capsule's invocation is open, an exact command
  * naming it as expected current waits at the ring head for its end output,
- * as an armed output gate waits for its output.  END_INVOCATION ends the
+ * as an armed output gate waits for its output.  SKIP_CONSUMED_OUTPUT ends the
  * invocation explicitly instead; an explicit gate on such a capsule is
  * rejected by the consumer.  A command that continues the open invocation
  * itself (the same capsule without a new entry image, such as
  * CONTINUE_ENTRY after an interrupted entry) is not held: it would wait for
  * its own end.
  */
-static bool kvm_exec_invocation_holds(struct kvm_exec_capsule *source,
+static bool kvm_exec_entry_scope_holds(struct kvm_exec_capsule *source,
 				      const struct kvm_exec_command *command)
 {
 	/* The source may be absent; only an open invocation holds anything. */
-	if (!kvm_exec_invocation_open(source))
+	if (!kvm_exec_entry_scope_open(source))
 		return false;
 	if (command->target_capsule_id == source->capsule_id &&
 	    !(command->flags & KVM_EXEC_CMD_F_SET_ENTRY))
 		return false;
-	return !(command->flags & (KVM_EXEC_CMD_F_END_INVOCATION |
+	return !(command->flags & (KVM_EXEC_CMD_F_SKIP_CONSUMED_OUTPUT |
 				   KVM_EXEC_CMD_F_PIO_WRITE_GATE)) &&
 	       source->capsule_id == command->expected_current_id &&
 	       source->lifecycle_generation == command->expected_current_generation;
 }
 
 /* Wake the capsule's end waiter after a lifecycle change ends its wait. */
-static void kvm_exec_cancel_end_waiters(struct kvm_exec_capsule *capsule)
+static void kvm_exec_cancel_consumed_waiters(struct kvm_exec_capsule *capsule)
 {
 	if (!capsule->portable)
 		return;
-	WRITE_ONCE(capsule->portable->end_cancelled, true);
-	wake_up_all(&capsule->portable->end_wait);
-	kvm_exec_wake_end_futex(capsule);
+	WRITE_ONCE(capsule->portable->consumed_cancelled, true);
+	wake_up_all(&capsule->portable->consumed_wait);
+	kvm_exec_wake_consumed_futex(capsule);
 }
 
 static bool kvm_exec_portable_advance(struct kvm_exec_capsule *capsule);
@@ -552,10 +552,10 @@ static bool kvm_exec_entry_pending(struct kvm_exec_capsule *capsule)
  * prepared after the end stays valid.  Only a registered end output ends an
  * invocation, so other capsules always advance.
  */
-static bool kvm_exec_invocation_settled(struct kvm_exec_capsule *capsule)
+static bool kvm_exec_consumed_settled(struct kvm_exec_capsule *capsule)
 {
-	return kvm_exec_end_registered(capsule) &&
-	       capsule->portable->invocation_ended &&
+	return kvm_exec_consumed_registered(capsule) &&
+	       capsule->portable->at_consumed_output &&
 	       !capsule->portable->service_pending &&
 	       !kvm_exec_entry_pending(capsule);
 }
@@ -599,8 +599,8 @@ static bool kvm_exec_entry_unobserved(struct kvm_exec_capsule *capsule)
 		return false;
 	if (kvm_exec_entry_pending(capsule))
 		return true;
-	if (capsule->portable->end_entry_command == entry->command_sequence &&
-	    capsule->portable->end_entry_executor == entry->executor_generation)
+	if (capsule->portable->consumed_entry_command == entry->command_sequence &&
+	    capsule->portable->consumed_entry_executor == entry->executor_generation)
 		return false;
 	observation = (void *)capsule->portable->control +
 		KVM_EXEC_CAPSULE_CONTROL_SIZE + sizeof(struct kvm_exec_entry_progress);
@@ -626,7 +626,7 @@ static void kvm_exec_portable_release(struct kvm_exec_capsule *capsule)
 {
 	if (!capsule->portable)
 		return;
-	if (!kvm_exec_invocation_settled(capsule))
+	if (!kvm_exec_consumed_settled(capsule))
 		kvm_exec_portable_advance(capsule);
 	if (kvm_exec_entry_pending(capsule)) {
 		capsule->portable->entry->authorized = false;
@@ -911,9 +911,9 @@ u64 kvm_exec_supported_features(void)
 
 	/* The end output retires through the supplied-entry protocol. */
 	if (features & KVM_EXEC_FEATURE_ENTRY_STATE_X86)
-		features |= KVM_EXEC_FEATURE_INVOCATION_END |
-			    KVM_EXEC_FEATURE_INVOCATION_WAKE |
-			    KVM_EXEC_FEATURE_INVOCATION_FUTEX |
+		features |= KVM_EXEC_FEATURE_CONSUMED_OUTPUT |
+			    KVM_EXEC_FEATURE_CONSUMED_OUTPUT_WAKE |
+			    KVM_EXEC_FEATURE_CONSUMED_OUTPUT_FUTEX |
 			    KVM_EXEC_FEATURE_BOUNDARY_REQUEST |
 			    KVM_EXEC_FEATURE_REGISTERED_ENTRY_FPU;
 	return features;
@@ -1399,7 +1399,7 @@ static int kvm_exec_attach_vcpu(struct kvm_exec_domain *domain,
 			}
 			new_capsule->portable->control = domain->control_region +
 				domain->nr_capsule_slots * domain->control_stride;
-			init_waitqueue_head(&new_capsule->portable->end_wait);
+			init_waitqueue_head(&new_capsule->portable->consumed_wait);
 			if (domain->negotiated_features & KVM_EXEC_FEATURE_ENTRY_STATE_X86) {
 				new_capsule->portable->entry = kzalloc(
 					sizeof(*new_capsule->portable->entry), GFP_KERNEL_ACCOUNT);
@@ -1473,22 +1473,22 @@ static int kvm_exec_attach_vcpu(struct kvm_exec_domain *domain,
 			 * A waiter left from the old lifecycle sees the lifecycle
 			 * change and returns.
 			 */
-			capsule->portable->end_registered = false;
+			capsule->portable->consumed_registered = false;
 			capsule->portable->end_port = 0;
 			capsule->portable->end_width = 0;
 			capsule->portable->end_value = 0;
-			capsule->portable->invocation_open = false;
-			capsule->portable->invocation_ended = false;
-			WRITE_ONCE(capsule->portable->end_cancelled, false);
+			capsule->portable->entry_scope_open = false;
+			capsule->portable->at_consumed_output = false;
+			WRITE_ONCE(capsule->portable->consumed_cancelled, false);
 			WRITE_ONCE(capsule->portable->wake_sequence, 0);
-			capsule->portable->end_entry_executor = 0;
-			capsule->portable->end_entry_command = 0;
-			WRITE_ONCE(capsule->portable->end_sequence, 0);
-			if (kvm_exec_invocation_end_negotiated(domain)) {
-				memset(kvm_exec_end_status(capsule), 0,
-				       sizeof(struct kvm_exec_invocation_end_status));
-				WRITE_ONCE(kvm_exec_end_waiter(capsule)->waiting, 0);
-				WRITE_ONCE(kvm_exec_end_waiter(capsule)->wake_address, 0);
+			capsule->portable->consumed_entry_executor = 0;
+			capsule->portable->consumed_entry_command = 0;
+			WRITE_ONCE(capsule->portable->consumed_sequence, 0);
+			if (kvm_exec_consumed_output_negotiated(domain)) {
+				memset(kvm_exec_consumed_status(capsule), 0,
+				       sizeof(struct kvm_exec_consumed_output_status));
+				WRITE_ONCE(kvm_exec_consumed_waiter(capsule)->waiting, 0);
+				WRITE_ONCE(kvm_exec_consumed_waiter(capsule)->wake_address, 0);
 			}
 			if (capsule->portable->entry) {
 				struct kvm_exec_entry_record *entry = capsule->portable->entry;
@@ -1602,7 +1602,7 @@ static int kvm_exec_detach_vcpu(struct kvm_exec_domain *domain,
 	domain->nr_attached--;
 	if (capsule->portable) {
 		kvm_exec_publish_capsule_status(capsule);
-		kvm_exec_cancel_end_waiters(capsule);
+		kvm_exec_cancel_consumed_waiters(capsule);
 	}
 out:
 	mutex_unlock(&domain->lock);
@@ -2451,8 +2451,8 @@ static int kvm_exec_dispatch_ring_state(struct kvm_exec_executor *executor,
 static bool kvm_exec_entry_command_supported(struct kvm_exec_domain *domain,
 					     const struct kvm_exec_command *command)
 {
-	if ((command->flags & KVM_EXEC_CMD_F_END_INVOCATION) &&
-	    !kvm_exec_invocation_end_negotiated(domain))
+	if ((command->flags & KVM_EXEC_CMD_F_SKIP_CONSUMED_OUTPUT) &&
+	    !kvm_exec_consumed_output_negotiated(domain))
 		return false;
 	return !(command->flags & (KVM_EXEC_CMD_F_SET_ENTRY | KVM_EXEC_CMD_F_CONTINUE_ENTRY)) ||
 	       (domain->negotiated_features & KVM_EXEC_FEATURE_ENTRY_STATE_X86);
@@ -2466,8 +2466,8 @@ static bool kvm_exec_dispatch_command_shape_valid(struct kvm_exec_command *cmd)
 	    cmd->flags & ~(KVM_EXEC_CMD_F_PIO_WRITE_GATE |
 			   KVM_EXEC_CMD_F_GUARDED_TARGET | KVM_EXEC_CMD_F_SET_ENTRY |
 			   KVM_EXEC_CMD_F_CONTINUE_ENTRY |
-			   KVM_EXEC_CMD_F_END_INVOCATION | KVM_EXEC_CMD_F_RESUME_HALT) ||
-	    ((cmd->flags & KVM_EXEC_CMD_F_END_INVOCATION) &&
+			   KVM_EXEC_CMD_F_SKIP_CONSUMED_OUTPUT | KVM_EXEC_CMD_F_RESUME_HALT) ||
+	    ((cmd->flags & KVM_EXEC_CMD_F_SKIP_CONSUMED_OUTPUT) &&
 	     (!cmd->expected_current_id ||
 	      (cmd->flags & KVM_EXEC_CMD_F_PIO_WRITE_GATE))) ||
 	    !cmd->request_sequence ||
@@ -2596,7 +2596,7 @@ static int kvm_exec_async_handoff_ready(struct kvm_exec_executor *executor)
 
 	mutex_lock(&domain->lock);
 	source = kvm_exec_current_capsule(executor);
-	if (kvm_exec_invocation_holds(source, &command))
+	if (kvm_exec_entry_scope_holds(source, &command))
 		readiness = KVM_EXEC_HANDOFF_ARMED;
 	else if (kvm_exec_async_handoff_command(executor, source, &command))
 		readiness = KVM_EXEC_HANDOFF_READY;
@@ -3268,7 +3268,7 @@ static bool kvm_exec_async_blocks_entry(struct kvm_exec_capsule *capsule)
 {
 	if (capsule->portable)
 		return capsule->portable->service_pending || capsule->portable->blocked ||
-		       capsule->portable->invocation_ended ||
+		       capsule->portable->at_consumed_output ||
 		       (kvm_exec_entry_pending(capsule) && !capsule->portable->entry->authorized);
 	return capsule->exit.async_request_pending ||
 	       (capsule->exit.async_completion_ready &&
@@ -3629,7 +3629,7 @@ kvm_exec_dispatch_gate_unsatisfied(struct kvm_exec_executor *executor,
 	bool gated = command->flags & KVM_EXEC_CMD_F_PIO_WRITE_GATE;
 	bool unsatisfied;
 
-	if (!gated && !kvm_exec_invocation_end_negotiated(domain))
+	if (!gated && !kvm_exec_consumed_output_negotiated(domain))
 		return false;
 	if (gated && (domain->negotiated_features & gate_features) != gate_features)
 		return false;
@@ -3647,7 +3647,7 @@ kvm_exec_dispatch_gate_unsatisfied(struct kvm_exec_executor *executor,
 	if (gated)
 		/* An explicit gate on an end-registered source is rejected instead. */
 		unsatisfied = current_capsule &&
-			      !kvm_exec_end_registered(current_capsule) &&
+			      !kvm_exec_consumed_registered(current_capsule) &&
 			      current_capsule->capsule_id ==
 				      command->expected_current_id &&
 			      current_capsule->lifecycle_generation ==
@@ -3655,7 +3655,7 @@ kvm_exec_dispatch_gate_unsatisfied(struct kvm_exec_executor *executor,
 			      !kvm_exec_async_handoff_command(executor, current_capsule,
 							      command);
 	else
-		unsatisfied = kvm_exec_invocation_holds(current_capsule, command);
+		unsatisfied = kvm_exec_entry_scope_holds(current_capsule, command);
 	mutex_unlock(&domain->lock);
 	return unsatisfied;
 }
@@ -3750,9 +3750,9 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 		status = KVM_EXEC_COMPLETE_CURRENT_MISMATCH;
 		goto terminal_locked;
 	}
-	if (kvm_exec_end_registered(current_capsule) ?
+	if (kvm_exec_consumed_registered(current_capsule) ?
 	    command.flags & KVM_EXEC_CMD_F_PIO_WRITE_GATE :
-	    command.flags & KVM_EXEC_CMD_F_END_INVOCATION) {
+	    command.flags & KVM_EXEC_CMD_F_SKIP_CONSUMED_OUTPUT) {
 		/* One mechanism per capsule: its end output or an explicit gate. */
 		status = KVM_EXEC_COMPLETE_REJECTED;
 		goto terminal_locked;
@@ -3855,11 +3855,11 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 		goto terminal_locked;
 	}
 	if (current_capsule && current_capsule->portable) {
-		if (current_capsule->portable->invocation_ended)
-			completion->flags |= KVM_EXEC_COMPLETE_F_AT_INVOCATION_END;
+		if (current_capsule->portable->at_consumed_output)
+			completion->flags |= KVM_EXEC_COMPLETE_F_AT_CONSUMED_OUTPUT;
 		/* The explicit end of an open invocation, without its output. */
-		if (command.flags & KVM_EXEC_CMD_F_END_INVOCATION)
-			current_capsule->portable->invocation_open = false;
+		if (command.flags & KVM_EXEC_CMD_F_SKIP_CONSUMED_OUTPUT)
+			current_capsule->portable->entry_scope_open = false;
 	}
 	if (command.opcode == KVM_EXEC_CMD_RELEASE) {
 		completion->handoff_started_ns =
@@ -3919,11 +3919,11 @@ kvm_exec_dispatch_consume(struct kvm_exec_executor *executor,
 			kvm_exec_portable_accept(target);
 			kvm_exec_entry_admit(target, &command);
 			/* A selection lifts an ended capsule's entry block. */
-			target->portable->invocation_ended = false;
+			target->portable->at_consumed_output = false;
 			/* An invocation opens when its supplied state is admitted. */
 			if ((command.flags & KVM_EXEC_CMD_F_SET_ENTRY) &&
-			    target->portable->end_registered)
-				target->portable->invocation_open = true;
+			    target->portable->consumed_registered)
+				target->portable->entry_scope_open = true;
 		}
 		if (async_pio_handoff)
 			completion->flags |=
@@ -4546,7 +4546,7 @@ static void kvm_exec_dispatch_run_owner(struct kvm_exec_executor *executor,
 		/* Publish completion progress even without a new architectural exit. */
 		if (run->return_reason == KVM_EXEC_RETURN_SIGNAL ||
 		    run->return_reason == KVM_EXEC_RETURN_DOMAIN_PAUSED) {
-			if (!kvm_exec_invocation_settled(capsule))
+			if (!kvm_exec_consumed_settled(capsule))
 				kvm_exec_portable_advance(capsule);
 			kvm_exec_publish_capsule_status(capsule);
 		}
@@ -4613,12 +4613,12 @@ static void kvm_exec_dispatch_return_locked(struct kvm_exec_executor *executor,
  * invocation is open: a single, fully snapshotted output PIO of exactly the
  * registered port, width and value whose completion is still pending.
  */
-static bool kvm_exec_invocation_end_matches(struct kvm_exec_capsule *capsule)
+static bool kvm_exec_consumed_output_matches(struct kvm_exec_capsule *capsule)
 {
 	struct kvm_exec_exit_state *exit = &capsule->exit;
 	u32 value = 0;
 
-	if (!kvm_exec_invocation_open(capsule) || exit->run_flags ||
+	if (!kvm_exec_entry_scope_open(capsule) || exit->run_flags ||
 	    exit->reason != KVM_EXIT_IO || exit->direction != KVM_EXIT_IO_OUT ||
 	    exit->count != 1 || !exit->payload_valid || !exit->completion_pending ||
 	    exit->len != capsule->portable->end_width ||
@@ -4628,32 +4628,32 @@ static bool kvm_exec_invocation_end_matches(struct kvm_exec_capsule *capsule)
 	return value == capsule->portable->end_value;
 }
 
-/* Release end_sequence after every end-record word; then wake a waiter. */
-static void kvm_exec_publish_invocation_end(struct kvm_exec_capsule *capsule)
+/* Release consumed_sequence after every end-record word; then wake a waiter. */
+static void kvm_exec_publish_consumed_output(struct kvm_exec_capsule *capsule)
 {
 	struct kvm_exec_portable_state *portable = capsule->portable;
-	struct kvm_exec_invocation_end_status *status = kvm_exec_end_status(capsule);
+	struct kvm_exec_consumed_output_status *status = kvm_exec_consumed_status(capsule);
 
 	lockdep_assert_held(&capsule->domain->lock);
 	WRITE_ONCE(status->lifecycle_generation, capsule->lifecycle_generation);
 	WRITE_ONCE(status->exit_sequence, capsule->exit.sequence);
 	/* Pairs with the reader's acquire; the run page was written before. */
-	smp_store_release(&status->end_sequence, portable->end_sequence);
+	smp_store_release(&status->consumed_sequence, portable->consumed_sequence);
 	/*
 	 * Pairs with the waiter's fence between setting its word and rereading
-	 * end_sequence: either it sees the new sequence or this sees its word.
+	 * consumed_sequence: either it sees the new sequence or this sees its word.
 	 */
 	smp_mb();
-	if (READ_ONCE(kvm_exec_end_waiter(capsule)->waiting)) {
-		wake_up_all(&portable->end_wait);
-		kvm_exec_wake_end_futex(capsule);
-	} else if (wq_has_sleeper(&portable->end_wait)) {
-		wake_up_all(&portable->end_wait);
+	if (READ_ONCE(kvm_exec_consumed_waiter(capsule)->waiting)) {
+		wake_up_all(&portable->consumed_wait);
+		kvm_exec_wake_consumed_futex(capsule);
+	} else if (wq_has_sleeper(&portable->consumed_wait)) {
+		wake_up_all(&portable->consumed_wait);
 	}
 }
 
 /*
- * INVOCATION_FUTEX: a selection of a capsule with a registered end completed
+ * CONSUMED_OUTPUT_FUTEX: a selection of a capsule with a registered end completed
  * without applying, so no end will come for it.  Name it in the end record
  * and wake the end waiter.  A cancellation before apply and a current
  * mismatch follow the VMM's own withdrawal, which it reports itself.
@@ -4663,11 +4663,11 @@ static void kvm_exec_notify_failed_selection(struct kvm_exec_executor *executor,
 					     u32 status)
 {
 	struct kvm_exec_domain *domain = executor->domain;
-	struct kvm_exec_invocation_end_status *end;
+	struct kvm_exec_consumed_output_status *end;
 	struct kvm_exec_capsule *capsule;
 
 	lockdep_assert_held(&domain->lock);
-	if (!kvm_exec_invocation_futex_negotiated(domain) ||
+	if (!kvm_exec_consumed_futex_negotiated(domain) ||
 	    !(command->flags & KVM_EXEC_CMD_F_SET_ENTRY) ||
 	    status == KVM_EXEC_COMPLETE_APPLIED ||
 	    status == KVM_EXEC_COMPLETE_RETURNED ||
@@ -4676,17 +4676,17 @@ static void kvm_exec_notify_failed_selection(struct kvm_exec_executor *executor,
 	    !command->target_capsule_id || command->target_capsule_id > ULONG_MAX)
 		return;
 	capsule = xa_load(&domain->capsules, command->target_capsule_id);
-	if (!capsule || !capsule->vcpu || !kvm_exec_end_registered(capsule) ||
+	if (!capsule || !capsule->vcpu || !kvm_exec_consumed_registered(capsule) ||
 	    capsule->lifecycle_generation != command->target_lifecycle_generation)
 		return;
-	end = kvm_exec_end_status(capsule);
+	end = kvm_exec_consumed_status(capsule);
 	WRITE_ONCE(end->failed_executor, executor->generation);
 	WRITE_ONCE(end->failed_status, status);
 	/* Pairs with the waiter's acquire after its wake. */
 	smp_store_release(&end->failed_selection, command->request_sequence);
 	smp_mb();
-	if (READ_ONCE(kvm_exec_end_waiter(capsule)->waiting))
-		kvm_exec_wake_end_futex(capsule);
+	if (READ_ONCE(kvm_exec_consumed_waiter(capsule)->waiting))
+		kvm_exec_wake_consumed_futex(capsule);
 }
 
 /*
@@ -4696,7 +4696,7 @@ static void kvm_exec_notify_failed_selection(struct kvm_exec_executor *executor,
  * stores the synchronized registers before the end is published, and nothing
  * remains owed: no service, no pending completion, no response expected.
  */
-static int kvm_exec_finish_invocation(struct kvm_exec_executor *executor,
+static int kvm_exec_consume_output(struct kvm_exec_executor *executor,
 				      struct kvm_exec_capsule *capsule)
 {
 	struct kvm_exec_domain *domain = executor->domain;
@@ -4738,15 +4738,15 @@ static int kvm_exec_finish_invocation(struct kvm_exec_executor *executor,
 	}
 	kvm_exec_async_finish_completion_locked(capsule);
 	portable->resolved_sequence = capsule->exit.sequence;
-	portable->invocation_open = false;
-	portable->invocation_ended = true;
+	portable->entry_scope_open = false;
+	portable->at_consumed_output = true;
 	if (portable->entry && portable->entry->phase == KVM_EXEC_ENTRY_PHASE_APPLIED) {
-		portable->end_entry_executor = portable->entry->executor_generation;
-		portable->end_entry_command = portable->entry->command_sequence;
+		portable->consumed_entry_executor = portable->entry->executor_generation;
+		portable->consumed_entry_command = portable->entry->command_sequence;
 	}
-	WRITE_ONCE(portable->end_sequence, portable->end_sequence + 1);
+	WRITE_ONCE(portable->consumed_sequence, portable->consumed_sequence + 1);
 	kvm_exec_publish_capsule_status(capsule);
-	kvm_exec_publish_invocation_end(capsule);
+	kvm_exec_publish_consumed_output(capsule);
 	mutex_unlock(&domain->lock);
 	wake_up_all(&domain->drain_wait);
 	return 0;
@@ -5050,7 +5050,7 @@ static long kvm_exec_run_dispatch(struct kvm_exec_executor *executor,
 		bool entry_allowed;
 		bool invalid_completion = false;
 		bool async_published = false;
-		bool end_output = false;
+		bool consumed_output = false;
 		bool pending_after_run = false;
 		bool valid_exit = false;
 		bool interrupt_pending;
@@ -5374,12 +5374,12 @@ command_done:
 		 * An ended capsule stays current until a command moves the executor
 		 * or selects it again; nothing is owed meanwhile.
 		 */
-		if (capsule->portable && capsule->portable->invocation_ended) {
+		if (capsule->portable && capsule->portable->at_consumed_output) {
 			mutex_unlock(&domain->lock);
 			if (command_ret > 0)
 				continue;
 			if (run.flags & KVM_EXEC_DISPATCH_F_RETURN_IF_EMPTY) {
-				run.return_reason = KVM_EXEC_RETURN_INVOCATION_END;
+				run.return_reason = KVM_EXEC_RETURN_CONSUMED_OUTPUT;
 				break;
 			}
 			ret = kvm_exec_dispatch_sleep(executor, seen_kick_epoch, capsule,
@@ -5604,8 +5604,8 @@ command_done:
 					      observed_exit.reason);
 			kvm_exec_record_exit_locked(capsule, &observed_exit);
 			if (!strict_migrated && !domain->stopping && !domain->paused &&
-			    kvm_exec_invocation_end_matches(capsule))
-				end_output = true;
+			    kvm_exec_consumed_output_matches(capsule))
+				consumed_output = true;
 			else if (!strict_migrated && !domain->stopping && !domain->paused &&
 				 kvm_exec_async_pio_write(domain, &capsule->exit))
 				async_published =
@@ -5663,7 +5663,7 @@ command_done:
 		if (!completion_pending && !strict_migrated &&
 		    !retained_halt_exit && !interrupt_window_exit &&
 		    !wait_continued &&
-		    !async_published && !end_output && run_ret != -EINTR &&
+		    !async_published && !consumed_output && run_ret != -EINTR &&
 		    (run_ret || run.vcpu_exit_reason != KVM_EXIT_DEBUG ||
 		     capsule->portable || capsule->exit.run_flags)) {
 			run.return_reason = KVM_EXEC_RETURN_VCPU_EXIT;
@@ -5690,12 +5690,12 @@ command_done:
 			continue;
 		if (interrupt_window_exit)
 			continue;
-		if (end_output) {
+		if (consumed_output) {
 			/*
 			 * The end answers itself.  The loop then applies the next
 			 * command waiting for this end, or returns or sleeps.
 			 */
-			if (kvm_exec_finish_invocation(executor, capsule)) {
+			if (kvm_exec_consume_output(executor, capsule)) {
 				run.return_reason = KVM_EXEC_RETURN_INVALID_COMPLETION;
 				run.run_result = -EIO;
 				break;
@@ -5847,7 +5847,7 @@ static long kvm_exec_kick(struct kvm_exec_executor *executor,
 		return -EOPNOTSUPP;
 	if ((kick.flags & KVM_EXEC_KICK_F_RETURN_AT_BOUNDARY) &&
 	    (!(domain->negotiated_features & KVM_EXEC_FEATURE_RETURN_KICK) ||
-	     !kvm_exec_invocation_end_negotiated(domain)))
+	     !kvm_exec_consumed_output_negotiated(domain)))
 		return -EOPNOTSUPP;
 	if ((kick.flags & KVM_EXEC_KICK_F_WAKE_SLEEPING) &&
 	    !kvm_exec_sleep_state_negotiated(domain))
@@ -7549,7 +7549,7 @@ static void kvm_exec_domain_stop(struct kvm_exec_domain *domain)
 	xa_for_each(&domain->capsules, index, capsule) {
 		if (!capsule->vcpu)
 			continue;
-		kvm_exec_cancel_end_waiters(capsule);
+		kvm_exec_cancel_consumed_waiters(capsule);
 		mutex_lock(&capsule->vcpu->mutex);
 		if (kvm_exec_delivery_uses_local_apic(
 			    domain->interrupt_delivery))
@@ -7662,7 +7662,7 @@ static long kvm_exec_discard_entry(struct kvm_exec_domain *domain, void __user *
 			entry->authorized = false;
 			capsule->portable->native_completion.entry_pending = false;
 			/* The invocation never ran; it ends without an end record. */
-			capsule->portable->invocation_open = false;
+			capsule->portable->entry_scope_open = false;
 			kvm_exec_portable_advance(capsule);
 			kvm_exec_publish_entry(capsule);
 			kvm_exec_publish_capsule_status(capsule);
@@ -7681,21 +7681,21 @@ out:
  * Register or remove a capsule's invocation-end output.  Cold and exact: the
  * capsule is attached, current on no executor, and owes nothing.
  */
-static long kvm_exec_set_invocation_end(struct kvm_exec_domain *domain,
+static long kvm_exec_set_consumed_output(struct kvm_exec_domain *domain,
 					void __user *argp)
 {
-	struct kvm_exec_invocation_end request;
-	struct kvm_exec_invocation_end_status *status;
+	struct kvm_exec_consumed_output request;
+	struct kvm_exec_consumed_output_status *status;
 	struct kvm_exec_capsule *capsule;
 	bool enable;
 	long ret = 0;
 
-	if (!kvm_exec_invocation_end_negotiated(domain))
+	if (!kvm_exec_consumed_output_negotiated(domain))
 		return -EOPNOTSUPP;
 	if (copy_from_user(&request, argp, sizeof(request)))
 		return -EFAULT;
-	enable = request.flags == KVM_EXEC_INVOCATION_END_ENABLE;
-	if ((!enable && request.flags != KVM_EXEC_INVOCATION_END_DISABLE) ||
+	enable = request.flags == KVM_EXEC_CONSUMED_OUTPUT_ENABLE;
+	if ((!enable && request.flags != KVM_EXEC_CONSUMED_OUTPUT_DISABLE) ||
 	    request.reserved[0] || request.reserved[1] ||
 	    !request.capsule_id || request.capsule_id > ULONG_MAX ||
 	    !request.lifecycle_generation)
@@ -7714,22 +7714,22 @@ static long kvm_exec_set_invocation_end(struct kvm_exec_domain *domain,
 	}
 	if (capsule->owner || capsule->running || capsule->trace_refs ||
 	    capsule->portable->service_pending || capsule->exit.completion_pending ||
-	    kvm_exec_entry_pending(capsule) || capsule->portable->invocation_open) {
+	    kvm_exec_entry_pending(capsule) || capsule->portable->entry_scope_open) {
 		ret = -EBUSY;
 		goto out;
 	}
-	capsule->portable->end_registered = enable;
+	capsule->portable->consumed_registered = enable;
 	capsule->portable->end_port = request.port;
 	capsule->portable->end_width = request.width;
 	capsule->portable->end_value = request.value;
-	capsule->portable->invocation_ended = false;
-	status = kvm_exec_end_status(capsule);
+	capsule->portable->at_consumed_output = false;
+	status = kvm_exec_consumed_status(capsule);
 	WRITE_ONCE(status->lifecycle_generation, capsule->lifecycle_generation);
 	WRITE_ONCE(status->port, request.port);
 	WRITE_ONCE(status->width, request.width);
 	WRITE_ONCE(status->value, request.value);
 	smp_store_release(&status->flags,
-			  enable ? KVM_EXEC_END_STATUS_F_REGISTERED : 0);
+			  enable ? KVM_EXEC_CONSUMED_STATUS_F_REGISTERED : 0);
 out:
 	mutex_unlock(&domain->lock);
 	return ret;
@@ -7739,42 +7739,42 @@ out:
  * Ended, woken from user space, cancelled, or no longer the waiter's
  * lifecycle (detached or reattached).
  */
-static bool kvm_exec_end_waitable(struct kvm_exec_capsule *capsule,
-				  const struct kvm_exec_wait_invocation_end *wait,
+static bool kvm_exec_consumed_waitable(struct kvm_exec_capsule *capsule,
+				  const struct kvm_exec_wait_consumed_output *wait,
 				  bool wakeable)
 {
 	struct kvm_exec_portable_state *portable = capsule->portable;
 
 	return READ_ONCE(capsule->lifecycle_generation) != wait->lifecycle_generation ||
-	       READ_ONCE(portable->end_cancelled) ||
-	       READ_ONCE(portable->end_sequence) > wait->after_sequence ||
+	       READ_ONCE(portable->consumed_cancelled) ||
+	       READ_ONCE(portable->consumed_sequence) > wait->after_sequence ||
 	       (wakeable && READ_ONCE(portable->wake_sequence) > wait->after_wake);
 }
 
 /*
- * Wait until a capsule's end_sequence passes after_sequence or, with
- * KVM_EXEC_FEATURE_INVOCATION_WAKE, its wake_sequence passes after_wake.  A
+ * Wait until a capsule's consumed_sequence passes after_sequence or, with
+ * KVM_EXEC_FEATURE_CONSUMED_OUTPUT_WAKE, its wake_sequence passes after_wake.  A
  * waiter reads wake_sequence, sets its waiter word, fences and rereads
- * end_sequence and its own state before calling this.  The capsule outlives
+ * consumed_sequence and its own state before calling this.  The capsule outlives
  * the call: capsule memory is freed only with the domain, whose reference the
  * caller's fd holds.
  */
-static long kvm_exec_wait_invocation_end(struct kvm_exec_domain *domain,
+static long kvm_exec_wait_consumed_output(struct kvm_exec_domain *domain,
 					 void __user *argp)
 {
-	struct kvm_exec_wait_invocation_end wait;
+	struct kvm_exec_wait_consumed_output wait;
 	struct kvm_exec_portable_state *portable;
 	struct kvm_exec_capsule *capsule;
-	bool wakeable = kvm_exec_invocation_wake_negotiated(domain);
+	bool wakeable = kvm_exec_consumed_wake_negotiated(domain);
 	bool woken;
 	long ret;
 
-	if (!kvm_exec_invocation_end_negotiated(domain))
+	if (!kvm_exec_consumed_output_negotiated(domain))
 		return -EOPNOTSUPP;
 	if (copy_from_user(&wait, argp, sizeof(wait)))
 		return -EFAULT;
 	if ((!wakeable && wait.after_wake) || wait.wake_sequence ||
-	    wait.end_sequence ||
+	    wait.consumed_sequence ||
 	    !wait.capsule_id || wait.capsule_id > ULONG_MAX ||
 	    !wait.lifecycle_generation)
 		return -EINVAL;
@@ -7782,7 +7782,7 @@ static long kvm_exec_wait_invocation_end(struct kvm_exec_domain *domain,
 	capsule = xa_load(&domain->capsules, wait.capsule_id);
 	if (!capsule || !capsule->vcpu || !capsule->portable ||
 	    capsule->lifecycle_generation != wait.lifecycle_generation ||
-	    !capsule->portable->end_registered || domain->stopping) {
+	    !capsule->portable->consumed_registered || domain->stopping) {
 		mutex_unlock(&domain->lock);
 		return -ESTALE;
 	}
@@ -7790,13 +7790,13 @@ static long kvm_exec_wait_invocation_end(struct kvm_exec_domain *domain,
 	mutex_unlock(&domain->lock);
 
 	if (wait.timeout_ns)
-		ret = wait_event_interruptible_hrtimeout(portable->end_wait,
-			kvm_exec_end_waitable(capsule, &wait, wakeable),
+		ret = wait_event_interruptible_hrtimeout(portable->consumed_wait,
+			kvm_exec_consumed_waitable(capsule, &wait, wakeable),
 			ns_to_ktime(min_t(u64, wait.timeout_ns, KTIME_MAX)));
 	else
-		ret = wait_event_interruptible(portable->end_wait,
-			kvm_exec_end_waitable(capsule, &wait, wakeable));
-	wait.end_sequence = READ_ONCE(portable->end_sequence);
+		ret = wait_event_interruptible(portable->consumed_wait,
+			kvm_exec_consumed_waitable(capsule, &wait, wakeable));
+	wait.consumed_sequence = READ_ONCE(portable->consumed_sequence);
 	if (wakeable)
 		wait.wake_sequence = READ_ONCE(portable->wake_sequence);
 	woken = wakeable && wait.wake_sequence > wait.after_wake;
@@ -7806,8 +7806,8 @@ static long kvm_exec_wait_invocation_end(struct kvm_exec_domain *domain,
 		ret = -ETIMEDOUT;
 	/* Without an end or a wake of the waiter's lifecycle, the wait is stale. */
 	if (!ret && (READ_ONCE(capsule->lifecycle_generation) != wait.lifecycle_generation ||
-		     (wait.end_sequence <= wait.after_sequence && !woken))) {
-		wait.end_sequence = 0;
+		     (wait.consumed_sequence <= wait.after_sequence && !woken))) {
+		wait.consumed_sequence = 0;
 		wait.wake_sequence = 0;
 		ret = -ESTALE;
 	}
@@ -7823,14 +7823,14 @@ static long kvm_exec_wait_invocation_end(struct kvm_exec_domain *domain,
  * dispatcher's sleeping bit; the sequence makes the wake lossless whichever
  * side runs first.
  */
-static long kvm_exec_wake_invocation_waiter(struct kvm_exec_domain *domain,
+static long kvm_exec_wake_consumed_output_waiter(struct kvm_exec_domain *domain,
 					    void __user *argp)
 {
-	struct kvm_exec_wake_invocation_waiter wake;
+	struct kvm_exec_wake_consumed_output_waiter wake;
 	struct kvm_exec_portable_state *portable;
 	struct kvm_exec_capsule *capsule;
 
-	if (!kvm_exec_invocation_wake_negotiated(domain))
+	if (!kvm_exec_consumed_wake_negotiated(domain))
 		return -EOPNOTSUPP;
 	if (copy_from_user(&wake, argp, sizeof(wake)))
 		return -EFAULT;
@@ -7842,7 +7842,7 @@ static long kvm_exec_wake_invocation_waiter(struct kvm_exec_domain *domain,
 	capsule = xa_load(&domain->capsules, wake.capsule_id);
 	if (!capsule || !capsule->vcpu || !capsule->portable ||
 	    capsule->lifecycle_generation != wake.lifecycle_generation ||
-	    !capsule->portable->end_registered || domain->stopping) {
+	    !capsule->portable->consumed_registered || domain->stopping) {
 		mutex_unlock(&domain->lock);
 		return -ESTALE;
 	}
@@ -7853,11 +7853,11 @@ static long kvm_exec_wake_invocation_waiter(struct kvm_exec_domain *domain,
 	}
 	WRITE_ONCE(portable->wake_sequence, portable->wake_sequence + 1);
 	wake.wake_sequence = portable->wake_sequence;
-	smp_store_release(&kvm_exec_end_status(capsule)->wake_sequence,
+	smp_store_release(&kvm_exec_consumed_status(capsule)->wake_sequence,
 			  wake.wake_sequence);
 	mutex_unlock(&domain->lock);
 	/* Pairs with the waiter's condition, which rereads wake_sequence. */
-	wake_up_all(&portable->end_wait);
+	wake_up_all(&portable->consumed_wait);
 	if (copy_to_user(argp, &wake, sizeof(wake)))
 		return -EFAULT;
 	return 0;
@@ -7929,14 +7929,14 @@ static long kvm_exec_domain_ioctl(struct file *file, unsigned int ioctl,
 		return ret;
 
 	switch (ioctl) {
-	case KVM_EXEC_SET_INVOCATION_END:
-		return kvm_exec_set_invocation_end(domain, argp);
-	case KVM_EXEC_WAIT_INVOCATION_END:
-		return kvm_exec_wait_invocation_end(domain, argp);
+	case KVM_EXEC_SET_CONSUMED_OUTPUT:
+		return kvm_exec_set_consumed_output(domain, argp);
+	case KVM_EXEC_WAIT_CONSUMED_OUTPUT:
+		return kvm_exec_wait_consumed_output(domain, argp);
 	case KVM_EXEC_REGISTER_ENTRY_FPU:
 		return kvm_exec_register_entry_fpu(domain, argp);
-	case KVM_EXEC_WAKE_INVOCATION_WAITER:
-		return kvm_exec_wake_invocation_waiter(domain, argp);
+	case KVM_EXEC_WAKE_CONSUMED_OUTPUT_WAITER:
+		return kvm_exec_wake_consumed_output_waiter(domain, argp);
 	case KVM_EXEC_DISCARD_ENTRY:
 		return kvm_exec_discard_entry(domain, argp);
 	case KVM_EXEC_CONFIGURE_INTERRUPT_DELIVERY:
@@ -8044,15 +8044,15 @@ int kvm_dev_ioctl_create_exec_domain(void __user *argp)
 	    create.max_capsules > U16_MAX || create.max_executors > U16_MAX ||
 	    !(create.requested_features & KVM_EXEC_FEATURE_BASE_OBJECTS) ||
 	    create.requested_features & ~supported_features ||
-	    ((create.requested_features & KVM_EXEC_FEATURE_INVOCATION_END) &&
-	     (create.requested_features & KVM_EXEC_INVOCATION_END_REQUIRED) !=
-	     KVM_EXEC_INVOCATION_END_REQUIRED) ||
-	    ((create.requested_features & KVM_EXEC_FEATURE_INVOCATION_WAKE) &&
-	     !(create.requested_features & KVM_EXEC_FEATURE_INVOCATION_END)) ||
-	    ((create.requested_features & KVM_EXEC_FEATURE_INVOCATION_FUTEX) &&
-	     !(create.requested_features & KVM_EXEC_FEATURE_INVOCATION_WAKE)) ||
+	    ((create.requested_features & KVM_EXEC_FEATURE_CONSUMED_OUTPUT) &&
+	     (create.requested_features & KVM_EXEC_CONSUMED_OUTPUT_REQUIRED) !=
+	     KVM_EXEC_CONSUMED_OUTPUT_REQUIRED) ||
+	    ((create.requested_features & KVM_EXEC_FEATURE_CONSUMED_OUTPUT_WAKE) &&
+	     !(create.requested_features & KVM_EXEC_FEATURE_CONSUMED_OUTPUT)) ||
+	    ((create.requested_features & KVM_EXEC_FEATURE_CONSUMED_OUTPUT_FUTEX) &&
+	     !(create.requested_features & KVM_EXEC_FEATURE_CONSUMED_OUTPUT_WAKE)) ||
 	    ((create.requested_features & KVM_EXEC_FEATURE_BOUNDARY_REQUEST) &&
-	     !(create.requested_features & KVM_EXEC_FEATURE_INVOCATION_END)) ||
+	     !(create.requested_features & KVM_EXEC_FEATURE_CONSUMED_OUTPUT)) ||
 	    ((create.requested_features & KVM_EXEC_FEATURE_REGISTERED_ENTRY_FPU) &&
 	     !(create.requested_features & KVM_EXEC_FEATURE_ENTRY_STATE_X86)) ||
 	    ((create.requested_features & (KVM_EXEC_FEATURE_COMMAND_WAIT |
@@ -8160,8 +8160,8 @@ int kvm_dev_ioctl_create_exec_domain(void __user *argp)
 	domain->max_executors = create.max_executors;
 	if (create.requested_features & KVM_EXEC_FEATURE_PORTABLE_EXITS) {
 		domain->control_stride = create.requested_features &
-			KVM_EXEC_FEATURE_INVOCATION_END ?
-			KVM_EXEC_CAPSULE_END_CONTROL_SIZE :
+			KVM_EXEC_FEATURE_CONSUMED_OUTPUT ?
+			KVM_EXEC_CAPSULE_CONSUMED_CONTROL_SIZE :
 			create.requested_features &
 			KVM_EXEC_FEATURE_ENTRY_STATE_X86 ?
 			KVM_EXEC_CAPSULE_ENTRY_CONTROL_SIZE :
