@@ -554,6 +554,17 @@ static int kvm_exec_named_consumed_output(struct kvm_exec_capsule *capsule,
 }
 
 /*
+ * The capsule boundary epoch an AT_CONSUMED_OUTPUT command's output must
+ * follow.  A command that also guards its target uses reserved for that guard
+ * and names no epoch: it applies at the output its source waits at, as a gated
+ * command applies at its source's output.
+ */
+static u64 kvm_exec_at_output_epoch(const struct kvm_exec_command *command)
+{
+	return command->flags & KVM_EXEC_CMD_F_GUARDED_TARGET ? 0 : command->reserved;
+}
+
+/*
  * An AT_CONSUMED_OUTPUT command applies only while its expected-current
  * capsule waits at the output the command names, consumed after the capsule
  * boundary epoch the command carries.  An output consumed at or before that
@@ -566,7 +577,7 @@ static bool kvm_exec_at_named_output(struct kvm_exec_capsule *capsule,
 
 	return named >= 0 && capsule->portable->at_consumed_output &&
 	       capsule->portable->consumed_index == named &&
-	       capsule->portable->consumed_epoch > command->reserved;
+	       capsule->portable->consumed_epoch > kvm_exec_at_output_epoch(command);
 }
 
 /* Wake the capsule's end waiter after a lifecycle change ends its wait. */
@@ -2525,9 +2536,15 @@ static bool kvm_exec_dispatch_command_shape_valid(struct kvm_exec_command *cmd)
 			     KVM_EXEC_CMD_F_RESUME_HALT |
 			     KVM_EXEC_CMD_F_AT_CONSUMED_OUTPUT)) && cmd->reserved))
 		return false;
-	/* reserved is the capsule boundary epoch the named output must follow. */
+	/*
+	 * reserved is the capsule boundary epoch the named output must follow,
+	 * unless the command guards its target; it may supply that target's
+	 * entry as a gated command may.
+	 */
 	if ((cmd->flags & KVM_EXEC_CMD_F_AT_CONSUMED_OUTPUT) &&
-	    (cmd->flags != KVM_EXEC_CMD_F_AT_CONSUMED_OUTPUT ||
+	    ((cmd->flags & (KVM_EXEC_CMD_F_PIO_WRITE_GATE |
+			    KVM_EXEC_CMD_F_SKIP_CONSUMED_OUTPUT |
+			    KVM_EXEC_CMD_F_RESUME_HALT)) ||
 	     !cmd->expected_current_id))
 		return false;
 	if ((cmd->flags & KVM_EXEC_CMD_F_RESUME_HALT) &&

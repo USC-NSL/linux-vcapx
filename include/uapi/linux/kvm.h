@@ -1053,6 +1053,8 @@ struct kvm_ppc_resize_hpt {
  * The expected-current capsule's open entry scope closes here without a
  * consumed output.  Valid only when the expected-current capsule has an output
  * registered; the command then applies without waiting for that output.
+ * Deprecated with KVM_EXEC_CONSUMED_OUTPUT_ENTRY_SCOPED: without an entry
+ * scope an ordinary command is never held.
  */
 #define KVM_EXEC_CMD_F_SKIP_CONSUMED_OUTPUT	(1U << 4)
 /*
@@ -1060,7 +1062,11 @@ struct kvm_ppc_resize_hpt {
  * that gate_port, gate_width and gate_value name, after the capsule boundary
  * epoch in reserved.  Published after the capsule already waits at such an
  * output, it applies at once.  The output must be registered for that capsule
- * without ENTRY_SCOPED.  Mutually exclusive with every other command flag.
+ * without ENTRY_SCOPED.  It may also carry GUARDED_TARGET with SET_ENTRY or
+ * CONTINUE_ENTRY; reserved is then the target's guard and no epoch is named:
+ * the command applies at the named output its source waits at, however long
+ * ago it was consumed.  Mutually exclusive with PIO_WRITE_GATE,
+ * SKIP_CONSUMED_OUTPUT and RESUME_HALT.
  */
 #define KVM_EXEC_CMD_F_AT_CONSUMED_OUTPUT	(1U << 6)
 /* RESUME_HALT: reserved names the target's exact HLT exit sequence.
@@ -1068,7 +1074,7 @@ struct kvm_ppc_resize_hpt {
  */
 #define KVM_EXEC_CMD_F_RESUME_HALT	(1U << 5)
 
-#define KVM_EXEC_PORTABLE_ABI_VERSION	3U
+#define KVM_EXEC_PORTABLE_ABI_VERSION	4U
 #define KVM_EXEC_CAPSULE_CONTROL_SIZE	128U
 #define KVM_EXEC_CAPSULE_ENTRY_CONTROL_SIZE 256U
 #define KVM_EXEC_ENTRY_STATE_SIZE	640U
@@ -1094,6 +1100,9 @@ struct kvm_ppc_resize_hpt {
  * open.  Requires ENTRY_STATE_X86.  Without it an output is consumed whenever
  * the capsule executes it and only AT_CONSUMED_OUTPUT commands wait for it.
  * All registrations of one capsule carry the same choice.
+ *
+ * Deprecated: publish each queued entry with AT_CONSUMED_OUTPUT instead, which
+ * holds exactly the commands that ask for it.  Kept until its users are gone.
  */
 #define KVM_EXEC_CONSUMED_OUTPUT_ENTRY_SCOPED	(1U << 2)
 #define KVM_EXEC_CONSUMED_STATUS_F_REGISTERED (1U << 0)
